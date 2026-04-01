@@ -1,0 +1,43 @@
+{
+  "name": "@ori-memory/aries",
+  "version": "0.1.0",
+  "description": "Memory-native coding agent CLI. Built on Ori.",
+  "type": "module",
+  "bin": {
+    "aries": "./dist/index.js",
+    "ari": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0",
+    "@google/genai": "^1.0.0",
+    "@types/react": "^19.2.14",
+    "chalk": "^5.4.0",
+    "glob": "^11.0.0",
+    "ink": "^6.8.0",
+    "ink-text-input": "^6.0.0",
+    "marked": "^15.0.0",
+    "marked-terminal": "^7.3.0",
+    "react": "^19.2.4",
+    "xxhash-wasm": "^1.1.0",
+    "yaml": "^2.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aayoawoyemi/aries-cli"
+  }
+}
