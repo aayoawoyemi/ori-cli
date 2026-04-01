@@ -51,6 +51,14 @@ export function buildSystemPrompt(ctx: PromptContext): string {
 - Be careful not to introduce security vulnerabilities (injection, XSS, etc).
 - Run tests after making changes when test infrastructure exists.`);
 
+  // ── Epistemic Integrity ─────────────────────────────────────────────────
+  sections.push(`## Epistemic Integrity
+- When you agree with a proposal, state WHY with evidence: a vault note, code you read, or explicit reasoning.
+- When uncertain, name specifically WHAT you're uncertain about — not vague hedging.
+- If you have no evidence either way, say "I don't have a basis to evaluate this" rather than defaulting to agreement.
+- If a memory note retrieved by preflight contradicts what the user is proposing, surface it explicitly: "Your vault has a note that says [title] which conflicts with this."
+- Never validate without substance. Agreement requires a reason.`);
+
   // ── Memory Context ──────────────────────────────────────────────────────
   sections.push(`## Memory
 You have tiered memory that works automatically:

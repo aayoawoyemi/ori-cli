@@ -46,11 +46,15 @@ export async function runPostflight(
   const importance = hadToolCalls ? 3 : 1;
   const newAccumulator = currentImportance + importance;
 
+  // ── Agreement ratio monitoring ───────────────────────────────────────
+  // Track whether the model is being a yes-man. If agreement ratio > 0.9
+  // over 20 turns, save an observation so future preflight can surface it.
+  trackAgreementRatio(messages, vault);
+
   // ── Reflection trigger ──────────────────────────────────────────────
   if (vault?.connected && newAccumulator >= REFLECTION_THRESHOLD) {
-    // Fire-and-forget — never block the response
     triggerReflection(messages, vault).catch(() => {});
-    return 0; // reset after reflection
+    return 0;
   }
 
   return newAccumulator;
@@ -100,6 +104,50 @@ function generateReflectionTitle(messages: Message[]): string {
   if (words.length === 0) return 'session reflection on recent work';
 
   return `reflection on ${words.join(' ').toLowerCase().slice(0, 60)}`;
+}
+
+// ── Agreement Ratio Monitoring ───────────────────────────────────────────────
+
+const AGREEMENT_SIGNALS = ['yes', 'agree', 'good idea', 'makes sense', 'exactly', 'correct', 'sounds good', 'great', 'perfect'];
+const PUSHBACK_SIGNALS = ['however', 'but ', 'actually', 'instead', 'issue with', 'problem', 'concern', 'careful', 'not sure', 'don\'t have a basis'];
+const AGREEMENT_WINDOW = 20;
+const AGREEMENT_THRESHOLD = 0.9;
+
+let agreementHistory: boolean[] = []; // true = agreed, false = pushed back
+
+function trackAgreementRatio(messages: Message[], vault: OriVault | null): void {
+  // Get the last assistant message
+  const lastAssistant = messages.filter(m => m.role === 'assistant').pop();
+  if (!lastAssistant) return;
+
+  const text = getMessageText(lastAssistant).toLowerCase();
+  if (text.length < 20) return; // skip trivial responses
+
+  const agreeCount = AGREEMENT_SIGNALS.filter(s => text.includes(s)).length;
+  const pushCount = PUSHBACK_SIGNALS.filter(s => text.includes(s)).length;
+
+  // Classify this turn
+  const agreed = agreeCount > pushCount;
+  agreementHistory.push(agreed);
+
+  // Keep rolling window
+  if (agreementHistory.length > AGREEMENT_WINDOW) {
+    agreementHistory = agreementHistory.slice(-AGREEMENT_WINDOW);
+  }
+
+  // Check ratio
+  if (agreementHistory.length >= AGREEMENT_WINDOW) {
+    const ratio = agreementHistory.filter(a => a).length / agreementHistory.length;
+    if (ratio >= AGREEMENT_THRESHOLD && vault?.connected) {
+      vault.add(
+        'high agreement ratio detected — possible sycophantic drift',
+        `Agreement ratio: ${(ratio * 100).toFixed(0)}% over last ${AGREEMENT_WINDOW} turns. The model may be validating without substance. Review recent decisions critically.`,
+        'insight',
+      ).catch(() => {});
+      // Reset so we don't spam
+      agreementHistory = [];
+    }
+  }
 }
 
 // ── Compaction Classification ───────────────────────────────────────────────

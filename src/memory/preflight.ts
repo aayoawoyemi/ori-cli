@@ -9,6 +9,7 @@ export interface PreflightNote {
   title: string;
   score?: number;
   source: 'project' | 'ranked' | 'warmth' | 'important';
+  contradicting?: boolean;
 }
 
 export interface PreflightContext {
@@ -88,20 +89,24 @@ export async function runPreflight(
 
   if (projectNotes.length === 0 && vaultNotes.length === 0) return null;
 
+  // ── Contradiction flagging ──────────────────────────────────────────
+  // Check if any retrieved notes contradict the user's message.
+  // Simple heuristic: notes containing negation/failure/problem language
+  // about the same topic the user is proposing.
+  const allNotes = [...projectNotes, ...vaultNotes];
+  flagContradictions(allNotes, query);
+
   // ── Assemble context block ──────────────────────────────────────────
 
   const sections: string[] = [];
 
   if (projectNotes.length > 0) {
-    const lines = projectNotes.map(n => `- "${n.title}"`).join('\n');
+    const lines = projectNotes.map(n => formatNote(n)).join('\n');
     sections.push(`## Project Knowledge\n${lines}`);
   }
 
   if (vaultNotes.length > 0) {
-    const lines = vaultNotes.map(n => {
-      const scoreStr = n.score ? ` (${n.source}, ${n.score.toFixed(2)})` : ` (${n.source})`;
-      return `- "${n.title}"${scoreStr}`;
-    }).join('\n');
+    const lines = vaultNotes.map(n => formatNote(n)).join('\n');
     sections.push(`## Vault Knowledge\n${lines}`);
   }
 
@@ -139,6 +144,42 @@ export function injectPreflightContext(messages: Message[], preflight: Preflight
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+const CONTRADICTION_SIGNALS = [
+  'failed', 'failure', 'broken', 'wrong', 'problem', 'issue', 'bug',
+  'doesn\'t work', 'not work', 'avoid', 'don\'t use', 'mistake',
+  'worse', 'slow', 'crash', 'couldn\'t', 'unable', 'rejected',
+];
+
+/**
+ * Flag notes whose titles suggest they contradict the user's intent.
+ * A note about "Redis failed under concurrent writes" contradicts
+ * a user saying "let's use Redis for caching."
+ */
+function flagContradictions(notes: PreflightNote[], userQuery: string): void {
+  const queryLower = userQuery.toLowerCase();
+  // Extract key nouns from user query (words > 3 chars, not common)
+  const queryTerms = queryLower.split(/\s+/).filter(w => w.length > 3);
+
+  for (const note of notes) {
+    const titleLower = note.title.toLowerCase();
+    // Does the note share topic with the query?
+    const topicOverlap = queryTerms.some(term => titleLower.includes(term));
+    if (!topicOverlap) continue;
+
+    // Does the note contain contradiction signals?
+    const hasContradiction = CONTRADICTION_SIGNALS.some(sig => titleLower.includes(sig));
+    if (hasContradiction) {
+      note.contradicting = true;
+    }
+  }
+}
+
+function formatNote(n: PreflightNote): string {
+  const tag = n.contradicting ? ' [CONTRADICTS — surface this]' : '';
+  const scoreStr = n.score ? ` (${n.source}, ${n.score.toFixed(2)})` : ` (${n.source})`;
+  return `- "${n.title}"${scoreStr}${tag}`;
+}
 
 async function searchProjectBrain(brain: ProjectBrain, query: string): Promise<ProjectMemory[]> {
   try {
