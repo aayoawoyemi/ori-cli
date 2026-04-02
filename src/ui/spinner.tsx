@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Box, Text } from 'ink';
+import { figures, colors } from './theme.js';
 
 const VERBS = [
   'Thinking', 'Reasoning', 'Analyzing', 'Processing',
@@ -11,7 +12,6 @@ interface SpinnerProps {
   activeTool?: string;
 }
 
-/** Animated spinner with verb, shown while the model is working. */
 export function Spinner({ isLoading, activeTool }: SpinnerProps): React.ReactElement | null {
   const [frame, setFrame] = useState(0);
   const [verb] = useState(() => VERBS[Math.floor(Math.random() * VERBS.length)]);
@@ -29,7 +29,6 @@ export function Spinner({ isLoading, activeTool }: SpinnerProps): React.ReactEle
 
   return (
     <Box>
-      <Text color="cyan">⏺ </Text>
       <Text dimColor>{label}{dots}</Text>
     </Box>
   );
@@ -40,7 +39,6 @@ interface ToolDotProps {
   isError: boolean;
 }
 
-/** Blinking dot for tool calls — like Claude Code's ToolUseLoader. */
 export function ToolDot({ resolved, isError }: ToolDotProps): React.ReactElement {
   const [visible, setVisible] = useState(true);
 
@@ -50,12 +48,12 @@ export function ToolDot({ resolved, isError }: ToolDotProps): React.ReactElement
     return () => clearInterval(interval);
   }, [resolved]);
 
-  const color = isError ? 'red' : resolved ? 'green' : undefined;
-  const char = visible || resolved ? '●' : ' ';
+  const color = isError ? colors.error : resolved ? colors.success : undefined;
+  const char = visible || resolved ? figures.dot : ' ';
 
   return (
     <Box minWidth={2}>
-      <Text color={color}>{char}</Text>
+      <Text color={color} dimColor={!resolved && !isError}>{char}</Text>
     </Box>
   );
 }

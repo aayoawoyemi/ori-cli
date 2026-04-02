@@ -2,8 +2,9 @@ import React from 'react';
 import { Box, Text } from 'ink';
 import { Markdown, StreamingMarkdown } from './markdown.js';
 import { ToolDot } from './spinner.js';
+import { figures, colors } from './theme.js';
 
-// ── Types for display ───────────────────────────────────────────────────────
+// ── Types ───────────────────────────────────────────────────────────────────
 
 export interface DisplayMessage {
   role: 'user' | 'assistant';
@@ -25,22 +26,21 @@ interface MessagesProps {
   isStreaming: boolean;
 }
 
-/** Render the conversation history + streaming response. */
+// ── Messages ────────────────────────────────────────────────────────────────
+
 export function Messages({ messages, toolCalls, streamingText, isStreaming }: MessagesProps): React.ReactElement {
   return (
-    <Box flexDirection="column" gap={1}>
+    <Box flexDirection="column">
       {messages.map((msg, i) => (
-        <MessageRow key={i} message={msg} />
+        <MessageRow key={i} message={msg} addMargin={i > 0} />
       ))}
 
-      {/* Active tool calls */}
       {toolCalls.map(tc => (
         <ToolCallRow key={tc.id} toolCall={tc} />
       ))}
 
-      {/* Streaming response */}
       {isStreaming && streamingText && (
-        <Box flexDirection="column">
+        <Box flexDirection="column" marginTop={1}>
           <StreamingMarkdown text={streamingText} />
         </Box>
       )}
@@ -48,30 +48,35 @@ export function Messages({ messages, toolCalls, streamingText, isStreaming }: Me
   );
 }
 
-function MessageRow({ message }: { message: DisplayMessage }): React.ReactElement {
+// ── Message Row ─────────────────────────────────────────────────────────────
+
+function MessageRow({ message, addMargin }: { message: DisplayMessage; addMargin: boolean }): React.ReactElement {
   if (message.role === 'user') {
     return (
-      <Box>
-        <Text bold color="blue">{`> `}</Text>
-        <Text bold>{message.text}</Text>
+      <Box flexDirection="row" marginTop={addMargin ? 1 : 0}>
+        <Text color={colors.subtle}>{figures.pointer} </Text>
+        <Text>{message.text}</Text>
       </Box>
     );
   }
 
-  // Assistant message — render as markdown
   return (
-    <Box flexDirection="column">
+    <Box flexDirection="column" marginTop={addMargin ? 1 : 0}>
       <Markdown text={message.text} />
     </Box>
   );
 }
 
+// ── Tool Call Row ───────────────────────────────────────────────────────────
+
 function ToolCallRow({ toolCall }: { toolCall: DisplayToolCall }): React.ReactElement {
   return (
-    <Box flexDirection="row" gap={1}>
+    <Box flexDirection="row" alignItems="flex-start">
       <ToolDot resolved={toolCall.resolved} isError={toolCall.isError} />
       <Text bold>{toolCall.name}</Text>
-      <Text dimColor>{toolCall.summary}</Text>
+      {toolCall.summary && (
+        <Text dimColor> ({toolCall.summary})</Text>
+      )}
     </Box>
   );
 }

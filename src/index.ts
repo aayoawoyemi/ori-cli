@@ -152,15 +152,11 @@ async function main(): Promise<void> {
   // ── Boot screen (before Ink takes over) ─────────────────────────────
   const agentLabel = vaultIdentity?.identity ? config.agent.name : 'Ori';
   console.log('');
-  console.log(chalk.bold(`  Ori CLI`) + chalk.dim(` v0.1.0`) + (agentLabel !== 'Ori' ? chalk.dim(` · agent: ${agentLabel}`) : ''));
-  console.log(chalk.dim(`  ${modelInfo.model} · ${authMode}`));
+  console.log(`  ${chalk.bold('Ori CLI')} ${chalk.dim('v0.1.0')}`);
+  console.log(chalk.dim(`  ${modelInfo.model} · ${authMode} · ${agentLabel}`));
   console.log(chalk.dim(`  ${cwd}`));
-
   if (vault?.connected) {
-    console.log(chalk.dim(`  Vault: ${vault.vaultPath} (${vaultNoteCount ?? '?'} notes)`));
-  }
-  if (projectBrain && projectBrain.count > 0) {
-    console.log(chalk.dim(`  Brain: ${projectBrain.count} project memories`));
+    console.log(chalk.dim(`  vault: ${vaultNoteCount ?? '?'} notes`));
   }
   console.log('');
 
