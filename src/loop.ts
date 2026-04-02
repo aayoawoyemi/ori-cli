@@ -5,6 +5,7 @@ import type { ToolContext } from './tools/types.js';
 import type { OriVault } from './memory/vault.js';
 import type { ProjectBrain } from './memory/projectBrain.js';
 import type { SessionStorage } from './session/storage.js';
+import type { HooksConfig } from './config/types.js';
 import { executeTools, resetDoomLoop } from './tools/execution.js';
 import { buildAssistantMessage, buildToolResultMessage, getMessageText } from './utils/messages.js';
 import { estimateTokens } from './utils/tokens.js';
@@ -36,9 +37,10 @@ export interface LoopParams {
   vault: OriVault | null;
   projectBrain: ProjectBrain | null;
   session: SessionStorage | null;
+  hooks?: HooksConfig;
   maxTurns?: number;
   maxResultChars?: number;
-  compactThreshold?: number;  // fraction (0.0-1.0), default 0.8
+  compactThreshold?: number;
   signal?: AbortSignal;
 }
 
@@ -67,6 +69,7 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     vault,
     projectBrain,
     session,
+    hooks,
     maxTurns = 50,
     maxResultChars = 30_000,
     compactThreshold = 0.8,
@@ -200,7 +203,7 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
         session?.log({ type: 'tool_call', id: tc.id, name: tc.name, input: tc.input, timestamp: Date.now() });
       }
 
-      const results = await executeTools(toolCalls, registry, toolContext);
+      const results = await executeTools(toolCalls, registry, toolContext, hooks, vault?.vaultPath);
 
       for (const result of results) {
         yield {

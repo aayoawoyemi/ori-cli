@@ -12,6 +12,8 @@ import type { ProjectBrain } from '../memory/projectBrain.js';
 import type { SessionStorage } from '../session/storage.js';
 import type { Message } from '../router/types.js';
 import { syncSession } from '../session/sync.js';
+import { runHooks } from '../hooks/runner.js';
+import type { HooksConfig } from '../config/types.js';
 import { runResearch } from '../research/index.js';
 import type { ResearchDepth } from '../research/types.js';
 
@@ -24,6 +26,7 @@ interface AppProps {
   projectBrain: ProjectBrain | null;
   session: SessionStorage;
   systemPrompt: string;
+  hooks: HooksConfig;
   vaultNoteCount?: number;
   initialPrompt?: string;
 }
@@ -32,7 +35,7 @@ export function App(props: AppProps): React.ReactElement {
   const { exit } = useApp();
   const {
     agentName, cwd, router, registry, vault, projectBrain,
-    session, systemPrompt, vaultNoteCount, initialPrompt,
+    session, systemPrompt, hooks, vaultNoteCount, initialPrompt,
   } = props;
 
   // ── State ───────────────────────────────────────────────────────────
@@ -49,7 +52,8 @@ export function App(props: AppProps): React.ReactElement {
   // Handle Ctrl+C
   useInput((input, key) => {
     if (key.ctrl && input === 'c') {
-      syncSession(messagesRef.current, 0, projectBrain, vault, router)
+      runHooks('stop', hooks, { cwd, vaultPath: vault?.vaultPath })
+        .then(() => syncSession(messagesRef.current, 0, projectBrain, vault, router))
         .finally(() => {
           vault?.disconnect();
           exit();
@@ -57,11 +61,14 @@ export function App(props: AppProps): React.ReactElement {
     }
   });
 
-  // Process initial prompt if provided
+  // Run sessionStart hooks + initial prompt
   useEffect(() => {
-    if (initialPrompt) {
-      handleSubmit(initialPrompt);
-    }
+    (async () => {
+      await runHooks('sessionStart', hooks, { cwd, vaultPath: vault?.vaultPath });
+      if (initialPrompt) {
+        handleSubmit(initialPrompt);
+      }
+    })();
   }, []);
 
   // ── Handle user input ───────────────────────────────────────────────
@@ -116,6 +123,7 @@ export function App(props: AppProps): React.ReactElement {
         vault,
         projectBrain,
         session,
+        hooks,
       });
 
       for await (const event of loop) {
@@ -194,6 +202,7 @@ export function App(props: AppProps): React.ReactElement {
     switch (cmd) {
       case '/exit':
       case '/quit':
+        await runHooks('stop', hooks, { cwd, vaultPath: vault?.vaultPath });
         await syncSession(messagesRef.current, 0, projectBrain, vault, router);
         vault?.disconnect();
         exit();

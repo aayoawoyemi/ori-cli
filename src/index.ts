@@ -175,6 +175,7 @@ async function main(): Promise<void> {
       projectBrain,
       session,
       systemPrompt,
+      hooks: config.hooks,
       vaultNoteCount,
       initialPrompt: promptArg,
     }),

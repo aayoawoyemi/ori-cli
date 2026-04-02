@@ -38,6 +38,7 @@ export const DEFAULT_CONFIG: AriesConfig = {
     allowWrite: true,
     allowNetwork: true,
   },
+  hooks: {},
   mcp: {
     servers: {},
   },

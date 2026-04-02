@@ -51,6 +51,19 @@ export interface AgentConfig {
   name: string;
 }
 
+export interface HookConfig {
+  command: string;
+  tools?: string[];
+  timeout?: number;
+}
+
+export interface HooksConfig {
+  sessionStart?: HookConfig[];
+  preToolUse?: HookConfig[];
+  postToolUse?: HookConfig[];
+  stop?: HookConfig[];
+}
+
 export interface AriesConfig {
   agent: AgentConfig;
   models: RouterConfig;
@@ -59,5 +72,6 @@ export interface AriesConfig {
   compact: CompactConfig;
   tools: ToolsConfig;
   permissions: PermissionsConfig;
+  hooks: HooksConfig;
   mcp: { servers: Record<string, { command: string; args?: string[] }> };
 }
