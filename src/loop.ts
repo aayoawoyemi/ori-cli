@@ -107,8 +107,40 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       });
     }
 
-    // ── COMPACTION CHECK ─────────────────────────────────────────────
+    // ── CONTEXT PROPRIOCEPTION ─────────────────────────────────────
+    // Inject token utilization so the agent can self-regulate.
+    // "You are at 43% context capacity" changes behavior — verbose when
+    // there's room, concise near compaction.
     const tokenEst = estimateTokens(messages);
+    const utilizationPct = Math.round((tokenEst / contextLimit) * 100);
+    const preflightTitles = lastPreflight
+      ? [...lastPreflight.projectNotes, ...lastPreflight.vaultNotes].map(n => {
+          const tag = n.contradicting ? ' [CONTRADICTS]' : '';
+          return `"${n.title}"${tag}`;
+        })
+      : [];
+
+    const proprioceptionBlock = [
+      `<context-status>`,
+      `Context: ${utilizationPct}% (${tokenEst}/${contextLimit} tokens estimated)`,
+      preflightTitles.length > 0
+        ? `Memories loaded this turn: ${preflightTitles.join(', ')}`
+        : 'No memories retrieved this turn.',
+      `</context-status>`,
+    ].join('\n');
+
+    // Inject as system-reminder in the last user message
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user' && typeof messages[i].content === 'string') {
+        messages[i] = {
+          ...messages[i],
+          content: `${messages[i].content}\n\n<system-reminder>\n${proprioceptionBlock}\n</system-reminder>`,
+        };
+        break;
+      }
+    }
+
+    // ── COMPACTION CHECK ─────────────────────────────────────────────
     if (tokenEst > compactTokenThreshold) {
       const result = await runCompaction(
         messages, projectBrain, vault, router, compactTokenThreshold,

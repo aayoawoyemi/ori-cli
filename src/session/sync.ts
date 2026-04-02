@@ -2,16 +2,16 @@ import type { Message } from '../router/types.js';
 import type { OriVault } from '../memory/vault.js';
 import type { ProjectBrain } from '../memory/projectBrain.js';
 import type { ModelRouter } from '../router/index.js';
-import { runPostflight, REFLECTION_THRESHOLD } from '../memory/postflight.js';
-import { triggerReflectionWithModel } from '../memory/reflection.js';
+import { runPostflight } from '../memory/postflight.js';
+import { triggerReflectionWithModel, triggerReflectionSimple } from '../memory/reflection.js';
 import { getMessageText } from '../utils/messages.js';
 
 /**
  * End-of-session sync. Called when the user exits or runs /clear.
  *
- * 1. Final postflight with accumulated session context
- * 2. Force reflection if importance accumulator is above half-threshold
- * 3. Save session summary to vault ops/sessions/
+ * 1. Final postflight
+ * 2. ALWAYS reflect — every session deserves a synthesis moment
+ * 3. Save session metadata to vault
  */
 export async function syncSession(
   messages: Message[],
@@ -20,21 +20,28 @@ export async function syncSession(
   vault: OriVault | null,
   router: ModelRouter,
 ): Promise<void> {
-  if (messages.length < 2) return; // nothing meaningful to sync
+  if (messages.length < 2) return;
 
   // 1. Final postflight
   await runPostflight(messages, null, projectBrain, vault, importanceAccumulator);
 
-  // 2. Force reflection if we accumulated enough importance (half threshold)
-  if (vault?.connected && importanceAccumulator >= REFLECTION_THRESHOLD / 2) {
+  // 2. Always reflect at session end — no threshold gate.
+  // Every session gets a synthesis moment. The agent identified this gap:
+  // "there's no moment where I look back at what happened and crystallize it."
+  if (vault?.connected && messages.length >= 4) {
     try {
       await triggerReflectionWithModel(messages, vault, router);
     } catch {
-      // Reflection failure shouldn't block exit
+      // Fall back to simple keyword reflection if cheap model unavailable
+      try {
+        await triggerReflectionSimple(messages, vault);
+      } catch {
+        // Reflection failure never blocks exit
+      }
     }
   }
 
-  // 3. Save session metadata to vault
+  // 3. Save session metadata
   if (vault?.connected && messages.length >= 4) {
     const userMsgCount = messages.filter(m => m.role === 'user').length;
     const assistantMsgCount = messages.filter(m => m.role === 'assistant').length;
@@ -44,7 +51,7 @@ export async function syncSession(
 
     await vault.add(
       `session ${date} ${topic}`,
-      `Session on ${date}. ${userMsgCount} user messages, ${assistantMsgCount} assistant messages. Last topic: ${topic}`,
+      `Session on ${date}. ${userMsgCount} user messages, ${assistantMsgCount} assistant messages. Topic: ${topic}`,
       'learning',
     ).catch(() => {});
   }
