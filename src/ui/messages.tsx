@@ -53,9 +53,14 @@ export function Messages({ messages, toolCalls, streamingText, isStreaming }: Me
 function MessageRow({ message, addMargin }: { message: DisplayMessage; addMargin: boolean }): React.ReactElement {
   if (message.role === 'user') {
     return (
-      <Box flexDirection="row" marginTop={addMargin ? 1 : 0}>
+      <Box
+        flexDirection="row"
+        marginTop={addMargin ? 1 : 0}
+        width="100%"
+        paddingRight={1}
+      >
         <Text color={colors.subtle}>{figures.pointer} </Text>
-        <Text>{message.text}</Text>
+        <Text backgroundColor="#333333" color="white">{message.text}</Text>
       </Box>
     );
   }
