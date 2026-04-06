@@ -1,0 +1,11 @@
+# Phase 1: stdlib only.
+# Phase 2: tree-sitter parsing + graph algorithms.
+tree-sitter>=0.25
+tree-sitter-language-pack>=1.4
+rustworkx>=0.17
+networkx>=3.0
+
+# Phase 3: reuses existing Ori Mnemos MCP interface — no new Python deps.
+
+# Phase 4: rlm_call recursive self-invocation.
+anthropic>=0.40

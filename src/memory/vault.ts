@@ -190,10 +190,27 @@ class McpClient extends EventEmitter {
     return result;
   }
 
+  /**
+   * Graceful disconnect: close stdin so the child process sees EOF,
+   * which triggers Node's 'beforeExit' event → flushSession in Ori.
+   * This ensures Q-value batch rewards, NPMI recomputation, and
+   * homeostasis normalization run before the process exits.
+   */
   disconnect(): void {
     if (this.proc) {
-      this.proc.kill();
-      this.proc = null;
+      try {
+        // Close stdin — Ori's MCP server reads from stdin, EOF causes
+        // the read loop to end, which triggers process.beforeExit → flushSession.
+        this.proc.stdin?.end();
+      } catch { /* already closed */ }
+
+      // Give it a moment to flush, then force kill if still alive
+      setTimeout(() => {
+        try { this.proc?.kill(); } catch { /* already dead */ }
+        this.proc = null;
+      }, 2000);
+
+      // Don't null proc immediately — let the timeout handle it
     }
   }
 }
@@ -290,12 +307,57 @@ export class OriVault {
     }
   }
 
+  async querySimilar(query: string, limit = 5): Promise<VaultNote[]> {
+    try {
+      const result = await this.client.callTool('ori_query_similar', {
+        query, limit,
+      }) as { success: boolean; data?: { results: Array<{ title: string; score: number }> } };
+
+      return (result.data?.results ?? []).map(r => ({
+        title: r.title,
+        score: r.score,
+        source: 'similar',
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  async queryFading(limit = 5): Promise<VaultNote[]> {
+    try {
+      const result = await this.client.callTool('ori_query_fading', {
+        limit,
+      }) as { success: boolean; data?: { results: Array<{ title: string; score: number }> } };
+
+      return (result.data?.results ?? []).map(r => ({
+        title: r.title,
+        score: r.score,
+        source: 'fading',
+      }));
+    } catch {
+      return [];
+    }
+  }
+
   // ── Write ───────────────────────────────────────────────────────────────
 
   async add(title: string, content: string, type = 'insight'): Promise<boolean> {
     try {
       const result = await this.client.callTool('ori_add', {
         title, content, type,
+      }) as { success: boolean };
+      return result.success;
+    } catch {
+      return false;
+    }
+  }
+
+  // ── Update (triggers vitality bump + spreading activation) ──────────
+
+  async update(title: string): Promise<boolean> {
+    try {
+      const result = await this.client.callTool('ori_update', {
+        file: title,
       }) as { success: boolean };
       return result.success;
     } catch {

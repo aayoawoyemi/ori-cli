@@ -1,0 +1,177 @@
+{
+  "tasks": [
+    "rename",
+    "explore"
+  ],
+  "model": "sonnet",
+  "runs": 5,
+  "results": [
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 1,
+      "turns": 6,
+      "inputTokens": 9789,
+      "outputTokens": 740,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 17610,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": true,
+      "typecheckErrors": 29
+    },
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 2,
+      "turns": 6,
+      "inputTokens": 9781,
+      "outputTokens": 704,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 17194,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": true,
+      "typecheckErrors": 29
+    },
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 3,
+      "turns": 6,
+      "inputTokens": 9741,
+      "outputTokens": 700,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 18053,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": true,
+      "typecheckErrors": 29
+    },
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 4,
+      "turns": 6,
+      "inputTokens": 9879,
+      "outputTokens": 753,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 25300,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": true,
+      "typecheckErrors": 29
+    },
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 5,
+      "turns": 6,
+      "inputTokens": 13800,
+      "outputTokens": 750,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 18529,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": true,
+      "typecheckErrors": 29
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 1,
+      "turns": 15,
+      "inputTokens": 94900,
+      "outputTokens": 1697,
+      "toolCalls": 15,
+      "toolBreakdown": {
+        "Repl": 15
+      },
+      "wallMs": 74941,
+      "success": false,
+      "reason": "error: Max turns exceeded (15)",
+      "error": "Max turns exceeded (15)"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 2,
+      "turns": 15,
+      "inputTokens": 96230,
+      "outputTokens": 1591,
+      "toolCalls": 15,
+      "toolBreakdown": {
+        "Repl": 15
+      },
+      "wallMs": 41984,
+      "success": false,
+      "reason": "error: Max turns exceeded (15)",
+      "error": "Max turns exceeded (15)"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 3,
+      "turns": 15,
+      "inputTokens": 89169,
+      "outputTokens": 2202,
+      "toolCalls": 15,
+      "toolBreakdown": {
+        "Repl": 15
+      },
+      "wallMs": 50082,
+      "success": false,
+      "reason": "error: Max turns exceeded (15)",
+      "error": "Max turns exceeded (15)"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 4,
+      "turns": 0,
+      "inputTokens": 0,
+      "outputTokens": 0,
+      "toolCalls": 0,
+      "toolBreakdown": {},
+      "wallMs": 0,
+      "success": false,
+      "reason": "exception: bridge request timed out after 10000ms",
+      "error": "bridge request timed out after 10000ms"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 5,
+      "turns": 10,
+      "inputTokens": 55321,
+      "outputTokens": 1159,
+      "toolCalls": 9,
+      "toolBreakdown": {
+        "Repl": 9
+      },
+      "wallMs": 30782,
+      "success": false,
+      "reason": "warmContext.ts: advanceTurn not exported"
+    }
+  ]
+}

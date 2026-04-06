@@ -4,6 +4,7 @@ import type { OriVault } from './vault.js';
 import type { ProjectBrain } from './projectBrain.js';
 import { estimateTokens } from '../utils/tokens.js';
 import { getMessageText } from '../utils/messages.js';
+import { getWarmContextForCompaction } from './warmContext.js';
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -216,10 +217,14 @@ export async function runCompaction(
     ? `\n\n${saved.length} insights saved to persistent memory (${saved.filter(s => s.tier === 'vault').length} vault, ${saved.filter(s => s.tier === 'project').length} project). These will be available via preflight retrieval.`
     : '';
 
+  // Prepend warm context so identity/goals/reflections survive compaction
+  const warmBlock = getWarmContextForCompaction();
+  const warmPrefix = warmBlock ? `${warmBlock}\n\n` : '';
+
   const compactedMessages: Message[] = [
     {
       role: 'user',
-      content: `<compaction-summary>\nThis is a structured summary of the previous conversation:\n\n${summary}${savedInfo}\n</compaction-summary>\n\nContinue from where we left off.`,
+      content: `${warmPrefix}<compaction-summary>\nThis is a structured summary of the previous conversation:\n\n${summary}${savedInfo}\n</compaction-summary>\n\nContinue from where we left off.`,
       meta: {
         type: 'compact_boundary',
         compactedAt: Date.now(),

@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { captureSnapshot } from './snapshot.js';
 import type { Tool } from './types.js';
 import type { ToolDefinition, ToolResult } from '../router/types.js';
 
@@ -127,6 +128,59 @@ function contextAwareMatch(content: string, oldString: string): string | null {
   return null;
 }
 
+/**
+ * Generate a simple unified diff between old and new text.
+ * Shows 2 lines of context around changes.
+ */
+function generateDiff(oldText: string, newText: string, filePath: string): string {
+  const oldLines = oldText.split('\n');
+  const newLines = newText.split('\n');
+  const result: string[] = [`--- ${filePath}`, `+++ ${filePath}`];
+
+  // Find first differing line
+  let start = 0;
+  while (start < oldLines.length && start < newLines.length && oldLines[start] === newLines[start]) {
+    start++;
+  }
+
+  // Find last differing line (from the end)
+  let oldEnd = oldLines.length - 1;
+  let newEnd = newLines.length - 1;
+  while (oldEnd > start && newEnd > start && oldLines[oldEnd] === newLines[newEnd]) {
+    oldEnd--;
+    newEnd--;
+  }
+
+  // Context: 2 lines before and after
+  const ctxStart = Math.max(0, start - 2);
+  const ctxOldEnd = Math.min(oldLines.length - 1, oldEnd + 2);
+  const ctxNewEnd = Math.min(newLines.length - 1, newEnd + 2);
+
+  result.push(`@@ -${ctxStart + 1},${ctxOldEnd - ctxStart + 1} +${ctxStart + 1},${ctxNewEnd - ctxStart + 1} @@`);
+
+  // Context before
+  for (let i = ctxStart; i < start; i++) {
+    result.push(` ${oldLines[i]}`);
+  }
+
+  // Removed lines
+  for (let i = start; i <= oldEnd; i++) {
+    result.push(`-${oldLines[i]}`);
+  }
+
+  // Added lines
+  for (let i = start; i <= newEnd; i++) {
+    result.push(`+${newLines[i]}`);
+  }
+
+  // Context after
+  for (let i = oldEnd + 1; i <= ctxOldEnd; i++) {
+    if (i < oldLines.length) result.push(` ${oldLines[i]}`);
+  }
+
+  return result.join('\n');
+}
+
 // ── Edit Tool ───────────────────────────────────────────────────────────────
 
 export class EditTool implements Tool {
@@ -204,13 +258,15 @@ export class EditTool implements Tool {
         ? content.split(actualMatch).join(newString)
         : content.replace(actualMatch, newString);
 
+      captureSnapshot(filePath, 'Edit');
       writeFileSync(filePath, updated, 'utf-8');
 
       const strategyNote = found.strategy !== 'exact' ? ` (matched via ${found.strategy})` : '';
+      const diff = generateDiff(actualMatch, newString, filePath);
       return {
         id: '',
         name: this.name,
-        output: `File edited successfully: ${filePath}${strategyNote}`,
+        output: `Applied edit to ${filePath}${strategyNote}\n${diff}`,
         isError: false,
       };
     } catch (err) {

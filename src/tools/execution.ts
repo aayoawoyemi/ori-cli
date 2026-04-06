@@ -55,6 +55,7 @@ export async function executeTools(
   ctx: ToolContext,
   hooks?: HooksConfig,
   vaultPath?: string,
+  maxSubagents = 5,
 ): Promise<ToolResult[]> {
   const results: ToolResult[] = [];
 
@@ -89,12 +90,26 @@ export async function executeTools(
     }
   }
 
-  // Run all read-only tools in parallel
-  if (readCalls.length > 0) {
+  // Separate agent calls from other read-only tools
+  const agentCalls = readCalls.filter(tc => tc.name === 'Agent');
+  const otherReads = readCalls.filter(tc => tc.name !== 'Agent');
+
+  // Other reads: unbounded parallel (fast filesystem ops)
+  if (otherReads.length > 0) {
     const readResults = await Promise.all(
-      readCalls.map(tc => executeSingle(tc, registry, ctx, hooks, vaultPath)),
+      otherReads.map(tc => executeSingle(tc, registry, ctx, hooks, vaultPath)),
     );
     results.push(...readResults);
+  }
+
+  // Agent calls: bounded parallel (each spawns a child process)
+  if (agentCalls.length > 0) {
+    const agentResults = await runBounded(
+      agentCalls,
+      maxSubagents,
+      tc => executeSingle(tc, registry, ctx, hooks, vaultPath),
+    );
+    results.push(...agentResults);
   }
 
   // Run write tools serially
@@ -103,6 +118,35 @@ export async function executeTools(
     results.push(result);
   }
 
+  return results;
+}
+
+/**
+ * Run async tasks with bounded concurrency.
+ * At most `limit` tasks execute simultaneously; the rest queue.
+ */
+async function runBounded(
+  items: ToolCall[],
+  limit: number,
+  fn: (item: ToolCall) => Promise<ToolResult>,
+): Promise<ToolResult[]> {
+  const results: ToolResult[] = [];
+  const executing = new Set<Promise<void>>();
+
+  for (const item of items) {
+    const p = (async () => {
+      const result = await fn(item);
+      results.push(result);
+    })();
+    executing.add(p);
+    p.finally(() => executing.delete(p));
+
+    if (executing.size >= limit) {
+      await Promise.race(executing);
+    }
+  }
+
+  await Promise.all(executing);
   return results;
 }
 

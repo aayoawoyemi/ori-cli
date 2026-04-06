@@ -1,0 +1,102 @@
+{
+  "task": "rename-multi-file",
+  "model": "qwen3.6",
+  "runs": 3,
+  "results": [
+    {
+      "variant": "BARE",
+      "run": 1,
+      "turns": 5,
+      "inputTokens": 22939,
+      "outputTokens": 1068,
+      "toolCalls": 9,
+      "toolBreakdown": {
+        "Grep": 2,
+        "Read": 3,
+        "Edit": 4
+      },
+      "wallMs": 23814,
+      "success": true,
+      "reason": "ok"
+    },
+    {
+      "variant": "BARE",
+      "run": 2,
+      "turns": 6,
+      "inputTokens": 28451,
+      "outputTokens": 1220,
+      "toolCalls": 9,
+      "toolBreakdown": {
+        "Grep": 2,
+        "Read": 3,
+        "Edit": 4
+      },
+      "wallMs": 27982,
+      "success": true,
+      "reason": "ok"
+    },
+    {
+      "variant": "BARE",
+      "run": 3,
+      "turns": 5,
+      "inputTokens": 23669,
+      "outputTokens": 1116,
+      "toolCalls": 9,
+      "toolBreakdown": {
+        "Grep": 2,
+        "Read": 3,
+        "Edit": 4
+      },
+      "wallMs": 24399,
+      "success": true,
+      "reason": "ok"
+    },
+    {
+      "variant": "HARNESS",
+      "run": 1,
+      "turns": 9,
+      "inputTokens": 50066,
+      "outputTokens": 1577,
+      "toolCalls": 11,
+      "toolBreakdown": {
+        "Repl": 3,
+        "Edit": 4,
+        "Bash": 4
+      },
+      "wallMs": 36462,
+      "success": true,
+      "reason": "ok"
+    },
+    {
+      "variant": "HARNESS",
+      "run": 2,
+      "turns": 15,
+      "inputTokens": 85446,
+      "outputTokens": 1773,
+      "toolCalls": 14,
+      "toolBreakdown": {
+        "Repl": 3,
+        "Edit": 5,
+        "Bash": 6
+      },
+      "wallMs": 49679,
+      "success": true,
+      "reason": "ok"
+    },
+    {
+      "variant": "HARNESS",
+      "run": 3,
+      "turns": 9,
+      "inputTokens": 44184,
+      "outputTokens": 1092,
+      "toolCalls": 8,
+      "toolBreakdown": {
+        "Bash": 4,
+        "Edit": 4
+      },
+      "wallMs": 27563,
+      "success": true,
+      "reason": "ok"
+    }
+  ]
+}

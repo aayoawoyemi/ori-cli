@@ -1,0 +1,130 @@
+{
+  "tasks": [
+    "rename",
+    "explore"
+  ],
+  "model": "sonnet",
+  "runs": 3,
+  "results": [
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 1,
+      "turns": 4,
+      "inputTokens": 16980,
+      "outputTokens": 683,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 10700,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": false,
+      "typecheckErrors": 30,
+      "judgeScore": 50,
+      "judgeRationale": "judge error: signal.addEventListener is not a function"
+    },
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 2,
+      "turns": 6,
+      "inputTokens": 25833,
+      "outputTokens": 686,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 11755,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": false,
+      "typecheckErrors": 30,
+      "judgeScore": 50,
+      "judgeRationale": "judge error: signal.addEventListener is not a function"
+    },
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 3,
+      "turns": 6,
+      "inputTokens": 30134,
+      "outputTokens": 741,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 53522,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": false,
+      "typecheckErrors": 30,
+      "judgeScore": 50,
+      "judgeRationale": "judge error: signal.addEventListener is not a function"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 1,
+      "turns": 4,
+      "inputTokens": 9809,
+      "outputTokens": 713,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Repl": 1,
+        "Edit": 4
+      },
+      "wallMs": 18700,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": false,
+      "typecheckErrors": 30,
+      "judgeScore": 50,
+      "judgeRationale": "judge error: signal.addEventListener is not a function"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 2,
+      "turns": 4,
+      "inputTokens": 9743,
+      "outputTokens": 660,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Repl": 1,
+        "Edit": 4
+      },
+      "wallMs": 21133,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": false,
+      "typecheckErrors": 30,
+      "judgeScore": 50,
+      "judgeRationale": "judge error: signal.addEventListener is not a function"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 3,
+      "turns": 4,
+      "inputTokens": 9747,
+      "outputTokens": 682,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Repl": 1,
+        "Edit": 4
+      },
+      "wallMs": 11048,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": false,
+      "typecheckErrors": 30,
+      "judgeScore": 50,
+      "judgeRationale": "judge error: signal.addEventListener is not a function"
+    }
+  ]
+}

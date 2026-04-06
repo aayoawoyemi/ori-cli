@@ -1,0 +1,120 @@
+{
+  "tasks": [
+    "rename",
+    "explore"
+  ],
+  "model": "qwen3.6",
+  "runs": 3,
+  "results": [
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 1,
+      "turns": 15,
+      "inputTokens": 80449,
+      "outputTokens": 1712,
+      "toolCalls": 15,
+      "toolBreakdown": {
+        "Repl": 7,
+        "Read": 1,
+        "Edit": 6,
+        "Bash": 1
+      },
+      "wallMs": 47476,
+      "success": false,
+      "reason": "error: Max turns exceeded (15)",
+      "error": "Max turns exceeded (15)"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 2,
+      "turns": 15,
+      "inputTokens": 105909,
+      "outputTokens": 3323,
+      "toolCalls": 21,
+      "toolBreakdown": {
+        "Repl": 9,
+        "Edit": 11,
+        "Bash": 1
+      },
+      "wallMs": 74352,
+      "success": false,
+      "reason": "error: Max turns exceeded (15)",
+      "error": "Max turns exceeded (15)"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 3,
+      "turns": 15,
+      "inputTokens": 86102,
+      "outputTokens": 2824,
+      "toolCalls": 15,
+      "toolBreakdown": {
+        "Repl": 5,
+        "Edit": 7,
+        "Bash": 1,
+        "Write": 2
+      },
+      "wallMs": 64260,
+      "success": false,
+      "reason": "error: Max turns exceeded (15)",
+      "error": "Max turns exceeded (15)"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "explore",
+      "run": 1,
+      "turns": 15,
+      "inputTokens": 214253,
+      "outputTokens": 1311,
+      "toolCalls": 15,
+      "toolBreakdown": {
+        "Repl": 15
+      },
+      "wallMs": 45526,
+      "success": false,
+      "reason": "error: Max turns exceeded (15)",
+      "error": "Max turns exceeded (15)"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "explore",
+      "run": 2,
+      "turns": 15,
+      "inputTokens": 192577,
+      "outputTokens": 1455,
+      "toolCalls": 16,
+      "toolBreakdown": {
+        "Repl": 14,
+        "Read": 1,
+        "Bash": 1
+      },
+      "wallMs": 49541,
+      "success": false,
+      "reason": "error: Max turns exceeded (15)",
+      "error": "Max turns exceeded (15)"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "explore",
+      "run": 3,
+      "turns": 15,
+      "inputTokens": 102421,
+      "outputTokens": 2009,
+      "toolCalls": 15,
+      "toolBreakdown": {
+        "Repl": 11,
+        "Read": 1,
+        "Bash": 1,
+        "Edit": 1,
+        "WebFetch": 1
+      },
+      "wallMs": 52930,
+      "success": false,
+      "reason": "error: Max turns exceeded (15)",
+      "error": "Max turns exceeded (15)"
+    }
+  ]
+}

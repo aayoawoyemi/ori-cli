@@ -1,0 +1,198 @@
+{
+  "tasks": [
+    "rename",
+    "explore"
+  ],
+  "model": "sonnet",
+  "runs": 3,
+  "results": [
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 1,
+      "turns": 6,
+      "inputTokens": 25973,
+      "outputTokens": 709,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 14335,
+      "success": true,
+      "reason": "ok"
+    },
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 2,
+      "turns": 6,
+      "inputTokens": 26114,
+      "outputTokens": 750,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 28353,
+      "success": true,
+      "reason": "ok"
+    },
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 3,
+      "turns": 4,
+      "inputTokens": 19209,
+      "outputTokens": 726,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 36615,
+      "success": true,
+      "reason": "ok"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 1,
+      "turns": 4,
+      "inputTokens": 9912,
+      "outputTokens": 704,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Repl": 1,
+        "Edit": 4
+      },
+      "wallMs": 21274,
+      "success": true,
+      "reason": "ok"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 2,
+      "turns": 4,
+      "inputTokens": 9753,
+      "outputTokens": 712,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Repl": 1,
+        "Edit": 4
+      },
+      "wallMs": 20725,
+      "success": true,
+      "reason": "ok"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 3,
+      "turns": 4,
+      "inputTokens": 9402,
+      "outputTokens": 530,
+      "toolCalls": 4,
+      "toolBreakdown": {
+        "Repl": 1,
+        "Edit": 3
+      },
+      "wallMs": 17429,
+      "success": false,
+      "reason": "warmContext.ts still has tickTurn"
+    },
+    {
+      "variant": "BARE",
+      "task": "explore",
+      "run": 1,
+      "turns": 5,
+      "inputTokens": 73661,
+      "outputTokens": 572,
+      "toolCalls": 9,
+      "toolBreakdown": {
+        "Glob": 1,
+        "Bash": 1,
+        "Read": 6,
+        "Grep": 1
+      },
+      "wallMs": 89837,
+      "success": false,
+      "reason": "error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request w",
+      "error": "429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your organization's rate limit of 30,000 input tokens per minute (org: 60f92a43-e32b-4e31-8299-45b41747198a, model: claude-sonnet-4-6). For details, refer to: https://docs.claude.com/en/api/rate-limits. You can see the response headers for current usage. Please reduce the prompt length or the maximum tokens requested, or try again later. You may also contact sales at https://claude.com/contact-sales to discuss your options for a rate limit increase.\"},\"request_id\":\"req_011CZmWCkxL1zUEqsKjnJgmm\"}"
+    },
+    {
+      "variant": "BARE",
+      "task": "explore",
+      "run": 2,
+      "turns": 1,
+      "inputTokens": 0,
+      "outputTokens": 0,
+      "toolCalls": 0,
+      "toolBreakdown": {},
+      "wallMs": 1858,
+      "success": false,
+      "reason": "error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request w",
+      "error": "429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your organization's rate limit of 30,000 input tokens per minute (org: 60f92a43-e32b-4e31-8299-45b41747198a, model: claude-sonnet-4-6). For details, refer to: https://docs.claude.com/en/api/rate-limits. You can see the response headers for current usage. Please reduce the prompt length or the maximum tokens requested, or try again later. You may also contact sales at https://claude.com/contact-sales to discuss your options for a rate limit increase.\"},\"request_id\":\"req_011CZmWCuhw3QCynvTbqtxvQ\"}"
+    },
+    {
+      "variant": "BARE",
+      "task": "explore",
+      "run": 3,
+      "turns": 1,
+      "inputTokens": 0,
+      "outputTokens": 0,
+      "toolCalls": 0,
+      "toolBreakdown": {},
+      "wallMs": 1560,
+      "success": false,
+      "reason": "error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request w",
+      "error": "429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your organization's rate limit of 30,000 input tokens per minute (org: 60f92a43-e32b-4e31-8299-45b41747198a, model: claude-sonnet-4-6). For details, refer to: https://docs.claude.com/en/api/rate-limits. You can see the response headers for current usage. Please reduce the prompt length or the maximum tokens requested, or try again later. You may also contact sales at https://claude.com/contact-sales to discuss your options for a rate limit increase.\"},\"request_id\":\"req_011CZmWD3LpYU5EcLveE8eGS\"}"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "explore",
+      "run": 1,
+      "turns": 6,
+      "inputTokens": 45492,
+      "outputTokens": 2163,
+      "toolCalls": 9,
+      "toolBreakdown": {
+        "Repl": 9
+      },
+      "wallMs": 156634,
+      "success": true,
+      "reason": "5/5 concepts covered"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "explore",
+      "run": 2,
+      "turns": 9,
+      "inputTokens": 77720,
+      "outputTokens": 2494,
+      "toolCalls": 8,
+      "toolBreakdown": {
+        "Repl": 8
+      },
+      "wallMs": 149786,
+      "success": true,
+      "reason": "5/5 concepts covered"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "explore",
+      "run": 3,
+      "turns": 6,
+      "inputTokens": 46682,
+      "outputTokens": 2426,
+      "toolCalls": 8,
+      "toolBreakdown": {
+        "Repl": 8
+      },
+      "wallMs": 102216,
+      "success": true,
+      "reason": "5/5 concepts covered"
+    }
+  ]
+}

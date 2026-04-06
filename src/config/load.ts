@@ -5,6 +5,30 @@ import { parse as parseYaml } from 'yaml';
 import { DEFAULT_CONFIG } from './defaults.js';
 import type { AriesConfig } from './types.js';
 
+/** Load .env file into process.env (simple key=value parser, no dependencies). */
+function loadDotenv(cwd: string): void {
+  const paths = [
+    join(cwd, '.env'),
+    join(cwd, '.env.local'),
+    join(homedir(), '.aries', '.env'),
+  ];
+  for (const p of paths) {
+    if (!existsSync(p)) continue;
+    const lines = readFileSync(p, 'utf-8').split('\n');
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eq = trimmed.indexOf('=');
+      if (eq === -1) continue;
+      const key = trimmed.slice(0, eq).trim();
+      const val = trimmed.slice(eq + 1).trim().replace(/^['"]|['"]$/g, '');
+      if (key && !(key in process.env)) {
+        process.env[key] = val;
+      }
+    }
+  }
+}
+
 /** Recursively interpolate ${ENV_VAR} references in string values. */
 function interpolateEnv(obj: unknown): unknown {
   if (typeof obj === 'string') {
@@ -53,6 +77,9 @@ function deepMerge<T extends Record<string, unknown>>(a: T, b: Record<string, un
  * 3. Built-in defaults
  */
 export function loadConfig(cwd: string): AriesConfig {
+  // Load .env files before anything else so ${ENV_VAR} interpolation works
+  loadDotenv(cwd);
+
   const globalPath = join(homedir(), '.aries', 'config.yaml');
   const projectPath = join(cwd, '.aries', 'config.yaml');
 

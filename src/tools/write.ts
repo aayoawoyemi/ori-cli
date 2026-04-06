@@ -1,5 +1,6 @@
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
+import { captureSnapshot } from './snapshot.js';
 import type { Tool } from './types.js';
 import type { ToolDefinition, ToolResult } from '../router/types.js';
 
@@ -35,6 +36,7 @@ export class WriteTool implements Tool {
 
     try {
       mkdirSync(dirname(filePath), { recursive: true });
+      captureSnapshot(filePath, 'Write');
       writeFileSync(filePath, content, 'utf-8');
       return {
         id: '',

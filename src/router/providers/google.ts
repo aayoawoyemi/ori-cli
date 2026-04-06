@@ -3,7 +3,7 @@ import type { ModelProvider, Message, ToolDefinition, StreamEvent, ContentBlock 
 import type { ModelConfig } from '../../config/types.js';
 
 /** Convert our messages to Gemini Content format. */
-function toGeminiContents(messages: Message[]): Content[] {
+function toGeminiContents(messages: Message[], toolNameById?: Map<string, string>): Content[] {
   const contents: Content[] = [];
 
   for (const msg of messages) {
@@ -33,10 +33,19 @@ function toGeminiContents(messages: Message[]): Content[] {
         for (const block of msg.content as ContentBlock[]) {
           if (block.type === 'text') {
             parts.push({ text: block.text });
+          } else if (block.type === 'image') {
+            parts.push({
+              inlineData: {
+                mimeType: block.source.media_type,
+                data: block.source.data,
+              },
+            });
           } else if (block.type === 'tool_result') {
+            // Gemini requires the function NAME, not the ID
+            const funcName = toolNameById?.get(block.tool_use_id) ?? block.tool_use_id;
             parts.push({
               functionResponse: {
-                name: block.tool_use_id, // Gemini uses the function name, but we track by id
+                name: funcName,
                 response: { result: block.content },
               },
             });
@@ -69,6 +78,8 @@ export class GoogleProvider implements ModelProvider {
   readonly model: string;
   readonly contextWindow: number;
   private client: GoogleGenAI;
+  // Track tool call IDs → function names for correlating results
+  private toolNameById = new Map<string, string>();
 
   constructor(config: ModelConfig) {
     this.model = config.model;
@@ -84,7 +95,7 @@ export class GoogleProvider implements ModelProvider {
     tools: ToolDefinition[],
     signal?: AbortSignal,
   ): AsyncGenerator<StreamEvent> {
-    const contents = toGeminiContents(messages);
+    const contents = toGeminiContents(messages, this.toolNameById);
     const geminiTools = toGeminiTools(tools);
 
     const response = await this.client.models.generateContentStream({
@@ -116,6 +127,8 @@ export class GoogleProvider implements ModelProvider {
           const id = `gemini_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
           const name = part.functionCall.name!;
           const input = (part.functionCall.args ?? {}) as Record<string, unknown>;
+          // Track ID → name so tool results can use the correct function name
+          this.toolNameById.set(id, name);
           yield { type: 'tool_use_start', id, name };
           yield { type: 'tool_use_end', id, input };
         }

@@ -1,0 +1,81 @@
+{
+  "tasks": [
+    "rename",
+    "explore"
+  ],
+  "model": "qwen3.6",
+  "runs": 1,
+  "results": [
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 1,
+      "turns": 5,
+      "inputTokens": 23982,
+      "outputTokens": 1312,
+      "toolCalls": 9,
+      "toolBreakdown": {
+        "Grep": 2,
+        "Read": 3,
+        "Edit": 4
+      },
+      "wallMs": 28847,
+      "success": true,
+      "reason": "ok"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 1,
+      "turns": 15,
+      "inputTokens": 97359,
+      "outputTokens": 3951,
+      "toolCalls": 23,
+      "toolBreakdown": {
+        "Repl": 8,
+        "Edit": 10,
+        "Read": 3,
+        "Bash": 1,
+        "WebFetch": 1
+      },
+      "wallMs": 105903,
+      "success": false,
+      "reason": "error: Max turns exceeded (15)",
+      "error": "Max turns exceeded (15)"
+    },
+    {
+      "variant": "BARE",
+      "task": "explore",
+      "run": 1,
+      "turns": 4,
+      "inputTokens": 105923,
+      "outputTokens": 2379,
+      "toolCalls": 9,
+      "toolBreakdown": {
+        "Glob": 1,
+        "Grep": 2,
+        "Read": 6
+      },
+      "wallMs": 57058,
+      "success": true,
+      "reason": "5/5 concepts covered"
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "explore",
+      "run": 1,
+      "turns": 15,
+      "inputTokens": 168634,
+      "outputTokens": 1383,
+      "toolCalls": 15,
+      "toolBreakdown": {
+        "Repl": 14,
+        "": 1
+      },
+      "wallMs": 46571,
+      "success": false,
+      "reason": "error: Max turns exceeded (15)",
+      "error": "Max turns exceeded (15)"
+    }
+  ]
+}

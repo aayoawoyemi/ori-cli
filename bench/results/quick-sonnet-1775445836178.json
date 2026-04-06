@@ -1,0 +1,190 @@
+{
+  "tasks": [
+    "rename",
+    "explore"
+  ],
+  "model": "sonnet",
+  "runs": 5,
+  "results": [
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 1,
+      "turns": 6,
+      "inputTokens": 9834,
+      "outputTokens": 740,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 15052,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": true,
+      "typecheckErrors": 29
+    },
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 2,
+      "turns": 6,
+      "inputTokens": 13650,
+      "outputTokens": 730,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 16109,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": true,
+      "typecheckErrors": 29
+    },
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 3,
+      "turns": 6,
+      "inputTokens": 9906,
+      "outputTokens": 691,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 14517,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": true,
+      "typecheckErrors": 29
+    },
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 4,
+      "turns": 6,
+      "inputTokens": 9726,
+      "outputTokens": 721,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 53788,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": true,
+      "typecheckErrors": 29
+    },
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 5,
+      "turns": 4,
+      "inputTokens": 6164,
+      "outputTokens": 753,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 15890,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": true,
+      "typecheckErrors": 29
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 1,
+      "turns": 4,
+      "inputTokens": 9801,
+      "outputTokens": 739,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Repl": 1,
+        "Edit": 4
+      },
+      "wallMs": 15449,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": true,
+      "typecheckErrors": 29
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 2,
+      "turns": 5,
+      "inputTokens": 13270,
+      "outputTokens": 835,
+      "toolCalls": 6,
+      "toolBreakdown": {
+        "Repl": 2,
+        "Edit": 4
+      },
+      "wallMs": 24048,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": true,
+      "typecheckErrors": 29
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 3,
+      "turns": 4,
+      "inputTokens": 9830,
+      "outputTokens": 735,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Repl": 1,
+        "Edit": 4
+      },
+      "wallMs": 14829,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": true,
+      "typecheckErrors": 29
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 4,
+      "turns": 4,
+      "inputTokens": 9804,
+      "outputTokens": 706,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Repl": 1,
+        "Edit": 4
+      },
+      "wallMs": 10699,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": true,
+      "typecheckErrors": 29
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 5,
+      "turns": 4,
+      "inputTokens": 9804,
+      "outputTokens": 709,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Repl": 1,
+        "Edit": 4
+      },
+      "wallMs": 15435,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": true,
+      "typecheckErrors": 29
+    }
+  ]
+}

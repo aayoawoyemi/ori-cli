@@ -1,4 +1,10 @@
-export type HookPoint = 'sessionStart' | 'preToolUse' | 'postToolUse' | 'stop';
+export type HookPoint =
+  | 'sessionStart'
+  | 'preToolUse'
+  | 'postToolUse'
+  | 'stop'
+  | 'preCodeExecution'
+  | 'postCodeExecution';
 
 export interface HookConfig {
   command: string;
@@ -14,6 +20,11 @@ export interface HookEnv {
   ARIES_TOOL_INPUT?: string;
   ARIES_TOOL_OUTPUT?: string;
   ARIES_TOOL_ERROR?: string;
+  ARIES_CODE?: string;
+  ARIES_CODE_STDOUT?: string;
+  ARIES_CODE_STDERR?: string;
+  ARIES_CODE_EXCEPTION?: string;
+  ARIES_CODE_REJECTED?: string;
 }
 
 export interface HooksConfig {
@@ -21,4 +32,6 @@ export interface HooksConfig {
   preToolUse?: HookConfig[];
   postToolUse?: HookConfig[];
   stop?: HookConfig[];
+  preCodeExecution?: HookConfig[];
+  postCodeExecution?: HookConfig[];
 }

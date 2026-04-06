@@ -3,6 +3,7 @@ import type { OriVault } from './vault.js';
 import type { ProjectBrain } from './projectBrain.js';
 import type { PreflightContext } from './preflight.js';
 import type { ModelRouter } from '../router/index.js';
+import { triggerReflectionWithModel, triggerReflectionSimple } from './reflection.js';
 import { getMessageText } from '../utils/messages.js';
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -26,6 +27,7 @@ export async function runPostflight(
   _projectBrain: ProjectBrain | null,
   vault: OriVault | null,
   currentImportance: number,
+  router?: ModelRouter,
 ): Promise<number> {
   // Note: vitality bumps and co-access logging happen automatically
   // inside Ori's queryRanked during preflight. No manual calls needed.
@@ -52,59 +54,24 @@ export async function runPostflight(
   trackAgreementRatio(messages, vault);
 
   // ── Reflection trigger ──────────────────────────────────────────────
+  // Use the real model-powered synthesis when router is available,
+  // fall back to simple keyword extraction if not.
   if (vault?.connected && newAccumulator >= REFLECTION_THRESHOLD) {
-    triggerReflection(messages, vault).catch(() => {});
+    if (router) {
+      triggerReflectionWithModel(messages, vault, router).catch(() => {
+        triggerReflectionSimple(messages, vault).catch(() => {});
+      });
+    } else {
+      triggerReflectionSimple(messages, vault).catch(() => {});
+    }
     return 0;
   }
 
   return newAccumulator;
 }
 
-// ── Reflection ──────────────────────────────────────────────────────────────
-
-/**
- * Smallville importance accumulator pattern.
- * When enough important work accumulates, synthesize recent activity
- * into a high-level insight and save it to the vault.
- */
-async function triggerReflection(
-  messages: Message[],
-  vault: OriVault,
-): Promise<void> {
-  // Gather recent conversation context (last ~15 messages)
-  const recentText = messages
-    .slice(-15)
-    .filter(m => m.role === 'user' || m.role === 'assistant')
-    .map(m => {
-      const text = getMessageText(m);
-      return `[${m.role}]: ${text.slice(0, 300)}`;
-    })
-    .join('\n');
-
-  if (recentText.length < 100) return;
-
-  // Create a reflection note from the accumulated work
-  // This is a simplified version — Phase 3 will use the cheap model for better synthesis
-  const title = generateReflectionTitle(messages);
-  const content = `Reflection synthesized from ${messages.length} messages of accumulated work.\n\n${recentText.slice(0, 2000)}`;
-
-  await vault.add(title, content, 'insight');
-}
-
-function generateReflectionTitle(messages: Message[]): string {
-  // Extract the most common substantive terms from recent user messages
-  const userText = messages
-    .filter(m => m.role === 'user')
-    .slice(-5)
-    .map(m => getMessageText(m))
-    .join(' ');
-
-  // Simple keyword extraction — take the first meaningful phrase
-  const words = userText.split(/\s+/).filter(w => w.length > 4).slice(0, 6);
-  if (words.length === 0) return 'session reflection on recent work';
-
-  return `reflection on ${words.join(' ').toLowerCase().slice(0, 60)}`;
-}
+// Note: triggerReflection stub removed. Now using triggerReflectionWithModel
+// from reflection.ts (imported above) which does a proper cheap model synthesis.
 
 // ── Agreement Ratio Monitoring ───────────────────────────────────────────────
 

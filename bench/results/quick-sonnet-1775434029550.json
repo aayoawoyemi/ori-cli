@@ -1,0 +1,130 @@
+{
+  "tasks": [
+    "rename",
+    "explore"
+  ],
+  "model": "sonnet",
+  "runs": 3,
+  "results": [
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 1,
+      "turns": 6,
+      "inputTokens": 25962,
+      "outputTokens": 692,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 13944,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": false,
+      "typecheckErrors": 30,
+      "judgeScore": 50,
+      "judgeRationale": "judge error: Failed to construct 'Request': member signal is not of type AbortSignal."
+    },
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 2,
+      "turns": 6,
+      "inputTokens": 26086,
+      "outputTokens": 745,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 23496,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": false,
+      "typecheckErrors": 30,
+      "judgeScore": 50,
+      "judgeRationale": "judge error: Failed to construct 'Request': member signal is not of type AbortSignal."
+    },
+    {
+      "variant": "BARE",
+      "task": "rename",
+      "run": 3,
+      "turns": 6,
+      "inputTokens": 25941,
+      "outputTokens": 748,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Grep": 1,
+        "Edit": 4
+      },
+      "wallMs": 47756,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": false,
+      "typecheckErrors": 30,
+      "judgeScore": 50,
+      "judgeRationale": "judge error: Failed to construct 'Request': member signal is not of type AbortSignal."
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 1,
+      "turns": 4,
+      "inputTokens": 9883,
+      "outputTokens": 711,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Repl": 1,
+        "Edit": 4
+      },
+      "wallMs": 19279,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": false,
+      "typecheckErrors": 30,
+      "judgeScore": 50,
+      "judgeRationale": "judge error: Failed to construct 'Request': member signal is not of type AbortSignal."
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 2,
+      "turns": 4,
+      "inputTokens": 9753,
+      "outputTokens": 698,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Repl": 1,
+        "Edit": 4
+      },
+      "wallMs": 18757,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": false,
+      "typecheckErrors": 30,
+      "judgeScore": 50,
+      "judgeRationale": "judge error: Failed to construct 'Request': member signal is not of type AbortSignal."
+    },
+    {
+      "variant": "HARNESS-STRICT",
+      "task": "rename",
+      "run": 3,
+      "turns": 4,
+      "inputTokens": 9825,
+      "outputTokens": 724,
+      "toolCalls": 5,
+      "toolBreakdown": {
+        "Repl": 1,
+        "Edit": 4
+      },
+      "wallMs": 12913,
+      "success": true,
+      "reason": "ok",
+      "typecheckPassed": false,
+      "typecheckErrors": 30,
+      "judgeScore": 50,
+      "judgeRationale": "judge error: Failed to construct 'Request': member signal is not of type AbortSignal."
+    }
+  ]
+}

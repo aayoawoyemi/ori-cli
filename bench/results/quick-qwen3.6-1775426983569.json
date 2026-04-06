@@ -1,0 +1,93 @@
+{
+  "task": "rename-multi-file",
+  "model": "qwen3.6",
+  "runs": 3,
+  "results": [
+    {
+      "variant": "BARE",
+      "run": 1,
+      "turns": 5,
+      "inputTokens": 23152,
+      "outputTokens": 1096,
+      "toolCalls": 9,
+      "toolBreakdown": {
+        "Grep": 2,
+        "Read": 3,
+        "Edit": 4
+      },
+      "wallMs": 22195,
+      "success": true,
+      "reason": "ok"
+    },
+    {
+      "variant": "BARE",
+      "run": 2,
+      "turns": 7,
+      "inputTokens": 30474,
+      "outputTokens": 896,
+      "toolCalls": 6,
+      "toolBreakdown": {
+        "Grep": 2,
+        "Edit": 4
+      },
+      "wallMs": 21690,
+      "success": true,
+      "reason": "ok"
+    },
+    {
+      "variant": "BARE",
+      "run": 3,
+      "turns": 6,
+      "inputTokens": 30767,
+      "outputTokens": 1136,
+      "toolCalls": 11,
+      "toolBreakdown": {
+        "Grep": 3,
+        "Read": 4,
+        "Edit": 4
+      },
+      "wallMs": 26937,
+      "success": true,
+      "reason": "ok"
+    },
+    {
+      "variant": "HARNESS",
+      "run": 1,
+      "turns": 0,
+      "inputTokens": 0,
+      "outputTokens": 0,
+      "toolCalls": 0,
+      "toolBreakdown": {},
+      "wallMs": 0,
+      "success": false,
+      "reason": "exception: REPL bridge failed",
+      "error": "REPL bridge failed"
+    },
+    {
+      "variant": "HARNESS",
+      "run": 2,
+      "turns": 0,
+      "inputTokens": 0,
+      "outputTokens": 0,
+      "toolCalls": 0,
+      "toolBreakdown": {},
+      "wallMs": 0,
+      "success": false,
+      "reason": "exception: REPL bridge failed",
+      "error": "REPL bridge failed"
+    },
+    {
+      "variant": "HARNESS",
+      "run": 3,
+      "turns": 0,
+      "inputTokens": 0,
+      "outputTokens": 0,
+      "toolCalls": 0,
+      "toolBreakdown": {},
+      "wallMs": 0,
+      "success": false,
+      "reason": "exception: REPL bridge failed",
+      "error": "REPL bridge failed"
+    }
+  ]
+}
