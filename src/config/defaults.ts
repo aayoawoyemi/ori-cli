@@ -4,6 +4,8 @@ export const DEFAULT_CONFIG: AriesConfig = {
   agent: {
     name: 'Aries',
   },
+  timezone: 'America/Chicago',
+  displayMode: 'normal',
   models: {
     primary: {
       provider: 'anthropic',
@@ -38,8 +40,41 @@ export const DEFAULT_CONFIG: AriesConfig = {
     allowWrite: true,
     allowNetwork: true,
   },
+  local: {
+    baseUrl: 'http://localhost:8080',
+    contextSize: 32_768,
+    gpuLayers: 20,
+    models: {
+      // Add downloaded GGUF paths here, e.g.:
+      // 'devstral': { path: 'C:\\models\\devstralQ4_K_M.gguf', contextWindow: 131_072 },
+      // 'qwen-coder-7b': { path: 'C:\\models\\Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf', contextWindow: 32_768 },
+      // 'qwen-coder-3b': { path: 'C:\\models\\Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf', contextWindow: 32_768 },
+    },
+  },
   hooks: {},
+  repl: {
+    enabled: false,
+    timeoutMs: 30_000,
+    maxIterations: 1000,
+    maxRlmCalls: 10,
+    sandbox: 'same_process',
+    maxRestarts: 3,
+  },
+  signature: {
+    codebase: { level: 'standard', maxTokens: 1500 },
+    vault: { level: 'standard', maxTokens: 1500 },
+    cachePrefix: true,
+    includeInSubagents: false,
+  },
+  preflight: {
+    enabled: 'auto',  // auto-disables when repl.enabled (REPL pulls memory on-demand)
+  },
+  experimental: {
+    localClaudeSubscription: false,
+  },
   mcp: {
     servers: {},
   },
 };
+
+

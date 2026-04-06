@@ -17,6 +17,8 @@ import { VaultAddTool } from './vaultAdd.js';
 import { VaultExploreTool } from './vaultExplore.js';
 import { VaultWarmthTool } from './vaultWarmth.js';
 import { ProjectSearchTool } from './projectSearch.js';
+import { ReplTool } from './repl.js';
+import type { ReplHandle } from '../repl/setup.js';
 
 export class ToolRegistry {
   private tools = new Map<string, Tool>();
@@ -46,10 +48,10 @@ export class ToolRegistry {
 }
 
 /** Create a registry with all core tools. */
-export function createCoreRegistry(): ToolRegistry {
+export function createCoreRegistry(options?: { replEnabled?: boolean }): ToolRegistry {
   const registry = new ToolRegistry();
   // Core filesystem tools
-  registry.register(new BashTool());
+  registry.register(new BashTool({ replEnabled: options?.replEnabled }));
   registry.register(new ReadTool());
   registry.register(new WriteTool());
   registry.register(new EditTool());
@@ -78,5 +80,37 @@ export function registerMemoryTools(
   }
   if (projectBrain) {
     registry.register(new ProjectSearchTool(projectBrain));
+  }
+}
+
+/**
+ * Register the Repl tool. Enables code-acting via Python body.
+ * The getHandle closure allows the tool to check bridge liveness at call time
+ * (restart-on-crash is transparent to the tool).
+ */
+export function registerReplTool(
+  registry: ToolRegistry,
+  getHandle: () => ReplHandle | null,
+): void {
+  registry.register(new ReplTool(getHandle));
+}
+
+/**
+ * Strip legacy file-navigation tools (Read/Grep/Glob/VaultSearch/VaultRead/
+ * VaultExplore/VaultWarmth/ProjectSearch) to force the model through the
+ * Repl tool for code + memory navigation. Leaves Bash, Write, Edit, Web*,
+ * Agent, VaultAdd — ops that don't benefit from composition.
+ *
+ * Mirrors the mandatory-REPL thesis: removing meta-decisions by subtracting
+ * escape hatches.
+ */
+export function stripNavigationTools(registry: ToolRegistry): void {
+  const legacyNav = [
+    'Read', 'Grep', 'Glob',
+    'VaultSearch', 'VaultRead', 'VaultExplore', 'VaultWarmth',
+    'ProjectSearch',
+  ];
+  for (const name of legacyNav) {
+    (registry as any).tools.delete(name);
   }
 }

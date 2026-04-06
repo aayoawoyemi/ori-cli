@@ -11,6 +11,7 @@ export type SessionEntry =
   | { type: 'assistant'; content: string; timestamp: number }
   | { type: 'tool_call'; id: string; name: string; input: Record<string, unknown>; timestamp: number }
   | { type: 'tool_result'; id: string; name: string; output: string; isError: boolean; timestamp: number }
+  | { type: 'code_execution'; code: string; stdout: string; stderr: string; exception: string | null; duration_ms: number; rejected: { reason: string } | null; timed_out: boolean; rlm_stats?: { call_count: number; total_tokens: number }; timestamp: number }
   | { type: 'preflight'; projectNotes: string[]; vaultNotes: string[]; timestamp: number }
   | { type: 'postflight'; importance: number; reflected: boolean; timestamp: number }
   | { type: 'compact_boundary'; summary: string; insightsSaved: number; pruneOnly: boolean; timestamp: number }
@@ -21,6 +22,7 @@ export type SessionEntry =
 export class SessionStorage {
   private filePath: string;
   private sessionDir: string;
+  readonly sessionId: string;
 
   constructor(cwd: string) {
     // Sessions stored at ~/.aries/sessions/<project-hash>/
@@ -29,8 +31,8 @@ export class SessionStorage {
     mkdirSync(this.sessionDir, { recursive: true });
 
     // Current session file — timestamped
-    const sessionId = Date.now().toString(36);
-    this.filePath = join(this.sessionDir, `${sessionId}.jsonl`);
+    this.sessionId = Date.now().toString(36);
+    this.filePath = join(this.sessionDir, `${this.sessionId}.jsonl`);
   }
 
   /** Get the session file path. */

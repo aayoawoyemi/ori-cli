@@ -5,6 +5,15 @@ export interface TextContent {
   text: string;
 }
 
+export interface ImageContent {
+  type: 'image';
+  source: {
+    type: 'base64';
+    media_type: string;
+    data: string;
+  };
+}
+
 export interface ToolUseContent {
   type: 'tool_use';
   id: string;
@@ -19,7 +28,7 @@ export interface ToolResultContent {
   is_error?: boolean;
 }
 
-export type ContentBlock = TextContent | ToolUseContent | ToolResultContent;
+export type ContentBlock = TextContent | ImageContent | ToolUseContent | ToolResultContent;
 
 export interface Message {
   role: 'user' | 'assistant' | 'tool';
@@ -71,7 +80,7 @@ export type StreamEvent =
   | { type: 'tool_use_start'; id: string; name: string }
   | { type: 'tool_use_delta'; id: string; delta: string }
   | { type: 'tool_use_end'; id: string; input: Record<string, unknown> }
-  | { type: 'usage'; inputTokens: number; outputTokens: number; totalTokens: number }
+  | { type: 'usage'; inputTokens: number; outputTokens: number; totalTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
   | { type: 'done' };
 
 // ── Provider interface ──────────────────────────────────────────────────────

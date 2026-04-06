@@ -1,9 +1,14 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type { ModelProvider, Message, ToolDefinition, StreamEvent, ContentBlock } from '../types.js';
 import type { ModelConfig } from '../../config/types.js';
-import { loadOAuthCredentials, isTokenExpired, refreshOAuthToken, type OAuthCredentials } from '../../auth/oauth.js';
-import { buildBillingHeader, computeCch, VERSION } from '../../auth/cch.js';
+import {
+  AnthropicLocalOAuthError,
+  AnthropicLocalOAuthSource,
+  type OAuthCredentials,
+} from '../../auth/anthropicLocalOAuth.js';
+import { buildBillingHeader } from '../../auth/cch.js';
 import { getMessageText } from '../../utils/messages.js';
+import { CACHE_PREFIX_BREAK } from '../../prompt.js';
 
 /** Convert our Message format to Anthropic's format. */
 function toAnthropicMessages(messages: Message[]): Anthropic.MessageParam[] {
@@ -34,6 +39,15 @@ function toAnthropicMessages(messages: Message[]): Anthropic.MessageParam[] {
         for (const block of msg.content as ContentBlock[]) {
           if (block.type === 'text') {
             content.push({ type: 'text', text: block.text });
+          } else if (block.type === 'image') {
+            content.push({
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: block.source.media_type as 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp',
+                data: block.source.data,
+              },
+            });
           } else if (block.type === 'tool_result') {
             content.push({
               type: 'tool_result',
@@ -61,7 +75,29 @@ function toAnthropicTools(tools: ToolDefinition[]): Anthropic.Tool[] {
   }));
 }
 
-// ── OAuth + cch signing for subscription-based access ───────────────────────
+function splitSystemPromptByCacheBoundary(systemPrompt: string): {
+  prefix?: string;
+  remainder: string;
+} {
+  const idx = systemPrompt.indexOf(CACHE_PREFIX_BREAK);
+  if (idx === -1) {
+    return { remainder: systemPrompt };
+  }
+  const prefix = systemPrompt.slice(0, idx).trim();
+  const remainder = systemPrompt.slice(idx + CACHE_PREFIX_BREAK.length).trim();
+  return {
+    ...(prefix ? { prefix } : {}),
+    remainder: remainder || ' ',
+  };
+}
+
+interface AnthropicProviderOptions {
+  allowExperimentalLocalOAuth?: boolean;
+  oauthSource?: AnthropicLocalOAuthSource;
+  maxRateLimitRetries?: number;
+  defaultRateLimitBackoffMs?: number;
+  sleepImpl?: (ms: number, signal?: AbortSignal) => Promise<void>;
+}
 
 export class AnthropicProvider implements ModelProvider {
   readonly name = 'anthropic';
@@ -71,44 +107,173 @@ export class AnthropicProvider implements ModelProvider {
   private maxTokens: number;
   private useOAuth: boolean;
   private oauthCreds: OAuthCredentials | null = null;
+  private oauthSource: AnthropicLocalOAuthSource | null = null;
+  private readonly baseUrl?: string;
+  private readonly maxRateLimitRetries: number;
+  private readonly defaultRateLimitBackoffMs: number;
+  private readonly sleepImpl: (ms: number, signal?: AbortSignal) => Promise<void>;
 
-  constructor(config: ModelConfig) {
+  constructor(config: ModelConfig, options: AnthropicProviderOptions = {}) {
     this.model = config.model;
     this.contextWindow = config.contextWindow ?? 200_000;
     this.maxTokens = config.maxTokens ?? 16_384;
     this.useOAuth = config.auth === 'oauth';
+    this.baseUrl = config.baseUrl;
+    this.maxRateLimitRetries = Math.max(0, options.maxRateLimitRetries ?? 1);
+    this.defaultRateLimitBackoffMs = Math.max(1000, options.defaultRateLimitBackoffMs ?? 65_000);
+    this.sleepImpl = options.sleepImpl ?? this.defaultSleep;
 
     if (this.useOAuth) {
-      // Load OAuth token from Claude Code's credential store
-      this.oauthCreds = loadOAuthCredentials();
-      if (!this.oauthCreds) {
+      if (!options.allowExperimentalLocalOAuth) {
         throw new Error(
-          'OAuth mode requires Claude Code credentials. Run Claude Code once to authenticate, ' +
-          'or set ANTHROPIC_OAUTH_TOKEN environment variable.'
+          'Anthropic OAuth mode is disabled. Set experimental.localClaudeSubscription: true to use the local Claude subscription path.',
         );
       }
-      this.client = new Anthropic({
-        apiKey: this.oauthCreds.accessToken, // SDK uses apiKey field for Bearer auth too
-        ...(config.baseUrl && { baseURL: config.baseUrl }),
-      });
+
+      this.oauthSource = options.oauthSource ?? new AnthropicLocalOAuthSource();
+      try {
+        this.oauthCreds = this.oauthSource.loadCredentials();
+      } catch (err) {
+        throw new Error(this.formatOAuthError('credential load', err));
+      }
+
+      this.client = this.createOAuthClient(this.oauthCreds.accessToken);
     } else {
       this.client = new Anthropic({
         apiKey: config.apiKey || process.env.ANTHROPIC_API_KEY,
-        ...(config.baseUrl && { baseURL: config.baseUrl }),
+        ...(this.baseUrl && { baseURL: this.baseUrl }),
       });
     }
   }
 
+  private createOAuthClient(accessToken: string): Anthropic {
+    return new Anthropic({
+      apiKey: null,          // Suppress env ANTHROPIC_API_KEY fallback
+      authToken: accessToken,
+      ...(this.baseUrl && { baseURL: this.baseUrl }),
+      // OAuth requires the oauth-2025-04-20 beta flag, otherwise Anthropic
+      // rejects with "OAuth authentication is currently not supported."
+      defaultHeaders: {
+        'anthropic-beta': 'oauth-2025-04-20',
+      },
+    });
+  }
+
+  private formatOAuthError(stage: string, err: unknown): string {
+    if (err instanceof AnthropicLocalOAuthError) {
+      return `Anthropic local Claude subscription auth failed during ${stage}: ${err.message}`;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    return `Anthropic local Claude subscription auth failed during ${stage}: ${message}`;
+  }
+
+  private formatRequestError(stage: string, err: unknown): Error {
+    const message = err instanceof Error ? err.message : String(err);
+    if (this.useOAuth) {
+      const suffix = /401|unauthorized/i.test(message)
+        ? ' The local token may be expired, the billing header may have drifted, or the local credential store may need to be refreshed.'
+        : '';
+      return new Error(`Anthropic local Claude subscription request failed during ${stage}: ${message}${suffix}`);
+    }
+    return new Error(`Anthropic request failed during ${stage}: ${message}`);
+  }
+
+  private static asRecord(value: unknown): Record<string, unknown> {
+    return (value !== null && typeof value === 'object') ? (value as Record<string, unknown>) : {};
+  }
+
+  private getHeaderValue(headers: unknown, name: string): string | undefined {
+    if (!headers) return undefined;
+
+    const lower = name.toLowerCase();
+    const h = headers as { get?: (key: string) => string | null };
+    if (typeof h.get === 'function') {
+      const viaGet = h.get(name) ?? h.get(lower);
+      if (viaGet) return viaGet;
+    }
+
+    const rec = AnthropicProvider.asRecord(headers);
+    const raw = rec[name] ?? rec[lower];
+    if (typeof raw === 'string') return raw;
+    if (Array.isArray(raw) && raw.length > 0 && typeof raw[0] === 'string') return raw[0];
+    return undefined;
+  }
+
+  private isRateLimitError(err: unknown): boolean {
+    const rec = AnthropicProvider.asRecord(err);
+    const status = typeof rec.status === 'number' ? rec.status : undefined;
+    if (status === 429) return true;
+
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/rate[_\s-]*limit|too many requests|\b429\b/i.test(msg)) return true;
+
+    const maybeError = AnthropicProvider.asRecord(rec.error);
+    return typeof maybeError.type === 'string' && maybeError.type.toLowerCase() === 'rate_limit_error';
+  }
+
+  private getRateLimitBackoffMs(err: unknown): number {
+    const rec = AnthropicProvider.asRecord(err);
+    const retryAfter = this.getHeaderValue(rec.headers, 'retry-after');
+
+    if (retryAfter) {
+      const asNum = Number(retryAfter);
+      if (Number.isFinite(asNum) && asNum > 0) {
+        return Math.max(1000, Math.floor(asNum * 1000));
+      }
+
+      const asDate = Date.parse(retryAfter);
+      if (!Number.isNaN(asDate)) {
+        const delta = asDate - Date.now();
+        if (delta > 0) return Math.max(1000, delta);
+      }
+    }
+
+    return this.defaultRateLimitBackoffMs;
+  }
+
+  private async defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
+    if (ms <= 0) return;
+
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve();
+      }, ms);
+
+      const onAbort = () => {
+        clearTimeout(timer);
+        cleanup();
+        reject(new Error('Aborted while waiting for rate limit backoff'));
+      };
+
+      const cleanup = () => {
+        if (signal) signal.removeEventListener('abort', onAbort);
+      };
+
+      if (signal) {
+        if (signal.aborted) {
+          clearTimeout(timer);
+          cleanup();
+          reject(new Error('Aborted while waiting for rate limit backoff'));
+          return;
+        }
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+  }
+
   /** Ensure OAuth token is fresh. */
   private async ensureToken(): Promise<void> {
-    if (!this.useOAuth || !this.oauthCreds) return;
+    if (!this.useOAuth || !this.oauthCreds || !this.oauthSource) return;
 
-    if (isTokenExpired(this.oauthCreds)) {
-      const refreshed = await refreshOAuthToken(this.oauthCreds);
-      if (refreshed) {
-        this.oauthCreds = refreshed;
-        this.client = new Anthropic({ apiKey: refreshed.accessToken });
+    try {
+      const freshCreds = await this.oauthSource.ensureFreshToken(this.oauthCreds);
+      if (freshCreds.accessToken !== this.oauthCreds.accessToken || freshCreds.expiresAt !== this.oauthCreds.expiresAt) {
+        this.oauthCreds = freshCreds;
+        this.client = this.createOAuthClient(freshCreds.accessToken);
       }
+    } catch (err) {
+      throw new Error(this.formatOAuthError('token refresh', err));
     }
   }
 
@@ -123,8 +288,10 @@ export class AnthropicProvider implements ModelProvider {
     const anthropicMessages = toAnthropicMessages(messages);
     const anthropicTools = toAnthropicTools(tools);
 
-    // Build system array
+    // Build system array. If a cache marker is present, the prefix block
+    // (ambient signatures) is marked cacheable and billed at cache rates.
     let systemArray: Anthropic.TextBlockParam[];
+    const split = splitSystemPromptByCacheBoundary(systemPrompt);
 
     if (this.useOAuth) {
       // OAuth mode: inject billing header as first system block
@@ -132,14 +299,26 @@ export class AnthropicProvider implements ModelProvider {
       const firstUserText = firstUserMsg ? getMessageText(firstUserMsg) : '';
       const billingHeader = buildBillingHeader(firstUserText);
 
-      systemArray = [
-        { type: 'text', text: billingHeader },
-        { type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } },
-      ];
+      systemArray = [{ type: 'text', text: billingHeader }];
+      if (split.prefix) {
+        systemArray.push(
+          { type: 'text', text: split.prefix, cache_control: { type: 'ephemeral' } },
+          { type: 'text', text: split.remainder },
+        );
+      } else {
+        systemArray.push(
+          { type: 'text', text: split.remainder, cache_control: { type: 'ephemeral' } },
+        );
+      }
     } else {
-      systemArray = [
-        { type: 'text', text: systemPrompt },
-      ];
+      if (split.prefix) {
+        systemArray = [
+          { type: 'text', text: split.prefix, cache_control: { type: 'ephemeral' } },
+          { type: 'text', text: split.remainder },
+        ];
+      } else {
+        systemArray = [{ type: 'text', text: split.remainder }];
+      }
     }
 
     // Build request params
@@ -152,27 +331,9 @@ export class AnthropicProvider implements ModelProvider {
     };
 
     if (this.useOAuth) {
-      // OAuth mode: we need to compute cch over the serialized body.
-      // The SDK handles serialization internally, so we compute cch
-      // by serializing our params, computing the hash, then sending
-      // with the corrected billing header.
-      //
-      // Note: The ideal approach would intercept the fetch call.
-      // For V0, we compute cch over a serialized approximation.
-      // This works because the hash covers the JSON body and we
-      // control the serialization order.
-      const bodyJson = JSON.stringify(requestParams, null, 0);
-      const { cch, signedBody } = await computeCch(bodyJson);
-
-      // Update the billing header in the system array with the computed cch
-      const billingText = (systemArray[0] as Anthropic.TextBlockParam).text;
-      systemArray[0] = {
-        type: 'text',
-        text: billingText.replace('cch=00000', `cch=${cch}`),
-      };
-
-      // Rebuild params with signed billing header
-      requestParams.system = systemArray;
+      // cch=00000 stays literal — Claude Code 2.1.92 does not compute a
+      // replacement. Previous implementation computed xxHash64 which caused
+      // Anthropic to reject the billing header. No body signing needed.
     }
 
     // Build headers for OAuth mode
@@ -182,54 +343,95 @@ export class AnthropicProvider implements ModelProvider {
     if (this.useOAuth) {
       streamOptions.headers = {
         'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,adaptive-thinking-2026-01-28,research-preview-2026-02-01',
-        'user-agent': `aries-cli/0.1.0 (external, cli)`,
+        'user-agent': 'aries-cli/0.1.0 (external, cli)',
         'x-app': 'cli',
       };
     }
 
-    const stream = this.client.messages.stream(
-      requestParams,
-      streamOptions as Anthropic.RequestOptions,
-    );
+    let attempt = 0;
+    while (true) {
+      const toolInputBuffers = new Map<string, { name: string; json: string }>();
+      let emittedAnyOutput = false;
 
-    const toolInputBuffers = new Map<string, { name: string; json: string }>();
+      try {
+        const stream = this.client.messages.stream(
+          requestParams,
+          streamOptions as Anthropic.RequestOptions,
+        );
 
-    for await (const event of stream) {
-      if (event.type === 'content_block_start') {
-        if (event.content_block.type === 'tool_use') {
-          const block = event.content_block;
-          toolInputBuffers.set(block.id, { name: block.name, json: '' });
-          yield { type: 'tool_use_start', id: block.id, name: block.name };
-        }
-      } else if (event.type === 'content_block_delta') {
-        if (event.delta.type === 'text_delta') {
-          yield { type: 'text', content: event.delta.text };
-        } else if (event.delta.type === 'input_json_delta') {
-          const partial = event.delta.partial_json;
-          for (const [id, buf] of toolInputBuffers) {
-            buf.json += partial;
-            yield { type: 'tool_use_delta', id, delta: partial };
+        for await (const event of stream) {
+          if (event.type === 'content_block_start') {
+            if (event.content_block.type === 'tool_use') {
+              const block = event.content_block;
+              toolInputBuffers.set(block.id, { name: block.name, json: '' });
+              emittedAnyOutput = true;
+              yield { type: 'tool_use_start', id: block.id, name: block.name };
+            }
+          } else if (event.type === 'content_block_delta') {
+            if (event.delta.type === 'text_delta') {
+              emittedAnyOutput = true;
+              yield { type: 'text', content: event.delta.text };
+            } else if (event.delta.type === 'input_json_delta') {
+              const partial = event.delta.partial_json;
+              for (const [id, buf] of toolInputBuffers) {
+                buf.json += partial;
+                emittedAnyOutput = true;
+                yield { type: 'tool_use_delta', id, delta: partial };
+              }
+            }
+          } else if (event.type === 'content_block_stop') {
+            for (const [id, buf] of toolInputBuffers) {
+              try {
+                const input = JSON.parse(buf.json || '{}') as Record<string, unknown>;
+                emittedAnyOutput = true;
+                yield { type: 'tool_use_end', id, input };
+              } catch {
+                emittedAnyOutput = true;
+                yield { type: 'tool_use_end', id, input: {} };
+              }
+            }
+            toolInputBuffers.clear();
+          } else if (event.type === 'message_stop') {
+            const finalMessage = await stream.finalMessage();
+            emittedAnyOutput = true;
+            const usage = finalMessage.usage as unknown as Record<string, number>;
+            yield {
+              type: 'usage',
+              inputTokens: usage.input_tokens,
+              outputTokens: usage.output_tokens,
+              totalTokens: usage.input_tokens + usage.output_tokens,
+              cacheReadTokens: usage.cache_read_input_tokens ?? 0,
+              cacheWriteTokens: usage.cache_creation_input_tokens ?? 0,
+            };
+            emittedAnyOutput = true;
+            yield { type: 'done' };
           }
         }
-      } else if (event.type === 'content_block_stop') {
-        for (const [id, buf] of toolInputBuffers) {
-          try {
-            const input = JSON.parse(buf.json || '{}') as Record<string, unknown>;
-            yield { type: 'tool_use_end', id, input };
-          } catch {
-            yield { type: 'tool_use_end', id, input: {} };
+
+        return;
+      } catch (err) {
+        const canRetry =
+          this.isRateLimitError(err)
+          && !emittedAnyOutput
+          && attempt < this.maxRateLimitRetries
+          && !(signal?.aborted);
+
+        if (!canRetry) {
+          if (this.isRateLimitError(err) && attempt > 0) {
+            const msg = err instanceof Error ? err.message : String(err);
+            throw this.formatRequestError('stream execution', `rate limit persisted after ${attempt} retry attempt(s): ${msg}`);
           }
+          throw this.formatRequestError('stream execution', err);
         }
-        toolInputBuffers.clear();
-      } else if (event.type === 'message_stop') {
-        const finalMessage = await stream.finalMessage();
-        yield {
-          type: 'usage',
-          inputTokens: finalMessage.usage.input_tokens,
-          outputTokens: finalMessage.usage.output_tokens,
-          totalTokens: finalMessage.usage.input_tokens + finalMessage.usage.output_tokens,
-        };
-        yield { type: 'done' };
+
+        const backoffMs = this.getRateLimitBackoffMs(err);
+        try {
+          await this.sleepImpl(backoffMs, signal);
+        } catch (sleepErr) {
+          throw this.formatRequestError('rate-limit backoff', sleepErr);
+        }
+
+        attempt += 1;
       }
     }
   }

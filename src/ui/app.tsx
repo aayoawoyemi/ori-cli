@@ -1,11 +1,19 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { Box, Text, useApp, useInput } from 'ink';
 import { Messages, type DisplayMessage, type DisplayToolCall } from './messages.js';
-import { PromptInput } from './input.js';
+import { PromptInput, type AttachedImage } from './input.js';
 import { StatusBar } from './statusBar.js';
 import { Spinner } from './spinner.js';
-import { agentLoop, type LoopEvent } from '../loop.js';
-import { ModelRouter } from '../router/index.js';
+import { ModelPicker } from './modelPicker.js';
+import { agentLoop, type LoopEvent, type PermissionMode, type PermissionDecision } from '../loop.js';
+import { PermissionDialog } from './permissionDialog.js';
+import { PlanExitDialog, type PlanExitChoice } from './planExitDialog.js';
+import { setTitleBusy, setTitleDone, setTitleIdle, flashTaskbar } from './terminal.js';
+import { savePlan } from '../memory/planSave.js';
+import { figures } from './theme.js';
+import { UsageTracker, formatTokenCount, formatCost, formatDuration } from '../telemetry/tracker.js';
+import { ModelRouter, type EffortLevel } from '../router/index.js';
+import type { ToolCall } from '../router/types.js';
 import type { ToolRegistry } from '../tools/registry.js';
 import type { OriVault } from '../memory/vault.js';
 import type { ProjectBrain } from '../memory/projectBrain.js';
@@ -13,9 +21,10 @@ import type { SessionStorage } from '../session/storage.js';
 import type { Message } from '../router/types.js';
 import { syncSession } from '../session/sync.js';
 import { runHooks } from '../hooks/runner.js';
-import type { HooksConfig } from '../config/types.js';
+import type { HooksConfig, DisplayMode } from '../config/types.js';
 import { runResearch } from '../research/index.js';
 import type { ResearchDepth } from '../research/types.js';
+import type { ReplHandle } from '../repl/setup.js';
 
 interface AppProps {
   agentName: string;
@@ -29,6 +38,9 @@ interface AppProps {
   hooks: HooksConfig;
   vaultNoteCount?: number;
   initialPrompt?: string;
+  initialPermissionMode?: PermissionMode;
+  replHandle?: ReplHandle | null;
+  preflightEnabled?: boolean;
 }
 
 export function App(props: AppProps): React.ReactElement {
@@ -36,6 +48,7 @@ export function App(props: AppProps): React.ReactElement {
   const {
     agentName, cwd, router, registry, vault, projectBrain,
     session, systemPrompt, hooks, vaultNoteCount, initialPrompt,
+    initialPermissionMode, replHandle, preflightEnabled = true,
   } = props;
 
   // ── State ───────────────────────────────────────────────────────────
@@ -45,21 +58,92 @@ export function App(props: AppProps): React.ReactElement {
   const [isLoading, setIsLoading] = useState(false);
   const [tokenCount, setTokenCount] = useState(0);
   const [activeTool, setActiveTool] = useState<string | undefined>();
+  const [showModelPicker, setShowModelPicker] = useState(false);
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>(initialPermissionMode ?? 'default');
+  const [showPlanExit, setShowPlanExit] = useState(false);
+  const [planText, setPlanText] = useState('');
+  const [exitWarningAt, setExitWarningAt] = useState<number | null>(null);
+  const [displayMode, setDisplayMode] = useState<DisplayMode>('normal');
+  const [pendingPermission, setPendingPermission] = useState<{
+    toolCall: ToolCall;
+    resolve: (decision: PermissionDecision) => void;
+  } | null>(null);
 
   // Conversation messages for the loop (mutable ref to avoid stale closures)
   const messagesRef = useRef<Message[]>([]);
+  const abortRef = useRef<AbortController | null>(null);
+  const alwaysAllowRef = useRef(new Set<string>());
+  const trackerRef = useRef(new UsageTracker(session.sessionId, router.current.model));
+  const toolTimingRef = useRef(new Map<string, number>());
 
-  // Handle Ctrl+C
+  // ── Keyboard shortcuts ──────────────────────────────────────────────
   useInput((input, key) => {
+    // Ctrl+C → exit
     if (key.ctrl && input === 'c') {
-      runHooks('stop', hooks, { cwd, vaultPath: vault?.vaultPath })
-        .then(() => syncSession(messagesRef.current, 0, projectBrain, vault, router))
-        .finally(() => {
-          vault?.disconnect();
-          exit();
+      // If loading, first Ctrl+C interrupts; second exits
+      if (isLoading && abortRef.current) {
+        abortRef.current.abort();
+        return;
+      }
+      // Not loading — double Ctrl+C to exit
+      if (exitWarningAt && Date.now() - exitWarningAt < 2000) {
+        // Second press within 2s — actually exit
+        runHooks('stop', hooks, { cwd, vaultPath: vault?.vaultPath })
+          .then(() => syncSession(messagesRef.current, 0, projectBrain, vault, router))
+          .finally(() => {
+            vault?.disconnect();
+            exit();
+          });
+        return;
+      }
+      // First press — show warning
+      setExitWarningAt(Date.now());
+      return;
+    }
+
+    // Esc → interrupt streaming / close model picker
+    if (key.escape) {
+      if (showModelPicker) {
+        setShowModelPicker(false);
+        return;
+      }
+      if (isLoading && abortRef.current) {
+        abortRef.current.abort();
+        return;
+      }
+    }
+
+    // Alt+P → toggle model picker (like Claude Code's meta+p)
+    if (key.meta && input === 'p') {
+      if (!isLoading) {
+        setShowModelPicker(prev => !prev);
+      }
+      return;
+    }
+
+    // Alt+M (meta+m) or Shift+Tab → cycle permission mode
+    if ((key.meta && input === 'm') || (key.shift && key.tab)) {
+      if (!isLoading) {
+        // If in plan mode, show exit dialog instead of cycling
+        if (permissionMode === 'plan') {
+          setShowPlanExit(true);
+          return;
+        }
+        setPermissionMode(prev => {
+          const modes: PermissionMode[] = ['default', 'accept', 'yolo'];
+          const idx = modes.indexOf(prev);
+          return modes[(idx + 1) % modes.length]!;
         });
+      }
+      return;
     }
   });
+
+  useEffect(() => {
+    if (exitWarningAt === null) return;
+    const timer = setTimeout(() => setExitWarningAt(null), 2000);
+    return () => clearTimeout(timer);
+  }, [exitWarningAt]);
 
   // Run sessionStart hooks + initial prompt
   useEffect(() => {
@@ -71,10 +155,71 @@ export function App(props: AppProps): React.ReactElement {
     })();
   }, []);
 
+  // ── Model picker handlers ──────────────────────────────────────────
+  const handleModelSelect = useCallback((model: string, effort: EffortLevel) => {
+    try {
+      router.setModel(`${model} ${effort}`);
+      setShowModelPicker(false);
+      setDisplayMessages(prev => [...prev, {
+        role: 'assistant',
+        text: `Model: ${router.info.model} | Effort: ${router.effort}`,
+      }]);
+    } catch (err) {
+      setDisplayMessages(prev => [...prev, {
+        role: 'assistant', text: (err as Error).message,
+      }]);
+      setShowModelPicker(false);
+    }
+  }, [router]);
+
+  const handleModelCancel = useCallback(() => {
+    setShowModelPicker(false);
+  }, []);
+
+  // ── Plan exit handler ──────────────────────────────────────────────
+  const handlePlanExit = useCallback(async (choice: PlanExitChoice) => {
+    setShowPlanExit(false);
+
+    // Save the plan if requested
+    if (choice.saveTarget !== 'none' && planText) {
+      // Extract summary from first line or first 80 chars
+      const summary = planText.split('\n')[0]?.slice(0, 80) ?? 'plan';
+      const saved = await savePlan(
+        { summary, fullText: planText, timestamp: Date.now() },
+        choice.saveTarget,
+        cwd,
+        vault,
+        projectBrain,
+      );
+      if (saved) {
+        setDisplayMessages(prev => [...prev, {
+          role: 'system',
+          text: `Plan saved to ${choice.saveTarget}: ${saved}`,
+          subtype: 'info',
+        }]);
+      }
+    }
+
+    if (choice.execute) {
+      // Exit plan mode → switch to accept edits for execution
+      setPermissionMode('accept');
+      setPlanText('');
+      setDisplayMessages(prev => [...prev, {
+        role: 'system',
+        text: `${figures.autoMode} Plan mode off — executing with accept edits. Alt+M to change mode.`,
+        subtype: 'info',
+      }]);
+    }
+  }, [planText, cwd, vault, projectBrain]);
+
+  const handlePlanExitCancel = useCallback(() => {
+    setShowPlanExit(false);
+  }, []);
+
   // ── Handle user input ───────────────────────────────────────────────
-  const handleSubmit = useCallback(async (input: string) => {
+  const handleSubmit = useCallback(async (input: string, images?: AttachedImage[]) => {
     const trimmed = input.trim();
-    if (!trimmed) return;
+    if (!trimmed && !images?.length) return;
 
     // ── Slash commands ──────────────────────────────────────────────
     if (trimmed.startsWith('/')) {
@@ -102,18 +247,52 @@ export function App(props: AppProps): React.ReactElement {
       return;
     }
 
+    // ── Build content: text + image blocks ──────────────────────────
+    const hasImages = images && images.length > 0;
+    const contentBlocks = hasImages
+      ? [
+          ...(trimmed ? [{ type: 'text' as const, text: trimmed }] : []),
+          ...images!.map(img => ({
+            type: 'image' as const,
+            source: {
+              type: 'base64' as const,
+              media_type: img.mediaType,
+              data: img.base64,
+            },
+          })),
+        ]
+      : trimmed;
+
+    const displayText = hasImages
+      ? trimmed || `[${images!.length} image${images!.length > 1 ? 's' : ''} attached]`
+      : trimmed;
+
     // ── Normal message → agent loop ─────────────────────────────────
-    setDisplayMessages(prev => [...prev, { role: 'user', text: trimmed }]);
+    setDisplayMessages(prev => [...prev, { role: 'user', text: displayText }]);
     setIsLoading(true);
+    setTitleBusy(agentName, cwd);
     setStreamingText('');
     setToolCalls([]);
 
-    messagesRef.current.push({ role: 'user', content: trimmed });
-    session.log({ type: 'user', content: trimmed, timestamp: Date.now() });
+    messagesRef.current.push({ role: 'user', content: contentBlocks });
+    session.log({ type: 'user', content: displayText, timestamp: Date.now() });
 
     let fullText = '';
+    let displayText2 = '';  // what the user sees (may differ from fullText in quiet mode)
+    let hasSeenToolCall = false;
+    let interrupted = false;
+
+    // Create abort controller for this request
+    const abort = new AbortController();
+    abortRef.current = abort;
 
     try {
+      // Build identity context for conditioned retrieval
+      const identityCtx = [
+        agentName,
+        cwd.split(/[\\/]/).pop() ?? '', // project dir name
+      ].filter(Boolean).join(', ');
+
       const loop = agentLoop({
         messages: messagesRef.current,
         systemPrompt,
@@ -124,26 +303,83 @@ export function App(props: AppProps): React.ReactElement {
         projectBrain,
         session,
         hooks,
+        signal: abort.signal,
+        permissionMode,
+        alwaysAllowTools: alwaysAllowRef.current,
+        identityContext: identityCtx,
+        maxSubagents: 5,
+        preflightEnabled,
+        onPermissionRequest: (tc: ToolCall) => {
+          return new Promise<PermissionDecision>((resolve) => {
+            setPendingPermission({ toolCall: tc, resolve });
+          });
+        },
       });
 
       for await (const event of loop) {
+        if (abort.signal.aborted) {
+          interrupted = true;
+          break;
+        }
         handleLoopEvent(event, (text) => {
           fullText += text;
-          setStreamingText(fullText);
+          // Display mode filtering:
+          // - verbose: show everything
+          // - quiet: suppress all interim text (only final response after last tool)
+          // - normal: show everything (prompt discipline handles brevity)
+          if (displayMode === 'quiet') {
+            // In quiet mode, reset display on each new text chunk after a tool call
+            // The final text block (after all tools) will be shown
+            if (event.type === 'text') {
+              displayText2 += text;
+              // Don't update streaming display until we know it's the final block
+              // We'll show it at the end
+            }
+          } else {
+            displayText2 += text;
+            setStreamingText(displayText2);
+          }
         });
+        // Track tool calls for quiet mode
+        if (event.type === 'tool_call') {
+          hasSeenToolCall = true;
+          if (displayMode === 'quiet') {
+            displayText2 = '';  // reset — any text before this was narration
+          }
+        }
       }
     } catch (err) {
-      fullText = `Error: ${(err as Error).message}`;
+      if ((err as Error).name === 'AbortError' || abort.signal.aborted) {
+        interrupted = true;
+      } else {
+        fullText += `\n\nError: ${(err as Error).message}`;
+      }
     }
+
+    abortRef.current = null;
 
     // Finalize: move streaming text to messages
     setStreamingText('');
     setToolCalls([]);
     setIsLoading(false);
+    setTitleDone(agentName, cwd);
+    flashTaskbar();
     setActiveTool(undefined);
 
     if (fullText) {
-      setDisplayMessages(prev => [...prev, { role: 'assistant', text: fullText }]);
+      // In plan mode, accumulate the model's text as plan content
+      if (permissionMode === 'plan') {
+        setPlanText(prev => prev + (prev ? '\n\n' : '') + fullText);
+      }
+      // In quiet mode, only show the final text block (after last tool call)
+      const shownText = displayMode === 'quiet' ? displayText2.trim() : fullText;
+      setDisplayMessages(prev => [
+        ...prev,
+        ...(shownText ? [{ role: 'assistant' as const, text: shownText }] : []),
+        ...(interrupted ? [{ role: 'system' as const, text: 'Interrupted', subtype: 'info' as const }] : []),
+      ]);
+    } else if (interrupted) {
+      setDisplayMessages(prev => [...prev, { role: 'system', text: 'Interrupted', subtype: 'info' }]);
     }
   }, [cwd, systemPrompt, router, registry, vault, projectBrain, session]);
 
@@ -157,6 +393,7 @@ export function App(props: AppProps): React.ReactElement {
       case 'tool_call': {
         const tc = event.toolCall;
         const summary = getToolSummary(tc.name, tc.input);
+        toolTimingRef.current.set(tc.id, Date.now());
         setToolCalls(prev => [...prev, {
           id: tc.id, name: tc.name, summary, resolved: false, isError: false,
         }]);
@@ -164,25 +401,79 @@ export function App(props: AppProps): React.ReactElement {
         break;
       }
 
-      case 'tool_result':
+      case 'tool_result': {
+        const preview = formatToolResult(event.name, event.output, event.isError);
+        const startTime = toolTimingRef.current.get(event.id);
+        const durationMs = startTime ? Date.now() - startTime : undefined;
+        toolTimingRef.current.delete(event.id);
         setToolCalls(prev => prev.map(tc =>
           tc.id === event.id
-            ? { ...tc, resolved: true, isError: event.isError }
+            ? { ...tc, resolved: true, isError: event.isError, resultPreview: preview, durationMs }
+            : tc
+        ));
+        setActiveTool(undefined);
+        break;
+      }
+
+      case 'usage':
+        setTokenCount(event.totalTokens);
+        trackerRef.current.recordTurn(
+          router.current.model,
+          router.current.name,
+          event.inputTokens,
+          event.outputTokens,
+          event.cacheReadTokens ?? 0,
+          event.cacheWriteTokens ?? 0,
+        );
+        break;
+
+      case 'tool_denied':
+        setToolCalls(prev => prev.map(tc =>
+          tc.id === event.id
+            ? { ...tc, resolved: true, isError: true, resultPreview: 'Denied by user' }
             : tc
         ));
         setActiveTool(undefined);
         break;
 
-      case 'usage':
-        setTokenCount(event.totalTokens);
+      case 'plan_step':
+        // In plan mode, tool calls render as plan steps (not executed)
+        setToolCalls(prev => [...prev, {
+          id: event.toolCall.id,
+          name: event.toolCall.name,
+          summary: getToolSummary(event.toolCall.name, event.toolCall.input),
+          resolved: false,
+          isError: false,
+          resultPreview: '(plan — not executed)',
+        }]);
+        break;
+
+      case 'plan_complete':
+        setDisplayMessages(prev => [...prev, {
+          role: 'system',
+          text: `Plan complete: ${event.steps.length} steps proposed. Enter to execute, or refine.`,
+          subtype: 'info',
+        }]);
+        break;
+
+      case 'echo_fizzle':
+        // Show dim indicator of what the engine learned
+        if (event.echoed.length > 0) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'system',
+            text: `Memory: ${event.echoed.length} note${event.echoed.length > 1 ? 's' : ''} used → boosted`,
+            subtype: 'info',
+          }]);
+        }
         break;
 
       case 'compact':
         setDisplayMessages(prev => [...prev, {
-          role: 'assistant',
+          role: 'system',
           text: event.pruneOnly
-            ? '*[Context compacted: pruned old tool outputs]*'
-            : `*[Context compacted: ${event.savedCount} insights saved to memory]*`,
+            ? 'Conversation compacted (pruned old tool outputs)'
+            : `Conversation compacted (${event.savedCount} insights saved to memory)`,
+          subtype: 'compact',
         }]);
         break;
 
@@ -214,8 +505,34 @@ export function App(props: AppProps): React.ReactElement {
         setTokenCount(0);
         break;
 
-      case '/model':
-        if (arg) {
+      case '/model': {
+        if (!arg) {
+          // No args → open interactive model picker
+          setShowModelPicker(true);
+          break;
+        }
+
+        const parts = arg.trim().split(/\s+/);
+        const SLOTS = ['primary', 'reasoning', 'cheap', 'bulk'];
+
+        // Check if first arg is a slot name: /model cheap deepseek
+        if (SLOTS.includes(parts[0]) && parts.length >= 2) {
+          const slot = parts[0];
+          const modelArg = parts.slice(1).join(' ');
+          try {
+            router.assignSlot(slot as any, modelArg);
+            const slotProvider = router.getProvider(slot as any);
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant',
+              text: `**${slot}** slot → ${slotProvider?.model ?? modelArg}`,
+            }]);
+          } catch (err) {
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant', text: (err as Error).message,
+            }]);
+          }
+        } else {
+          // Direct model switch: /model opus high
           try {
             const result = router.setModel(arg);
             setDisplayMessages(prev => [...prev, {
@@ -226,28 +543,75 @@ export function App(props: AppProps): React.ReactElement {
               role: 'assistant', text: (err as Error).message,
             }]);
           }
-        } else {
-          const current = router.info;
-          const available = ModelRouter.availableModels.join(', ');
-          const slots = router.slots.map(s =>
-            `  ${s.slot}: ${s.model}${s.slot === current.slot ? ' (active)' : ''}`
-          ).join('\n');
-          setDisplayMessages(prev => [...prev, {
-            role: 'assistant',
-            text: `**Current:** ${current.model} | effort: ${current.effort}\n\n**Slots:**\n${slots}\n\n**Available:** ${available}\n\n**Usage:** /model opus high, /model sonnet low, /model gemini`,
-          }]);
         }
         break;
+      }
 
       case '/effort':
         if (arg && ['high', 'medium', 'low'].includes(arg)) {
-          router.setEffort(arg as any);
+          router.setEffort(arg as EffortLevel);
           setDisplayMessages(prev => [...prev, {
             role: 'assistant', text: `Effort: ${arg}`,
           }]);
         } else {
           setDisplayMessages(prev => [...prev, {
             role: 'assistant', text: `**Effort:** ${router.effort}\n**Usage:** /effort high, /effort medium, /effort low`,
+          }]);
+        }
+        break;
+
+      case '/mode': {
+        const MODES: PermissionMode[] = ['default', 'accept', 'yolo'];
+        const MODE_DESC: Record<PermissionMode, string> = {
+          default: 'Prompt for write tools',
+          accept: 'Auto-approve edits, prompt for Bash',
+          plan: 'Read-only planning mode',
+          yolo: 'Auto-approve everything',
+        };
+        if (arg && MODES.includes(arg as PermissionMode)) {
+          setPermissionMode(arg as PermissionMode);
+          setDisplayMessages(prev => [...prev, {
+            role: 'system', text: `Mode: ${arg} — ${MODE_DESC[arg as PermissionMode]}`, subtype: 'info',
+          }]);
+        } else {
+          const modeList = MODES.map(m =>
+            `- \`${m}\`${m === permissionMode ? ' ← active' : ''} — ${MODE_DESC[m]}`
+          ).join('\n');
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: `**Permission mode:** ${permissionMode}\n\n${modeList}\n\n**Usage:** \`/mode accept\` or \`shift+tab\` to cycle`,
+          }]);
+        }
+        break;
+      }
+
+      case '/plan':
+        if (arg === 'off' || arg === 'exit') {
+          // Exit plan mode via dialog
+          if (permissionMode === 'plan') {
+            setShowPlanExit(true);
+          }
+        } else {
+          setPermissionMode('plan');
+          setPlanText('');
+          setDisplayMessages(prev => [...prev, {
+            role: 'system',
+            text: `${figures.planMode} Plan mode on — write tools disabled, read/explore active. /plan off to exit.`,
+            subtype: 'info',
+          }]);
+          if (arg) {
+            handleSubmit(arg);
+          }
+        }
+        break;
+
+      case '/execute':
+        // Quick exit from plan mode → execute
+        if (permissionMode === 'plan') {
+          setShowPlanExit(true);
+        } else {
+          setDisplayMessages(prev => [...prev, {
+            role: 'system', text: 'Not in plan mode. Use /plan to enter.', subtype: 'info',
           }]);
         }
         break;
@@ -271,11 +635,46 @@ export function App(props: AppProps): React.ReactElement {
         break;
 
       case '/cost':
-        setDisplayMessages(prev => [...prev, {
-          role: 'assistant',
-          text: `**Tokens:** ${tokenCount} / ${router.current.contextWindow}`,
-        }]);
+      case '/usage': {
+        const tracker = trackerRef.current;
+        const totals = tracker.totals;
+        const recent = tracker.lastTurns(10);
+
+        // Per-turn table
+        const turnLines = recent.map(t =>
+          `  ${String(t.turn).padStart(3)}  ${t.model.slice(0, 20).padEnd(20)}  ${formatTokenCount(t.inputTokens).padStart(7)} in  ${formatTokenCount(t.outputTokens).padStart(7)} out  ${t.cacheReadTokens > 0 ? formatTokenCount(t.cacheReadTokens).padStart(6) + ' cached' : '             '}  ${formatCost(t.costEstimate).padStart(8)}  ${t.durationMs ? formatDuration(t.durationMs).padStart(6) : ''}`
+        ).join('\n');
+
+        // Cache efficiency
+        const cacheHitRate = totals.inputTokens > 0
+          ? Math.round((totals.cacheReadTokens / (totals.inputTokens + totals.cacheReadTokens)) * 100)
+          : 0;
+
+        const text = [
+          `**Session Usage** (${totals.turns} turns)`,
+          '',
+          '```',
+          `  Input:       ${formatTokenCount(totals.inputTokens).padStart(8)}  tokens`,
+          `  Output:      ${formatTokenCount(totals.outputTokens).padStart(8)}  tokens`,
+          `  Cache read:  ${formatTokenCount(totals.cacheReadTokens).padStart(8)}  tokens  (${cacheHitRate}% hit rate)`,
+          `  Cache write: ${formatTokenCount(totals.cacheWriteTokens).padStart(8)}  tokens`,
+          `  ─────────────────────────────`,
+          `  Total:       ${formatTokenCount(totals.totalTokens).padStart(8)}  tokens`,
+          `  Est. cost:   ${formatCost(totals.cost).padStart(8)}`,
+          `  Wall time:   ${formatDuration(totals.durationMs).padStart(8)}`,
+          '```',
+          '',
+          `**Context:** ${formatTokenCount(tokenCount)} / ${formatTokenCount(router.current.contextWindow)} (${Math.round(tokenCount / router.current.contextWindow * 100)}%)`,
+          '',
+          totals.turns > 0 ? `**Last ${recent.length} turns:**` : '',
+          totals.turns > 0 ? '```' : '',
+          turnLines,
+          totals.turns > 0 ? '```' : '',
+        ].filter(Boolean).join('\n');
+
+        setDisplayMessages(prev => [...prev, { role: 'assistant', text }]);
         break;
+      }
 
       case '/tools':
         setDisplayMessages(prev => [...prev, {
@@ -283,6 +682,25 @@ export function App(props: AppProps): React.ReactElement {
           text: `**Tools (${registry.all().length}):**\n${registry.all().map(t => `- ${t.name} [${t.readOnly ? 'read' : 'write'}]`).join('\n')}`,
         }]);
         break;
+
+      case '/display': {
+        const modes: DisplayMode[] = ['verbose', 'normal', 'quiet'];
+        if (arg && modes.includes(arg as DisplayMode)) {
+          setDisplayMode(arg as DisplayMode);
+          setDisplayMessages(prev => [...prev, {
+            role: 'system', text: `Display mode: ${arg}`, subtype: 'info',
+          }]);
+        } else {
+          // Cycle: verbose → normal → quiet → verbose
+          const nextIdx = (modes.indexOf(displayMode) + 1) % modes.length;
+          const next = modes[nextIdx]!;
+          setDisplayMode(next);
+          setDisplayMessages(prev => [...prev, {
+            role: 'system', text: `Display mode: ${next}`, subtype: 'info',
+          }]);
+        }
+        break;
+      }
 
       case '/research': {
         if (!arg) {
@@ -318,21 +736,384 @@ export function App(props: AppProps): React.ReactElement {
         break;
       }
 
+      case '/config': {
+        const slots = router.slots;
+        const current = router.info;
+        const lines = slots.map(s =>
+          `  **${s.slot}**: ${s.model}${s.slot === current.slot ? ' ← active' : ''}`
+        );
+        const available = ModelRouter.availableModels.join(', ');
+        setDisplayMessages(prev => [...prev, {
+          role: 'assistant',
+          text: `**Model Routing**\n${lines.join('\n')}\n\n**Effort:** ${current.effort}\n\n**Available models:** ${available}\n\n**Assign a slot:** \`/model cheap deepseek\`, \`/model bulk llama\`\n**Switch active:** \`/model opus high\`\n**Edit config:** \`~/.aries/config.yaml\``,
+        }]);
+        break;
+      }
+
+      case '/repl': {
+        if (!replHandle) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: '**REPL not enabled.** Set `repl.enabled: true` in config to use /repl.',
+          }]);
+          break;
+        }
+        if (!arg) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: '**Usage:** `/repl <python code>` — executes in the Python body. Try `/repl print(codebase.top_files(5))` (requires prior `/index`).',
+          }]);
+          break;
+        }
+        // Echo the user's command
+        setDisplayMessages(prev => [...prev, { role: 'user', text: input }]);
+
+        // preCodeExecution hook (can block)
+        const preResult = await runHooks(
+          'preCodeExecution',
+          hooks,
+          { cwd, vaultPath: vault?.vaultPath },
+          undefined,
+          { code: arg },
+        );
+        if (preResult.blocked) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: `**preCodeExecution blocked:** ${preResult.blockMessage}`,
+          }]);
+          break;
+        }
+
+        // Execute
+        try {
+          const result = await replHandle.exec({ code: arg });
+
+          // Log to session
+          session.log({
+            type: 'code_execution',
+            code: arg,
+            stdout: result.stdout,
+            stderr: result.stderr,
+            exception: result.exception,
+            duration_ms: result.duration_ms,
+            rejected: result.rejected,
+            timed_out: result.timed_out,
+            rlm_stats: result.rlm_stats
+              ? { call_count: result.rlm_stats.call_count, total_tokens: result.rlm_stats.total_tokens }
+              : undefined,
+            timestamp: Date.now(),
+          });
+
+          // postCodeExecution hook (non-blocking)
+          await runHooks(
+            'postCodeExecution',
+            hooks,
+            { cwd, vaultPath: vault?.vaultPath },
+            undefined,
+            {
+              code: arg,
+              stdout: result.stdout,
+              stderr: result.stderr,
+              exception: result.exception,
+              rejected: result.rejected,
+            },
+          );
+
+          // Render result
+          if (result.rejected) {
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant',
+              text: `**Rejected by AST guard:** ${result.rejected!.reason}`,
+            }]);
+          } else if (result.timed_out) {
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant',
+              text: `**Timed out** after ${result.duration_ms}ms`,
+            }]);
+          } else {
+            const parts: string[] = [];
+            if (result.stdout) parts.push('```\n' + result.stdout.trimEnd() + '\n```');
+            if (result.stderr) parts.push('**stderr:**\n```\n' + result.stderr.trimEnd() + '\n```');
+            if (result.exception) parts.push('**exception:**\n```\n' + result.exception.trimEnd() + '\n```');
+            const footer = result.rlm_stats && result.rlm_stats.call_count > 0
+              ? `_(${result.duration_ms}ms · ${result.rlm_stats.call_count} rlm calls · ${result.rlm_stats.total_tokens} tokens)_`
+              : `_(${result.duration_ms}ms)_`;
+            parts.push(footer);
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant',
+              text: parts.join('\n\n'),
+            }]);
+          }
+        } catch (err) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: `**REPL error:** ${(err as Error).message}`,
+          }]);
+        }
+        break;
+      }
+
+      case '/signature': {
+        if (!replHandle) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: '**REPL not enabled.** Set `repl.enabled: true` in config.',
+          }]);
+          break;
+        }
+        setDisplayMessages(prev => [...prev, { role: 'user', text: input }]);
+        // Parse: /signature [codebase|vault] [lean|standard|deep|max] [maxTokens]
+        const parts = arg.split(/\s+/).filter(Boolean);
+        let which: 'codebase' | 'vault' = 'codebase';
+        let level: 'lean' | 'standard' | 'deep' | 'max' = 'standard';
+        let maxTokens = 1500;
+        for (const p of parts) {
+          if (p === 'codebase' || p === 'vault') which = p;
+          else if (['lean', 'standard', 'deep', 'max'].includes(p)) level = p as any;
+          else {
+            const n = parseInt(p, 10);
+            if (!isNaN(n)) maxTokens = n;
+          }
+        }
+        try {
+          const sig = which === 'vault'
+            ? await replHandle.bridge.vaultSignature(level, maxTokens)
+            : await replHandle.bridge.codebaseSignature(level, maxTokens);
+          if ('error' in sig && sig.error) {
+            const hint = which === 'vault' ? 'Vault not connected.' : 'Run `/index` first.';
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant',
+              text: `**${which} signature error:** ${sig.error}. ${hint}`,
+            }]);
+          } else {
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant',
+              text: `${sig.markdown}\n\n_(${which} · ${level} · ${sig.approx_tokens} tokens)_`,
+            }]);
+          }
+        } catch (err) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: `**Signature error:** ${(err as Error).message}`,
+          }]);
+        }
+        break;
+      }
+
+      case '/index': {
+        if (!replHandle) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: '**REPL not enabled.** Set `repl.enabled: true` in config.',
+          }]);
+          break;
+        }
+        const repoPath = arg || cwd;
+        setDisplayMessages(prev => [...prev, { role: 'user', text: input }]);
+        setIsLoading(true);
+        try {
+          const r = await replHandle.bridge.index({ repoPath });
+          if (r.ok) {
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant',
+              text: `**Indexed ${r.file_count} files** (${r.symbol_count} symbols, ${r.edge_count} edges, ${r.unique_symbols} unique symbols) in ${r.elapsed_ms}ms.\n\n\`codebase\` is now available in the REPL. Try \`/repl print(codebase.top_files(5))\`.`,
+            }]);
+          } else {
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant',
+              text: `**Index failed:** ${r.error ?? 'unknown'}`,
+            }]);
+          }
+        } catch (err) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: `**Index error:** ${(err as Error).message}`,
+          }]);
+        }
+        setIsLoading(false);
+        break;
+      }
+
+      case '/reload': {
+        // Re-index codebase, refresh vault orient, clear conversation
+        const reloadParts: string[] = [];
+        if (replHandle) {
+          try {
+            const idx = await replHandle.bridge.index({ repoPath: cwd });
+            if (idx.ok) {
+              reloadParts.push(`codebase: ${idx.file_count} files, ${idx.symbol_count} symbols`);
+            }
+          } catch { reloadParts.push('codebase: reindex failed'); }
+        }
+        if (vault?.connected) {
+          try {
+            await vault.orient();
+            reloadParts.push('vault: orient refreshed');
+          } catch { reloadParts.push('vault: orient failed'); }
+        }
+        messagesRef.current.length = 0;
+        setDisplayMessages([{
+          role: 'system',
+          text: `Reloaded. ${reloadParts.join(' | ')}`,
+          subtype: 'info',
+        }]);
+        setTokenCount(0);
+        break;
+      }
+
       case '/help':
         setDisplayMessages(prev => [...prev, {
           role: 'assistant',
           text: `**Commands:**
-- \`/model opus high\` — switch model + effort (opus, sonnet, haiku, gemini, flash)
+- \`/model\` — interactive model picker (or \`/model opus high\`)
+- \`/model cheap deepseek\` — assign a model to a slot
+- \`/config\` — show model routing (which model handles what)
 - \`/effort high|medium|low\` — change effort level
 - \`/cost\` — token usage
 - \`/tools\` — list tools
 - \`/vault\` — vault status
 - \`/brain\` — project brain
 - \`/research "query"\` — deep multi-source research
+- \`/index [path]\` — index codebase graph (default: cwd)
+- \`/signature [codebase|vault] [lean|standard|deep|max] [tokens]\` — preview ambient signature
+- \`/repl <code>\` — execute Python in the body (requires /index first)
+- \`/resume\` — resume a previous session
+- \`/undo\` — undo last file edit (\`/undo 3\` for multiple)
+- \`/compact\` — manually compact conversation
+- \`/reload\` — re-index codebase + refresh vault + clear conversation
 - \`/clear\` — clear conversation
-- \`/exit\` — exit`,
+- \`/exit\` — exit
+
+**Shortcuts:** Alt+P — model picker | Ctrl+C — exit`,
         }]);
         break;
+
+      case '/resume': {
+        const { readdirSync, statSync } = await import('node:fs');
+        const { join } = await import('node:path');
+        const sessionsDir = join(cwd, '.aries', 'sessions');
+        try {
+          const files = readdirSync(sessionsDir)
+            .filter(f => f.endsWith('.jsonl'))
+            .sort()
+            .reverse()
+            .slice(0, 5);
+
+          if (files.length === 0) {
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant', text: 'No previous sessions found.',
+            }]);
+            break;
+          }
+
+          if (!arg) {
+            // List recent sessions
+            const list = files.map((f, i) => {
+              const stat = statSync(join(sessionsDir, f));
+              const date = stat.mtime.toLocaleDateString();
+              return `${i + 1}. ${f} (${date})`;
+            }).join('\n');
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant',
+              text: `**Recent sessions:**\n${list}\n\n**Usage:** \`/resume 1\` to load most recent`,
+            }]);
+            break;
+          }
+
+          // Load specific session
+          const idx = parseInt(arg, 10) - 1;
+          const file = files[idx] ?? files[0];
+          const sessionPath = join(sessionsDir, file!);
+
+          const { resumeFromSession } = await import('../session/resume.js');
+          const { messages: resumed } = resumeFromSession(sessionPath);
+
+          if (resumed.length === 0) {
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant', text: 'Session was empty or could not be loaded.',
+            }]);
+            break;
+          }
+
+          messagesRef.current = resumed;
+          setDisplayMessages([{
+            role: 'system',
+            text: `Resumed session: ${file} (${resumed.length} messages)`,
+            subtype: 'info',
+          }]);
+          break;
+        } catch {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant', text: 'No sessions directory found. Run a session first.',
+          }]);
+          break;
+        }
+      }
+
+      case '/undo': {
+        const { undoLast, undoN, snapshotCount } = await import('../tools/snapshot.js');
+
+        if (arg === 'list') {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant', text: `**Undo stack:** ${snapshotCount()} snapshots available`,
+          }]);
+          break;
+        }
+
+        const count = arg ? parseInt(arg, 10) : 1;
+        if (count > 1) {
+          const restored = undoN(count);
+          if (restored.length === 0) {
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant', text: 'Nothing to undo.',
+            }]);
+          } else {
+            const list = restored.map(s => `- Restored ${s.path} (was ${s.tool})`).join('\n');
+            setDisplayMessages(prev => [...prev, {
+              role: 'system', text: `Undid ${restored.length} edits:\n${list}`, subtype: 'info',
+            }]);
+          }
+        } else {
+          const snap = undoLast();
+          if (snap) {
+            setDisplayMessages(prev => [...prev, {
+              role: 'system', text: `Restored ${snap.path} (was ${snap.tool})`, subtype: 'info',
+            }]);
+          } else {
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant', text: 'Nothing to undo.',
+            }]);
+          }
+        }
+        break;
+      }
+
+      case '/compact': {
+        setIsLoading(true);
+        try {
+          const { runCompaction } = await import('../memory/compact.js');
+          const result = await runCompaction(
+            messagesRef.current, projectBrain, vault, router,
+            Math.floor(router.current.contextWindow * 0.5),
+          );
+          messagesRef.current.length = 0;
+          messagesRef.current.push(...result.messages);
+          setTokenCount(0);
+          setDisplayMessages(prev => [...prev, {
+            role: 'system',
+            text: result.pruneOnly
+              ? 'Compacted (pruned old tool outputs)'
+              : `Compacted: ${result.saved.length} insights saved. ${result.summary.slice(0, 100)}`,
+            subtype: 'compact',
+          }]);
+        } catch (err) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'system', text: `Compact failed: ${(err as Error).message}`, subtype: 'error',
+          }]);
+        }
+        setIsLoading(false);
+        break;
+      }
 
       default:
         setDisplayMessages(prev => [...prev, {
@@ -354,24 +1135,61 @@ export function App(props: AppProps): React.ReactElement {
         />
 
         {/* Spinner */}
-        <Spinner isLoading={isLoading} activeTool={activeTool} />
+        <Spinner isLoading={isLoading} activeTool={activeTool} hasStreamingText={!!streamingText} />
       </Box>
 
-      {/* Pinned bottom: input + status */}
+      {/* Pinned bottom: model picker OR input + status */}
       <Box flexDirection="column" flexShrink={0}>
-        <PromptInput
-          onSubmit={handleSubmit}
-          model={router.info.model}
-          isLoading={isLoading}
-        />
-        <StatusBar
-          model={router.info.model}
-          effort={router.effort}
-          tokenCount={tokenCount}
-          contextWindow={router.current.contextWindow}
-          vaultNotes={vaultNoteCount}
-          isLoading={isLoading}
-        />
+        {/* Permission dialog takes priority over everything */}
+        {/* Dialogs in priority order: plan exit > permission > model picker > input */}
+        {showPlanExit ? (
+          <PlanExitDialog
+            planSummary={planText.split('\n')[0]?.slice(0, 120)}
+            onChoice={handlePlanExit}
+            onCancel={handlePlanExitCancel}
+          />
+        ) : pendingPermission ? (
+          <PermissionDialog
+            toolCall={pendingPermission.toolCall}
+            onAllow={() => { pendingPermission.resolve('allow'); setPendingPermission(null); }}
+            onDeny={() => { pendingPermission.resolve('deny'); setPendingPermission(null); }}
+            onAlways={() => { pendingPermission.resolve('always'); setPendingPermission(null); }}
+          />
+        ) : showModelPicker ? (
+          <ModelPicker
+            currentModel={router.info.model.includes('opus') ? 'opus'
+              : router.info.model.includes('sonnet') ? 'sonnet'
+              : router.info.model.includes('haiku') ? 'haiku'
+              : router.info.model.includes('gemini-2.5-pro') ? 'gemini'
+              : router.info.model.includes('flash') ? 'flash'
+              : 'sonnet'}
+            currentEffort={router.effort}
+            onSelect={handleModelSelect}
+            onCancel={handleModelCancel}
+          />
+        ) : (
+          <>
+            {exitWarningAt && (
+              <Box>
+                <Text dimColor>Press Ctrl+C again to exit</Text>
+              </Box>
+            )}
+            <PromptInput
+              onSubmit={handleSubmit}
+              model={router.info.model}
+              isLoading={isLoading}
+            />
+            <StatusBar
+              model={router.info.model}
+              effort={router.effort}
+              tokenCount={tokenCount}
+              contextWindow={router.current.contextWindow}
+              vaultNotes={vaultNoteCount}
+              isLoading={isLoading}
+              permissionMode={permissionMode}
+            />
+          </>
+        )}
       </Box>
     </Box>
   );
@@ -388,4 +1206,82 @@ function getToolSummary(name: string, input: Record<string, unknown>): string {
   if (input.task) return (input.task as string).slice(0, 60);
   if (input.context) return (input.context as string).slice(0, 60);
   return '';
+}
+
+/**
+ * Format tool result output for the ⎿ preview line.
+ * Claude Code shows a compact, tool-appropriate summary.
+ */
+function formatToolResult(toolName: string, output: string, isError: boolean): string {
+  if (isError) {
+    // Show first line of error
+    const firstLine = output.split('\n')[0] ?? output;
+    return firstLine.slice(0, 200);
+  }
+
+  const lines = output.split('\n').filter(l => l.trim());
+
+  switch (toolName) {
+    case 'Read': {
+      const lineCount = output.split('\n').length;
+      return `${lineCount} lines`;
+    }
+
+    case 'Edit': {
+      // Show full diff output (up to 500 chars) so the DiffPreview component can colorize it
+      if (output.includes('\n-') || output.includes('\n+')) return output.slice(0, 500);
+      if (output.includes('Applied edit')) return output.split('\n')[0]!.slice(0, 150);
+      return lines[0]?.slice(0, 150) ?? 'Edit applied';
+    }
+
+    case 'Write':
+      return lines[0]?.slice(0, 150) ?? 'File written';
+
+    case 'Bash': {
+      if (lines.length === 0) return '(no output)';
+      // Extract exit code if present
+      const exitMatch = output.match(/Exit code: (\d+)/);
+      const exitCode = exitMatch ? `Exit ${exitMatch[1]}` : '';
+      if (lines.length <= 3) return `${exitCode}${exitCode ? ' | ' : ''}${lines.join(' | ').slice(0, 180)}`;
+      return `${exitCode}${exitCode ? ' | ' : ''}${lines.length} lines`;
+    }
+
+    case 'Glob': {
+      if (lines.length === 0) return 'No matches';
+      if (lines.length <= 3) return lines.join(', ').slice(0, 200);
+      return `${lines.length} files`;
+    }
+
+    case 'Grep': {
+      if (lines.length === 0) return 'No matches';
+      if (lines.length === 1) return lines[0]!.slice(0, 200);
+      return `${lines.length} results`;
+    }
+
+    case 'WebFetch':
+      return `${output.length} chars fetched`;
+
+    case 'WebSearch': {
+      if (lines.length === 0) return 'No results';
+      return `${lines.length} results`;
+    }
+
+    case 'VaultSearch':
+    case 'VaultRead':
+    case 'VaultAdd':
+    case 'VaultExplore':
+    case 'VaultWarmth':
+    case 'ProjectSearch':
+      return lines[0]?.slice(0, 200) ?? output.slice(0, 200);
+
+    case 'Agent':
+      return lines[0]?.slice(0, 200) ?? 'Agent completed';
+
+    default: {
+      // Generic: first line, truncated
+      if (lines.length === 0) return '(empty)';
+      if (output.length <= 200) return lines.join(' ').slice(0, 200);
+      return `${lines[0]!.slice(0, 150)}… (${output.length} chars)`;
+    }
+  }
 }
