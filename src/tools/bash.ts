@@ -42,6 +42,9 @@ const ALWAYS_BLOCKED = [
 const REPL_MODE_BLOCKED = [
   /^cat\s/, /^head\s/, /^tail\s/, /^less\s/, /^more\s/, /^bat\s/,
   /^grep\s/, /^rg\s/, /^find\s/, /^fd\s/, /^ag\s/, /^ack\s/,
+  /^ls\b/, /^dir\b/,                                     // codebase.list_files()
+  /^powershell\b/, /^cmd\b/,                              // escape hatches
+  /^code\b/, /^cursor\b/,                                 // no editor launching
 ];
 
 // Always blocked — use WebFetch/WebSearch instead

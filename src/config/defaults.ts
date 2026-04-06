@@ -30,7 +30,7 @@ export const DEFAULT_CONFIG: AriesConfig = {
     classifyTiers: true,
   },
   tools: {
-    maxResultChars: 30_000,
+    maxResultChars: 10_000,
     parallelReadTools: true,
     maxSubagents: 5,
   },
