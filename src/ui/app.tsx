@@ -7,11 +7,13 @@ import { Spinner } from './spinner.js';
 import { ModelPicker } from './modelPicker.js';
 import { agentLoop, type LoopEvent, type PermissionMode, type PermissionDecision } from '../loop.js';
 import { PermissionDialog } from './permissionDialog.js';
-import { PlanExitDialog, type PlanExitChoice } from './planExitDialog.js';
+import { PlanApprovalDialog, type PlanAcceptMode } from './planApprovalDialog.js';
 import { setTitleBusy, setTitleDone, setTitleIdle, flashTaskbar } from './terminal.js';
-import { savePlan } from '../memory/planSave.js';
+import { registerPlanTools } from '../tools/registry.js';
+import type { PlanApprovalResult } from '../tools/planTypes.js';
+import { readFileSync } from 'node:fs';
 import { ResumePicker } from './resumePicker.js';
-import { figures } from './theme.js';
+import { figures, colors } from './theme.js';
 import { UsageTracker, formatTokenCount, formatCost, formatDuration } from '../telemetry/tracker.js';
 import { ModelRouter, type EffortLevel } from '../router/index.js';
 import type { ToolCall } from '../router/types.js';
@@ -63,8 +65,11 @@ export function App(props: AppProps): React.ReactElement {
   const [activeTool, setActiveTool] = useState<string | undefined>();
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(initialPermissionMode ?? 'default');
-  const [showPlanExit, setShowPlanExit] = useState(false);
-  const [planText, setPlanText] = useState('');
+  const [showPlanApproval, setShowPlanApproval] = useState(false);
+  const [planApprovalData, setPlanApprovalData] = useState<{ path: string; content: string } | null>(null);
+  const planFilePathRef = useRef<string | null>(null);
+  const prePlanModeRef = useRef<PermissionMode>('default');
+  const planApprovalResolveRef = useRef<((r: PlanApprovalResult) => void) | null>(null);
   const [exitWarningAt, setExitWarningAt] = useState<number | null>(null);
   const [displayMode, setDisplayMode] = useState<DisplayMode>('normal');
   const [pendingPermission, setPendingPermission] = useState<{
@@ -73,6 +78,8 @@ export function App(props: AppProps): React.ReactElement {
   } | null>(null);
   const [showResumePicker, setShowResumePicker] = useState(initialResumePicker ?? false);
   const [sessionTitle, setSessionTitle] = useState<string | null>(null);
+  const [pasteStatus, setPasteStatus] = useState<string | null>(null);
+  const pasteStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Conversation messages for the loop (mutable ref to avoid stale closures)
   const messagesRef = useRef<Message[]>([]);
@@ -109,7 +116,7 @@ export function App(props: AppProps): React.ReactElement {
   const bufferText = useCallback((text: string) => {
     textBufferRef.current += text;
     if (!flushTimerRef.current) {
-      flushTimerRef.current = setTimeout(flushTextBuffer, 32);
+      flushTimerRef.current = setTimeout(flushTextBuffer, 16);
     }
   }, [flushTextBuffer]);
 
@@ -174,15 +181,41 @@ export function App(props: AppProps): React.ReactElement {
     // Alt+M (meta+m) or Shift+Tab → cycle permission mode
     if ((key.meta && input === 'm') || (key.shift && key.tab)) {
       if (!isLoading) {
-        // If in plan mode, show exit dialog instead of cycling
+        // If in plan mode, Alt+M keeps planning (use /plan off or ExitPlanMode to exit)
         if (permissionMode === 'plan') {
-          setShowPlanExit(true);
+          setDisplayMessages(p => [...p, { role: 'system', text: `${figures.planMode} Already in plan mode. Use /plan off or let the model call ExitPlanMode.`, subtype: 'info' }]);
           return;
         }
         setPermissionMode(prev => {
-          const modes: PermissionMode[] = ['default', 'accept', 'yolo'];
+          const modes: PermissionMode[] = ['default', 'accept', 'plan', 'research', 'yolo'];
           const idx = modes.indexOf(prev);
-          return modes[(idx + 1) % modes.length]!;
+          const next = modes[(idx + 1) % modes.length]!;
+
+          // Entering plan mode → register plan tools + inject directive
+          if (next === 'plan') {
+            prePlanModeRef.current = prev;
+            planFilePathRef.current = null;
+            registerPlanTools(registry, {
+              cwd,
+              onEnter: (path) => { planFilePathRef.current = path; },
+              onExit: (path, content) => new Promise<PlanApprovalResult>(resolve => {
+                setPlanApprovalData({ path, content });
+                setShowPlanApproval(true);
+                planApprovalResolveRef.current = resolve;
+              }),
+            });
+            setDisplayMessages(p => [...p, { role: 'system', text: `${figures.planMode} Plan mode — model will call EnterPlanMode to begin. Alt+M to cycle.`, subtype: 'info' }]);
+            messagesRef.current.push({ role: 'user', content: 'You are now in plan mode. Call EnterPlanMode to begin.' });
+          }
+
+          // Entering research mode → inject research directive
+          if (next === 'research') {
+            const directive = '[RESEARCH MODE] You are in research mode. Explore broadly, follow dependencies, surface patterns, build a mental model. Do not write or modify files. Report findings concisely.';
+            setDisplayMessages(p => [...p, { role: 'system', text: `${figures.researchMode} Research mode — reads only. Alt+M to cycle.`, subtype: 'info' }]);
+            messagesRef.current.push({ role: 'user', content: directive });
+          }
+
+          return next;
         });
       }
       return;
@@ -226,44 +259,47 @@ export function App(props: AppProps): React.ReactElement {
     setShowModelPicker(false);
   }, []);
 
-  // ── Plan exit handler ──────────────────────────────────────────────
-  const handlePlanExit = useCallback(async (choice: PlanExitChoice) => {
-    setShowPlanExit(false);
+  // ── Plan approval handler ──────────────────────────────────────────
+  const handlePlanApproval = useCallback((mode: PlanAcceptMode) => {
+    setShowPlanApproval(false);
+    const result: PlanApprovalResult = { action: 'accepted', mode };
+    planApprovalResolveRef.current?.(result);
+    planApprovalResolveRef.current = null;
 
-    // Save the plan if requested
-    if (choice.saveTarget !== 'none' && planText) {
-      // Extract summary from first line or first 80 chars
-      const summary = planText.split('\n')[0]?.slice(0, 80) ?? 'plan';
-      const saved = await savePlan(
-        { summary, fullText: planText, timestamp: Date.now() },
-        choice.saveTarget,
-        cwd,
-        vault,
-        projectBrain,
-      );
-      if (saved) {
-        setDisplayMessages(prev => [...prev, {
-          role: 'system',
-          text: `Plan saved to ${choice.saveTarget}: ${saved}`,
-          subtype: 'info',
-        }]);
-      }
+    if (mode === 'clear_context' && planFilePathRef.current) {
+      try {
+        const plan = readFileSync(planFilePathRef.current, 'utf-8');
+        messagesRef.current = [{ role: 'user', content: `Implement this plan:\n\n${plan}` }];
+        setDisplayMessages([{ role: 'system', text: 'Context cleared. Plan injected as first message.', subtype: 'info' }]);
+      } catch { /* file read error — fall through */ }
     }
 
-    if (choice.execute) {
-      // Exit plan mode → switch to accept edits for execution
-      setPermissionMode('accept');
-      setPlanText('');
-      setDisplayMessages(prev => [...prev, {
-        role: 'system',
-        text: `${figures.autoMode} Plan mode off — executing with accept edits. Alt+M to change mode.`,
-        subtype: 'info',
-      }]);
-    }
-  }, [planText, cwd, vault, projectBrain]);
+    const nextMode = mode === 'accept_edits' ? 'accept' as PermissionMode : prePlanModeRef.current;
+    setPermissionMode(nextMode);
+    registry.unregister('EnterPlanMode');
+    registry.unregister('ExitPlanMode');
+    planFilePathRef.current = null;
+    setDisplayMessages(prev => [...prev, {
+      role: 'system',
+      text: `${figures.autoMode} Plan approved — now in ${nextMode} mode. Plan saved at .aries/plans/.`,
+      subtype: 'info',
+    }]);
+  }, [registry]);
 
-  const handlePlanExitCancel = useCallback(() => {
-    setShowPlanExit(false);
+  const handlePlanReject = useCallback((feedback: string) => {
+    setShowPlanApproval(false);
+    const result: PlanApprovalResult = { action: 'rejected', feedback };
+    planApprovalResolveRef.current?.(result);
+    planApprovalResolveRef.current = null;
+    // ExitPlanMode tool returns the feedback — model stays in plan mode and refines
+  }, []);
+
+  const handlePlanApprovalCancel = useCallback(() => {
+    setShowPlanApproval(false);
+    // Resolve as rejected with empty feedback — keeps model in plan mode
+    const result: PlanApprovalResult = { action: 'rejected', feedback: 'User cancelled — keep planning.' };
+    planApprovalResolveRef.current?.(result);
+    planApprovalResolveRef.current = null;
   }, []);
 
   // ── Handle user input ───────────────────────────────────────────────
@@ -326,7 +362,21 @@ export function App(props: AppProps): React.ReactElement {
     textBufferRef.current = '';
     if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
 
-    messagesRef.current.push({ role: 'user', content: contentBlocks });
+    // In cerebral mode, prepend a hard execution constraint to every user turn
+    let finalContent: typeof contentBlocks;
+    if (displayMode === 'cerebral') {
+      const prefix = '[CEREBRAL MODE] Execute directly. Zero narration. No "let me", no "I will", no explaining what you\'re about to do. Tool calls only until you have a final result. One sentence max at the end.\n\n';
+      if (typeof contentBlocks === 'string') {
+        finalContent = prefix + contentBlocks;
+      } else {
+        const [first, ...rest] = contentBlocks;
+        const firstText = first && 'text' in first ? first.text : '';
+        finalContent = [{ type: 'text' as const, text: prefix + firstText }, ...rest];
+      }
+    } else {
+      finalContent = contentBlocks;
+    }
+    messagesRef.current.push({ role: 'user', content: finalContent });
     session.log({ type: 'user', content: displayText, timestamp: Date.now() });
 
     let fullText = '';
@@ -361,6 +411,7 @@ export function App(props: AppProps): React.ReactElement {
         identityContext: identityCtx,
         maxSubagents: 5,
         preflightEnabled,
+        planFilePath: planFilePathRef.current ?? undefined,
         onPermissionRequest: (tc: ToolCall) => {
           return new Promise<PermissionDecision>((resolve) => {
             setPendingPermission({ toolCall: tc, resolve });
@@ -419,11 +470,7 @@ export function App(props: AppProps): React.ReactElement {
     const totals = trackerRef.current.totals;
     session.touch(userMsgCount, totals.cost);
 
-    if (fullText) {
-      // In plan mode, accumulate the model's text as plan content
-      if (permissionMode === 'plan') {
-        setPlanText(prev => prev + (prev ? '\n\n' : '') + fullText);
-      }
+      if (fullText) {
       // In quiet mode, only show the final text block (after last tool call)
       const shownText = displayMode === 'quiet' ? displayText2.trim() : fullText;
       // Preserve segments (tool calls + text) if the turn had tool calls, so they persist in history
@@ -481,9 +528,10 @@ export function App(props: AppProps): React.ReactElement {
         }
         const tc = event.toolCall;
         const summary = getToolSummary(tc.name, tc.input);
+        const displayName = getToolDisplayName(tc.name, tc.input);
         toolTimingRef.current.set(tc.id, Date.now());
         const toolData: DisplayToolCall = {
-          id: tc.id, name: tc.name, summary, resolved: false, isError: false,
+          id: tc.id, name: displayName, summary, resolved: false, isError: false,
         };
         setStreamSegments(prev => [...prev, { type: 'tool', data: toolData }]);
         setActiveTool(tc.name);
@@ -530,7 +578,7 @@ export function App(props: AppProps): React.ReactElement {
           type: 'tool',
           data: {
             id: event.toolCall.id,
-            name: event.toolCall.name,
+            name: getToolDisplayName(event.toolCall.name, event.toolCall.input),
             summary: getToolSummary(event.toolCall.name, event.toolCall.input),
             resolved: false,
             isError: false,
@@ -675,11 +723,12 @@ export function App(props: AppProps): React.ReactElement {
         break;
 
       case '/mode': {
-        const MODES: PermissionMode[] = ['default', 'accept', 'yolo'];
+        const MODES: PermissionMode[] = ['default', 'accept', 'plan', 'research', 'yolo'];
         const MODE_DESC: Record<PermissionMode, string> = {
           default: 'Prompt for write tools',
           accept: 'Auto-approve edits, prompt for Bash',
-          plan: 'Read-only planning mode',
+          plan: 'Read-only planning with spec pass',
+          research: 'Read-only exploration mode',
           yolo: 'Auto-approve everything',
         };
         if (arg && MODES.includes(arg as PermissionMode)) {
@@ -701,16 +750,34 @@ export function App(props: AppProps): React.ReactElement {
 
       case '/plan':
         if (arg === 'off' || arg === 'exit') {
-          // Exit plan mode via dialog
           if (permissionMode === 'plan') {
-            setShowPlanExit(true);
+            // Force exit without approval — restore mode, clean up
+            setPermissionMode(prePlanModeRef.current);
+            registry.unregister('EnterPlanMode');
+            registry.unregister('ExitPlanMode');
+            planFilePathRef.current = null;
+            setDisplayMessages(prev => [...prev, {
+              role: 'system',
+              text: `${figures.planMode} Plan mode off. Plan file preserved in .aries/plans/ if written.`,
+              subtype: 'info',
+            }]);
           }
         } else {
+          prePlanModeRef.current = permissionMode;
+          planFilePathRef.current = null;
+          registerPlanTools(registry, {
+            cwd,
+            onEnter: (path) => { planFilePathRef.current = path; },
+            onExit: (path, content) => new Promise<PlanApprovalResult>(resolve => {
+              setPlanApprovalData({ path, content });
+              setShowPlanApproval(true);
+              planApprovalResolveRef.current = resolve;
+            }),
+          });
           setPermissionMode('plan');
-          setPlanText('');
           setDisplayMessages(prev => [...prev, {
             role: 'system',
-            text: `${figures.planMode} Plan mode on — write tools disabled, read/explore active. /plan off to exit.`,
+            text: `${figures.planMode} Plan mode on — model will call EnterPlanMode. /plan off to exit.`,
             subtype: 'info',
           }]);
           if (arg) {
@@ -722,7 +789,16 @@ export function App(props: AppProps): React.ReactElement {
       case '/execute':
         // Quick exit from plan mode → execute
         if (permissionMode === 'plan') {
-          setShowPlanExit(true);
+          // Force exit to accept mode
+          setPermissionMode('accept');
+          registry.unregister('EnterPlanMode');
+          registry.unregister('ExitPlanMode');
+          planFilePathRef.current = null;
+          setDisplayMessages(prev => [...prev, {
+            role: 'system',
+            text: `${figures.autoMode} Plan mode off — executing with accept edits.`,
+            subtype: 'info',
+          }]);
         } else {
           setDisplayMessages(prev => [...prev, {
             role: 'system', text: 'Not in plan mode. Use /plan to enter.', subtype: 'info',
@@ -798,14 +874,14 @@ export function App(props: AppProps): React.ReactElement {
         break;
 
       case '/display': {
-        const modes: DisplayMode[] = ['verbose', 'normal', 'quiet'];
+        const modes: DisplayMode[] = ['verbose', 'normal', 'quiet', 'cerebral'];
         if (arg && modes.includes(arg as DisplayMode)) {
           setDisplayMode(arg as DisplayMode);
           setDisplayMessages(prev => [...prev, {
             role: 'system', text: `Display mode: ${arg}`, subtype: 'info',
           }]);
         } else {
-          // Cycle: verbose → normal → quiet → verbose
+          // Cycle: verbose → normal → quiet → cerebral → verbose
           const nextIdx = (modes.indexOf(displayMode) + 1) % modes.length;
           const next = modes[nextIdx]!;
           setDisplayMode(next);
@@ -813,6 +889,19 @@ export function App(props: AppProps): React.ReactElement {
             role: 'system', text: `Display mode: ${next}`, subtype: 'info',
           }]);
         }
+        break;
+      }
+
+      case '/cerebral': {
+        const next = displayMode === 'cerebral' ? 'normal' : 'cerebral';
+        setDisplayMode(next as DisplayMode);
+        setDisplayMessages(prev => [...prev, {
+          role: 'system',
+          text: next === 'cerebral'
+            ? 'Cerebral mode: execute-only, no narration'
+            : 'Cerebral mode: off',
+          subtype: 'info',
+        }]);
         break;
       }
 
@@ -1096,6 +1185,7 @@ export function App(props: AppProps): React.ReactElement {
 - \`/undo\` — undo last file edit (\`/undo 3\` for multiple)
 - \`/compact\` — manually compact conversation
 - \`/reload\` — re-index codebase + refresh vault + clear conversation
+- \`/setup\` — view/change agent name, vault, Ori MCP
 - \`/clear\` — clear conversation
 - \`/exit\` — exit
 
@@ -1184,6 +1274,7 @@ export function App(props: AppProps): React.ReactElement {
           const result = await runCompaction(
             messagesRef.current, projectBrain, vault, router,
             Math.floor(router.current.contextWindow * 0.5),
+            cwd,
           );
           messagesRef.current.length = 0;
           messagesRef.current.push(...result.messages);
@@ -1201,6 +1292,63 @@ export function App(props: AppProps): React.ReactElement {
           }]);
         }
         setIsLoading(false);
+        break;
+      }
+
+      case '/setup': {
+        // Show current config + instructions for changes
+        const home = process.env.HOME || process.env.USERPROFILE || '';
+        const configPath = `${home}/.aries/config.yaml`;
+        const vaultInfo = vault?.connected
+          ? `**Vault:** ${vault.vaultPath}`
+          : '**Vault:** not configured';
+        const oriMcpInfo = [
+          '',
+          '**Connect other editors to your vault:**',
+          '```',
+          'npm i -g ori-memory',
+          `ori bridge claude-code --vault <path>`,
+          '```',
+        ].join('\n');
+
+        if (arg === 'name' || arg === 'rename') {
+          const newName = rest.slice(1).join(' ').trim();
+          if (newName) {
+            // Write updated name to config
+            const { readFileSync, writeFileSync } = await import('node:fs');
+            try {
+              let yaml = readFileSync(configPath, 'utf-8');
+              yaml = yaml.replace(/^(\s*name:\s*).*$/m, `$1${newName}`);
+              writeFileSync(configPath, yaml, 'utf-8');
+              setDisplayMessages(prev => [...prev, {
+                role: 'assistant',
+                text: `Agent renamed to **${newName}**. Restart to apply.`,
+              }]);
+            } catch {
+              setDisplayMessages(prev => [...prev, {
+                role: 'assistant',
+                text: `Could not write to ${configPath}. Create it manually.`,
+              }]);
+            }
+          } else {
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant', text: 'Usage: `/setup name <new-name>`',
+            }]);
+          }
+        } else {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: [
+              `**Agent:** ${agentName}`,
+              vaultInfo,
+              `**Config:** ${configPath}`,
+              '',
+              '**Commands:**',
+              '- `/setup name <name>` — rename your agent',
+              oriMcpInfo,
+            ].join('\n'),
+          }]);
+        }
         break;
       }
 
@@ -1237,11 +1385,14 @@ export function App(props: AppProps): React.ReactElement {
       <Box flexDirection="column" flexShrink={0}>
         {/* Permission dialog takes priority over everything */}
         {/* Dialogs in priority order: plan exit > permission > model picker > input */}
-        {showPlanExit ? (
-          <PlanExitDialog
-            planSummary={planText.split('\n')[0]?.slice(0, 120)}
-            onChoice={handlePlanExit}
-            onCancel={handlePlanExitCancel}
+        {showPlanApproval && planApprovalData ? (
+          <PlanApprovalDialog
+            planFilePath={planApprovalData.path}
+            planContent={planApprovalData.content}
+            onAccept={handlePlanApproval}
+            onReject={handlePlanReject}
+            onCancel={handlePlanApprovalCancel}
+            onContentChange={(content) => setPlanApprovalData(prev => prev ? { ...prev, content } : null)}
           />
         ) : pendingPermission ? (
           <PermissionDialog
@@ -1278,8 +1429,16 @@ export function App(props: AppProps): React.ReactElement {
                 <Text dimColor>Press Ctrl+C again to exit</Text>
               </Box>
             )}
+            {pasteStatus && (
+              <Box><Text color={colors.warning}>{figures.bullet} {pasteStatus}</Text></Box>
+            )}
             <PromptInput
               onSubmit={handleSubmit}
+              onPasteError={(msg) => {
+                setPasteStatus(msg);
+                if (pasteStatusTimerRef.current) clearTimeout(pasteStatusTimerRef.current);
+                pasteStatusTimerRef.current = setTimeout(() => setPasteStatus(null), 3000);
+              }}
               model={router.info.model}
               isLoading={isLoading}
             />
@@ -1300,17 +1459,55 @@ export function App(props: AppProps): React.ReactElement {
   );
 }
 
-/** Extract a brief summary from tool input for display. */
+/** Format a tool call as "Verb(arg)" like Claude Code does. */
+function getToolDisplayName(name: string, input: Record<string, unknown>): string {
+  const filePath = input.file_path as string | undefined;
+  const relPath = filePath ? filePath.replace(/\\/g, '/').split('/').slice(-2).join('/') : undefined;
+
+  switch (name) {
+    case 'Read':
+      return relPath ? `Read(${relPath})` : 'Read';
+    case 'Edit':
+      return relPath ? `Update(${relPath})` : 'Update';
+    case 'Write':
+      return relPath ? `Write(${relPath})` : 'Write';
+    case 'Glob':
+      return `Glob(${(input.pattern as string | undefined)?.slice(0, 40) ?? '*'})`;
+    case 'Grep': {
+      const pat = (input.pattern as string | undefined)?.slice(0, 30) ?? '';
+      return `Grep(${pat})`;
+    }
+    case 'Bash':
+      return 'Bash';
+    case 'WebSearch':
+      return 'WebSearch';
+    case 'WebFetch':
+      return 'WebFetch';
+    case 'Agent':
+      return `Agent(${(input.description as string | undefined)?.slice(0, 30) ?? 'task'})`;
+    default:
+      return name;
+  }
+}
+
+/** Extract a brief summary from tool input for display (shown after the tool name). */
 function getToolSummary(name: string, input: Record<string, unknown>): string {
-  if (input.command) return (input.command as string).slice(0, 80);
-  if (input.file_path) return input.file_path as string;
-  if (input.pattern) return input.pattern as string;
-  if (input.query) return (input.query as string).slice(0, 60);
-  if (input.url) return input.url as string;
-  if (input.title) return (input.title as string).slice(0, 60);
-  if (input.task) return (input.task as string).slice(0, 60);
-  if (input.context) return (input.context as string).slice(0, 60);
-  return '';
+  switch (name) {
+    case 'Bash':
+      return (input.command as string | undefined)?.slice(0, 80) ?? '';
+    case 'WebSearch':
+      return (input.query as string | undefined)?.slice(0, 60) ?? '';
+    case 'WebFetch':
+      return (input.url as string | undefined)?.slice(0, 60) ?? '';
+    case 'Agent':
+      return '';
+    default:
+      // For file tools, the path is already in the display name
+      if (input.query) return (input.query as string).slice(0, 60);
+      if (input.title) return (input.title as string).slice(0, 60);
+      if (input.task) return (input.task as string).slice(0, 60);
+      return '';
+  }
 }
 
 /**
@@ -1332,19 +1529,27 @@ function formatToolResult(toolName: string, output: string, isError: boolean): s
       return `${lineCount} lines`;
     }
 
-    case 'Edit': {
-      // Show full diff output (up to 500 chars) so the DiffPreview component can colorize it
-      if (output.includes('\n-') || output.includes('\n+')) return output.slice(0, 500);
+    case 'Edit':
+    case 'Write': {
+      // Parse added/removed line counts from the diff
+      const addedLines = (output.match(/^\+[^+]/mg) ?? []).length;
+      const removedLines = (output.match(/^-[^-]/mg) ?? []).length;
+      const hasDiff = output.includes('\n-') || output.includes('\n+');
+      if (hasDiff) {
+        const summary = addedLines > 0 && removedLines > 0
+          ? `Added ${addedLines} line${addedLines !== 1 ? 's' : ''}, removed ${removedLines} line${removedLines !== 1 ? 's' : ''}`
+          : addedLines > 0 ? `Added ${addedLines} line${addedLines !== 1 ? 's' : ''}`
+          : removedLines > 0 ? `Removed ${removedLines} line${removedLines !== 1 ? 's' : ''}`
+          : 'Modified';
+        // Prepend summary to diff so DiffPreview shows both
+        return `${summary}\n${output.slice(0, 600)}`;
+      }
       if (output.includes('Applied edit')) return output.split('\n')[0]!.slice(0, 150);
-      return lines[0]?.slice(0, 150) ?? 'Edit applied';
+      return lines[0]?.slice(0, 150) ?? (toolName === 'Write' ? 'File written' : 'Edit applied');
     }
-
-    case 'Write':
-      return lines[0]?.slice(0, 150) ?? 'File written';
 
     case 'Bash': {
       if (lines.length === 0) return '(no output)';
-      // Extract exit code if present
       const exitMatch = output.match(/Exit code: (\d+)/);
       const exitCode = exitMatch ? `Exit ${exitMatch[1]}` : '';
       if (lines.length <= 3) return `${exitCode}${exitCode ? ' | ' : ''}${lines.join(' | ').slice(0, 180)}`;
@@ -1359,8 +1564,14 @@ function formatToolResult(toolName: string, output: string, isError: boolean): s
 
     case 'Grep': {
       if (lines.length === 0) return 'No matches';
-      if (lines.length === 1) return lines[0]!.slice(0, 200);
-      return `${lines.length} results`;
+      // Count unique files in output (grep output format: "file:line:content")
+      const files = new Set(lines.map(l => l.split(':')[0]).filter(Boolean));
+      const fileCount = files.size;
+      const matchCount = lines.length;
+      if (fileCount <= 1 && matchCount === 1) return lines[0]!.slice(0, 200);
+      return fileCount > 1
+        ? `${matchCount} match${matchCount !== 1 ? 'es' : ''} in ${fileCount} file${fileCount !== 1 ? 's' : ''}`
+        : `${matchCount} match${matchCount !== 1 ? 'es' : ''}`;
     }
 
     case 'WebFetch':
@@ -1368,7 +1579,7 @@ function formatToolResult(toolName: string, output: string, isError: boolean): s
 
     case 'WebSearch': {
       if (lines.length === 0) return 'No results';
-      return `${lines.length} results`;
+      return `${lines.length} result${lines.length !== 1 ? 's' : ''}`;
     }
 
     case 'VaultSearch':

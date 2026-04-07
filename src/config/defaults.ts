@@ -2,7 +2,7 @@ import type { AriesConfig } from './types.js';
 
 export const DEFAULT_CONFIG: AriesConfig = {
   agent: {
-    name: 'Aries',
+    name: 'Ori',
   },
   timezone: 'America/Chicago',
   displayMode: 'normal',
@@ -34,6 +34,7 @@ export const DEFAULT_CONFIG: AriesConfig = {
     parallelReadTools: true,
     maxSubagents: 5,
   },
+  webSearch: {},
   permissions: {
     mode: 'manual',
     allowBash: true,

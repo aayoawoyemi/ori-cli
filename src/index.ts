@@ -11,6 +11,7 @@ import type { EffortLevel } from './router/index.js';
 import { createCoreRegistry, registerMemoryTools } from './tools/registry.js';
 import { buildSystemPrompt } from './prompt.js';
 import { OriVault, findVault } from './memory/vault.js';
+import { readExperienceLog } from './memory/experienceLog.js';
 import { ProjectBrain } from './memory/projectBrain.js';
 import { SessionStorage } from './session/storage.js';
 import { detectExistingSetup } from './onboarding/detect.js';
@@ -272,7 +273,7 @@ if (continueSession) {
 }
 
 const router = new ModelRouter(config.models, config.experimental);
-const registry = createCoreRegistry({ replEnabled: config.repl.enabled });
+const registry = createCoreRegistry({ replEnabled: config.repl.enabled, webSearch: config.webSearch });
 registerMemoryTools(registry, vault, projectBrain);
 
 let replHandleRef: ReplHandle | null = null;
@@ -312,6 +313,7 @@ if (isSubagent) {
         vaultPath: vaultPath ?? undefined,
         anthropicApiKey: process.env.ANTHROPIC_API_KEY,
         rlmModel: config.models.primary.model,
+        vault,
       });
       if (subRepl) {
         const sigs = await compileAmbientSignatures(subRepl, {
@@ -340,6 +342,7 @@ if (isSubagent) {
     codebaseSignature: subCodebaseSignatureMd,
     vaultSignature: subVaultSignatureMd,
     replEnabled: false,
+    experienceLog: readExperienceLog(cwd),
   });
 
   const { agentLoop } = await import('./loop.js');
@@ -388,9 +391,12 @@ async function main(): Promise<void> {
   enterParchment();
 
   // ── Startup banner ──────────────────────────────────────────────────
-  // ── Ori elephant (downscaled from ori-website/dist/elephant.png at W=30) ──
-  const warm = chalk.ansi256(178);  // antique gold
-  const sprite = [
+  // Elephant left, "ORI CLI" block letters right, breathing ○ by the elephant.
+  const gold = chalk.hex('#c4a46c');      // antique gold — theme accent
+  const brightGold = chalk.hex('#d4aa55'); // warm gold — ring highlight
+
+  // Elephant sprite (14 lines, braille art)
+  const elephant = [
     '⠀⡠⠐⠒⠀⠀⠒⡐⠤⠤⠒⠀⠀⠠⠤⡀⠠⡀⠀⠀⠀',
     '⢠⠊⠀⠀⠐⣶⣄⡉⢉⠀⠀⢀⠀⠀⠀⢜⣧⡌⢂⠀⠀',
     '⠔⠁⠀⠀⠀⠀⢿⣟⠉⠀⠀⠀⠀⠀⠀⠀⠙⠅⠀⠆⠀',
@@ -406,27 +412,43 @@ async function main(): Promise<void> {
     '⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡠⣲⣰⡞⠀⠀',
     '⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⠶⠛⠀⠀⠀',
   ];
-  const authLabel = config.models.primary.auth === 'oauth'
-    ? (config.experimental.localClaudeSubscription ? 'Claude Max' : 'OAuth')
-    : 'API key';
-  const vaultLabel = vault?.connected ? `~/${vault.vaultPath?.split(/[/\\]/).pop() ?? 'brain'}` : '';
-  const infoLines = [
-    `${chalk.bold('Ori CLI')} ${chalk.dim('v0.1.0')}`,
-    `${modelInfo.model}`,
-    `${authLabel}${agentLabel !== 'Ori' ? ` · ${agentLabel}` : ''}`,
-    vaultLabel,
-  ].filter(Boolean);
 
-  // Print sprite on left, info on right (info starts ~halfway down the elephant)
+  // 7-line block letters "ORI CLI" — vertically centered against the elephant
+  const blockText = [
+    ' ██████  ██████  ██     ██████ ██      ██',
+    '██    ██ ██   ██ ██    ██      ██      ██',
+    '██    ██ ██████  ██    ██      ██      ██',
+    '██    ██ ██   ██ ██    ██      ██      ██',
+    ' ██████  ██   ██ ██     ██████ ██████  ██',
+  ];
+
+  const vaultLabel = vault?.connected
+    ? `~/${vault.vaultPath?.split(/[/\\]/).pop() ?? 'brain'}`
+    : '';
+  const infoParts = [
+    'v1.0-beta',
+    agentLabel !== 'Ori' ? agentLabel : null,
+    vaultLabel || null,
+  ].filter(Boolean) as string[];
+  const infoLine = chalk.dim(infoParts.join('  ·  '));
+
+  // Print: elephant on left, block text on right (centered), ring after elephant
   console.log('');
-  const infoStartLine = Math.max(0, Math.floor(sprite.length / 2) - Math.floor(infoLines.length / 2));
-  for (let i = 0; i < sprite.length; i++) {
-    const art = warm(sprite[i]!);
-    const infoIdx = i - infoStartLine;
-    const info = infoIdx >= 0 && infoIdx < infoLines.length
-      ? (infoIdx === 0 ? infoLines[infoIdx] : chalk.dim(infoLines[infoIdx]))
+  const textStart = Math.floor((elephant.length - blockText.length) / 2);
+  for (let i = 0; i < elephant.length; i++) {
+    const art = gold(elephant[i]!);
+    const textIdx = i - textStart;
+    const text = textIdx >= 0 && textIdx < blockText.length
+      ? '  ' + gold(blockText[textIdx]!)
       : '';
-    console.log(`  ${art}  ${info ?? ''}`);
+    console.log(`  ${art}${text}`);
+  }
+  // Ring + info line below the elephant
+  if (!vault?.connected) {
+    // No vault — nudge them toward setup
+    console.log(`  ${brightGold('○')}  ${chalk.dim('v1.0-beta')}  ${chalk.hex('#c4a46c')('type /setup to configure your vault')}`);
+  } else {
+    console.log(`  ${brightGold('○')}  ${infoLine}`);
   }
   console.log('');
 
@@ -443,6 +465,7 @@ async function main(): Promise<void> {
         vaultPath: vaultPath ?? undefined,
         anthropicApiKey: anthropicKey,
         rlmModel: config.models.primary.model,
+        vault,
         onEvent: (e) => {
           if (e.type === 'bridge_restart' || e.type === 'bridge_error') {
             console.error(chalk.yellow(`  [repl] ${e.type}`));
@@ -488,6 +511,7 @@ async function main(): Promise<void> {
     codebaseSignature: codebaseSignatureMd,
     vaultSignature: vaultSignatureMd,
     replEnabled: !!replHandle,
+    experienceLog: readExperienceLog(cwd),
   });
 
   const { waitUntilExit } = render(

@@ -1,5 +1,6 @@
 import { createInterface } from 'node:readline';
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { execSync } from 'node:child_process';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import chalk from 'chalk';
@@ -10,9 +11,13 @@ export interface OnboardingResult {
   userDescription: string | null;
 }
 
+const gold = chalk.hex('#c4a46c');
+const brightGold = chalk.hex('#d4aa55');
+const dim = chalk.dim;
+
 /**
- * First-run onboarding flow.
- * "Who am I to you?" — the user names their agent and defines the relationship.
+ * First-run onboarding — create a vault via `ori init`.
+ * Only runs when no existing vault is detected (from Ori MCP or otherwise).
  */
 export async function runOnboarding(): Promise<OnboardingResult> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -20,89 +25,97 @@ export async function runOnboarding(): Promise<OnboardingResult> {
   const ask = (prompt: string): Promise<string> =>
     new Promise(resolve => rl.question(prompt, resolve));
 
-  console.log(chalk.bold('\n  Welcome to Aries.\n'));
-
-  // ── Name the agent ──────────────────────────────────────────────────
-  const nameInput = await ask(
-    chalk.dim('  Before we start — who am I to you?\n') +
-    chalk.dim('  Give me a name (Enter for "Aries"): '),
-  );
-  const agentName = nameInput.trim() || 'Aries';
-
-  // ── Who are you? ────────────────────────────────────────────────────
+  // ── Welcome ─────────────────────────────────────────────────────────
   console.log('');
-  const userInput = await ask(
-    chalk.dim('  And who are you? What should I know about\n') +
-    chalk.dim('  you and how we\'ll work together?\n') +
-    chalk.dim('  (Skip with Enter — I\'ll learn as we go.)\n\n') +
-    chalk.dim('  > '),
-  );
-  const userDescription = userInput.trim() || null;
-
-  // ── Vault setup ─────────────────────────────────────────────────────
+  console.log(gold('  ┌──────────────────────────────────────┐'));
+  console.log(gold('  │') + chalk.bold('  Welcome to Ori CLI                 ') + gold('│'));
+  console.log(gold('  │') + dim('  A coding agent with persistent memory') + gold('│'));
+  console.log(gold('  └──────────────────────────────────────┘'));
   console.log('');
-  const vaultInput = await ask(
-    chalk.dim(`  Got it. I'm ${agentName}.\n\n`) +
-    chalk.dim('  Persistent memory lets me remember across sessions\n') +
-    chalk.dim('  and projects. Set up a vault? [y/n] '),
+  console.log(dim('  Ori uses a vault — a folder of markdown files —'));
+  console.log(dim('  to remember context across sessions and projects.'));
+  console.log('');
+  console.log(gold('     ┌─────────┐    ┌─────────┐    ┌─────────┐'));
+  console.log(gold('     │ Ori CLI │    │ VS Code │    │ Cursor  │'));
+  console.log(gold('     └────┬────┘    └────┬────┘    └────┬────┘'));
+  console.log(gold('          │              │              │'));
+  console.log(gold('          └──────────────┼──────────────┘'));
+  console.log(gold('                         │'));
+  console.log(gold('                   ┌─────┴─────┐'));
+  console.log(gold('                   │') + brightGold('  Ori MCP  ') + gold('│'));
+  console.log(gold('                   └─────┬─────┘'));
+  console.log(gold('                         │'));
+  console.log(gold('                    ┌────┴────┐'));
+  console.log(gold('                    │') + brightGold(' vault/  ') + gold(' │'));
+  console.log(gold('                    │') + dim(' notes/  ') + gold(' │'));
+  console.log(gold('                    │') + dim(' self/   ') + gold(' │'));
+  console.log(gold('                    │') + dim(' inbox/  ') + gold(' │'));
+  console.log(gold('                    └─────────┘'));
+  console.log('');
+  console.log(dim('  One vault, many clients.'));
+  console.log('');
+
+  // ── Vault location ──────────────────────────────────────────────────
+  const defaultVaultPath = join(homedir(), 'brain');
+
+  const pathInput = await ask(
+    dim(`  Vault location (${defaultVaultPath}): `),
   );
+  const vaultPath = pathInput.trim() || defaultVaultPath;
 
-  let vaultPath: string | null = null;
+  // ── Delegate to ori init ────────────────────────────────────────────
+  // ori-memory is a dependency, so `ori` binary should be available.
+  // `ori init` creates the vault from its scaffold (richer than manual mkdir).
+  // We pass --json so it doesn't run its own interactive boot sequence.
+  let oriInitSuccess = false;
 
-  if (vaultInput.trim().toLowerCase() === 'y' || vaultInput.trim().toLowerCase() === 'yes') {
-    const defaultVaultPath = join(homedir(), '.aries', 'vault');
+  try {
+    execSync(`ori init "${vaultPath}" --json`, {
+      stdio: 'pipe',
+      env: { ...process.env },
+      timeout: 30_000,
+    });
+    oriInitSuccess = true;
     console.log('');
-    const pathInput = await ask(
-      chalk.dim(`  Where? (${defaultVaultPath}) `),
-    );
-    vaultPath = pathInput.trim() || defaultVaultPath;
-
-    // Create vault directory structure
+    console.log(gold('  ✓') + dim(` Vault created at ${vaultPath}`));
+  } catch (err) {
+    // Fallback: create minimal structure manually if ori binary fails
+    console.log(dim(`\n  ori init failed, creating vault manually...`));
     try {
       mkdirSync(join(vaultPath, 'self'), { recursive: true });
       mkdirSync(join(vaultPath, 'notes'), { recursive: true });
       mkdirSync(join(vaultPath, 'inbox'), { recursive: true });
       mkdirSync(join(vaultPath, 'ops'), { recursive: true });
       mkdirSync(join(vaultPath, '.ori'), { recursive: true });
-
-      // Seed identity
-      const identityContent = `# ${agentName}
-
-Agent identity for ${agentName}. Created during first-run onboarding.
-
-## Core
-- Name: ${agentName}
-- Role: Memory-native coding agent
-`;
-      writeFileSync(join(vaultPath, 'self', 'identity.md'), identityContent, 'utf-8');
-
-      // Seed user model
-      if (userDescription) {
-        const userModelContent = `# User Model
-
-${userDescription}
-`;
-        writeFileSync(join(vaultPath, 'self', 'user-model.md'), userModelContent, 'utf-8');
-      }
-
-      // Seed empty goals
-      writeFileSync(join(vaultPath, 'self', 'goals.md'), '# Goals\n\n(Updated automatically as we work together.)\n', 'utf-8');
-
-      console.log(chalk.dim(`\n  Vault created at ${vaultPath}`));
-    } catch (err) {
-      console.log(chalk.red(`\n  Failed to create vault: ${(err as Error).message}`));
-      vaultPath = null;
+      writeFileSync(
+        join(vaultPath, 'self', 'identity.md'),
+        '# Ori\n\nAgent identity. Updated automatically.\n',
+        'utf-8',
+      );
+      writeFileSync(
+        join(vaultPath, 'self', 'goals.md'),
+        '# Goals\n\n(Updated automatically as we work together.)\n',
+        'utf-8',
+      );
+      oriInitSuccess = true;
+      console.log(gold('  ✓') + dim(` Vault created at ${vaultPath}`));
+    } catch (mkdirErr) {
+      console.log(chalk.red(`  Failed to create vault: ${(mkdirErr as Error).message}`));
     }
   }
 
-  // ── Save global config ──────────────────────────────────────────────
+  // ── Save CLI config ─────────────────────────────────────────────────
   const globalConfigDir = join(homedir(), '.aries');
   mkdirSync(globalConfigDir, { recursive: true });
 
-  const configContent = `# Aries CLI configuration
+  const configContent = `# Ori CLI configuration
 agent:
-  name: ${agentName}
-${vaultPath ? `\nvault:\n  path: ${vaultPath}\n  preflight: true\n  postflight: true` : ''}
+  name: Ori
+
+vault:
+  path: ${vaultPath}
+  preflight: true
+  postflight: true
 `;
 
   const configPath = join(globalConfigDir, 'config.yaml');
@@ -110,8 +123,8 @@ ${vaultPath ? `\nvault:\n  path: ${vaultPath}\n  preflight: true\n  postflight: 
     writeFileSync(configPath, configContent, 'utf-8');
   }
 
-  console.log(chalk.dim('\n  Ready.\n'));
+  console.log('');
   rl.close();
 
-  return { agentName, vaultPath, userDescription };
+  return { agentName: 'Ori', vaultPath: oriInitSuccess ? vaultPath : null, userDescription: null };
 }
