@@ -1,22 +1,28 @@
 {
-  "name": "@ori-memory/aries",
+  "name": "@ori-memory/cli",
   "version": "0.1.0",
-  "description": "Memory-native coding agent CLI. Built on Ori.",
+  "description": "Memory-native coding agent CLI. Built on Ori Mnemos.",
   "type": "module",
   "bin": {
-    "ori": "./dist/index.js"
+    "ori-cli": "./dist/index.js"
   },
+  "files": [
+    "dist",
+    "body",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0",
     "ori-memory": "^0.5.5",
     "@google/genai": "^1.0.0",
-    "@types/react": "^19.2.14",
     "chalk": "^5.4.0",
     "glob": "^11.0.0",
     "ink": "^6.8.0",
@@ -29,15 +35,26 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/react": "^19.2.14",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   },
   "engines": {
     "node": ">=22.0.0"
   },
+  "keywords": [
+    "ai",
+    "agent",
+    "memory",
+    "cli",
+    "coding-agent",
+    "ori",
+    "llm",
+    "persistent-memory"
+  ],
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/aayoawoyemi/aries-cli"
+    "url": "https://github.com/aayoawoyemi/ori-cli"
   }
 }
