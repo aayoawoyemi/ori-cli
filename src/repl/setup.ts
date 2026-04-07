@@ -12,7 +12,7 @@ import type { CodeExecution, ReplResult, ReplEvent } from './types.js';
 export interface ReplHandle {
   bridge: ReplBridge;
   logger: TrajectoryLogger;
-  exec: (execution: CodeExecution) => Promise<ReplResult>;
+  exec: (execution: CodeExecution, signal?: AbortSignal) => Promise<ReplResult>;
   shutdown: () => Promise<void>;
   isAlive: () => boolean;
 }
@@ -135,8 +135,8 @@ export async function setupReplBridge(
   return {
     bridge,
     logger,
-    async exec(execution) {
-      const result = await bridge.exec(execution);
+    async exec(execution, signal) {
+      const result = await bridge.exec(execution, signal);
       logger.log(execution, result);
       return result;
     },

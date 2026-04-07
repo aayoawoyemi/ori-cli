@@ -81,11 +81,20 @@ export class WebSearchTool implements Tool {
 
   private async duckDuckGoSearch(query: string, maxResults: number): Promise<ToolResult> {
     try {
-      // DuckDuckGo instant answer API (limited but no key needed)
       const encoded = encodeURIComponent(query);
       const response = await fetch(
-        `https://api.duckduckgo.com/?q=${encoded}&format=json&no_html=1&skip_disambig=1`,
-        { signal: AbortSignal.timeout(10_000) },
+        `https://html.duckduckgo.com/html/?q=${encoded}`,
+        {
+          method: 'POST',
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: `q=${encoded}`,
+          signal: AbortSignal.timeout(10_000),
+        },
       );
 
       if (!response.ok) {
@@ -96,34 +105,20 @@ export class WebSearchTool implements Tool {
         };
       }
 
-      const data = await response.json() as {
-        Abstract?: string;
-        AbstractURL?: string;
-        AbstractSource?: string;
-        RelatedTopics?: Array<{ Text?: string; FirstURL?: string }>;
-      };
+      const html = await response.text();
+      const results = this.parseDDGResults(html, maxResults);
 
-      const lines: string[] = [];
-
-      if (data.Abstract) {
-        lines.push(`${data.AbstractSource}: ${data.Abstract}\n${data.AbstractURL}\n`);
-      }
-
-      if (data.RelatedTopics) {
-        for (const topic of data.RelatedTopics.slice(0, maxResults)) {
-          if (topic.Text && topic.FirstURL) {
-            lines.push(`${topic.Text}\n${topic.FirstURL}\n`);
-          }
-        }
-      }
-
-      if (lines.length === 0) {
+      if (results.length === 0) {
         return {
           id: '', name: this.name,
           output: `No results found for: ${query}. Try WebFetch with a specific URL instead.`,
           isError: false,
         };
       }
+
+      const lines = results.map(r =>
+        `${r.title}\n${r.url}\n${r.snippet}\n`
+      );
 
       return { id: '', name: this.name, output: lines.join('\n'), isError: false };
     } catch (err) {
@@ -133,5 +128,63 @@ export class WebSearchTool implements Tool {
         isError: true,
       };
     }
+  }
+
+  private parseDDGResults(html: string, maxResults: number): Array<{ title: string; url: string; snippet: string }> {
+    const results: Array<{ title: string; url: string; snippet: string }> = [];
+
+    // DDG HTML search results are in <div class="result ..."> blocks
+    // Each contains:
+    //   - Title in <a class="result__a"> ... </a>
+    //   - URL in <a class="result__url" href="..."> ... </a>
+    //   - Snippet in <a class="result__snippet"> ... </a>  (or <td class="result__snippet">)
+
+    // Split by result blocks
+    const resultBlocks = html.split(/class="result\s/g).slice(1);
+
+    for (const block of resultBlocks) {
+      if (results.length >= maxResults) break;
+
+      // Extract title from result__a
+      const titleMatch = block.match(/class="result__a"[^>]*>([\s\S]*?)<\/a>/);
+      const title = titleMatch ? this.stripTags(titleMatch[1]).trim() : '';
+
+      // Extract URL — DDG wraps actual URLs in uddg= param or result__url text
+      let url = '';
+      const urlTextMatch = block.match(/class="result__url"[^>]*>([\s\S]*?)<\/a>/);
+      if (urlTextMatch) {
+        url = this.stripTags(urlTextMatch[1]).trim();
+        if (!url.startsWith('http')) url = 'https://' + url;
+      }
+      // Also try href with uddg redirect
+      if (!url || url === 'https://') {
+        const hrefMatch = block.match(/href="[^"]*uddg=([^&"]+)/);
+        if (hrefMatch) {
+          url = decodeURIComponent(hrefMatch[1]);
+        }
+      }
+
+      // Extract snippet from result__snippet
+      const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|td)>/);
+      const snippet = snippetMatch ? this.stripTags(snippetMatch[1]).trim() : '';
+
+      if (title && url) {
+        results.push({ title, url, snippet });
+      }
+    }
+
+    return results;
+  }
+
+  private stripTags(html: string): string {
+    return html
+      .replace(/<[^>]+>/g, '')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#x27;/g, "'")
+      .replace(/&nbsp;/g, ' ')
+      .replace(/\s+/g, ' ');
   }
 }

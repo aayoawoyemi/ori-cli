@@ -112,6 +112,8 @@ export class AnthropicProvider implements ModelProvider {
   private readonly maxRateLimitRetries: number;
   private readonly defaultRateLimitBackoffMs: number;
   private readonly sleepImpl: (ms: number, signal?: AbortSignal) => Promise<void>;
+  /** Extended thinking budget (tokens). 0 = no thinking. Set by ModelRouter before each stream call. */
+  private _thinkingBudget = 0;
 
   constructor(config: ModelConfig, options: AnthropicProviderOptions = {}) {
     this.model = config.model;
@@ -262,6 +264,11 @@ export class AnthropicProvider implements ModelProvider {
     });
   }
 
+  /** Set the extended thinking token budget. 0 = no thinking (low latency). */
+  setThinkingBudget(budget: number): void {
+    this._thinkingBudget = Math.max(0, budget);
+  }
+
   /** Ensure OAuth token is fresh. */
   private async ensureToken(): Promise<void> {
     if (!this.useOAuth || !this.oauthCreds || !this.oauthSource) return;
@@ -322,13 +329,17 @@ export class AnthropicProvider implements ModelProvider {
     }
 
     // Build request params
-    const requestParams: Anthropic.MessageCreateParams = {
+    const requestParams = {
       model: this.model,
       max_tokens: this.maxTokens,
       system: systemArray,
       messages: anthropicMessages,
       ...(anthropicTools.length > 0 && { tools: anthropicTools }),
-    };
+      // Extended thinking: inject budget when > 0. budget_tokens counts toward max_tokens.
+      ...(this._thinkingBudget > 0 && {
+        thinking: { type: 'enabled' as const, budget_tokens: this._thinkingBudget },
+      }),
+    } as Anthropic.MessageCreateParams;
 
     if (this.useOAuth) {
       // cch=00000 stays literal — Claude Code 2.1.92 does not compute a
@@ -336,15 +347,21 @@ export class AnthropicProvider implements ModelProvider {
       // Anthropic to reject the billing header. No body signing needed.
     }
 
-    // Build headers for OAuth mode
+    // Build headers
     const streamOptions: Record<string, unknown> = {};
     if (signal) streamOptions.signal = signal;
 
     if (this.useOAuth) {
+      // OAuth mode: static beta list already includes adaptive-thinking-2026-01-28
       streamOptions.headers = {
         'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,adaptive-thinking-2026-01-28,research-preview-2026-02-01',
         'user-agent': 'aries-cli/0.1.0 (external, cli)',
         'x-app': 'cli',
+      };
+    } else if (this._thinkingBudget > 0) {
+      // API key mode: add extended thinking beta only when thinking is active
+      streamOptions.headers = {
+        'anthropic-beta': 'interleaved-thinking-2025-05-14',
       };
     }
 
@@ -359,38 +376,63 @@ export class AnthropicProvider implements ModelProvider {
           streamOptions as Anthropic.RequestOptions,
         );
 
+        // Track block types by stream index so we route deltas and stop events
+        // to the right buffer. Thinking blocks are skipped entirely.
+        const thinkingBlockIndices = new Set<number>();
+        // Map stream index → tool_use id, so input_json_delta goes to the right buffer
+        const indexToToolId = new Map<number, string>();
+
         for await (const event of stream) {
           if (event.type === 'content_block_start') {
-            if (event.content_block.type === 'tool_use') {
-              const block = event.content_block;
-              toolInputBuffers.set(block.id, { name: block.name, json: '' });
+            const cb = event.content_block as { type: string; id?: string; name?: string };
+            if (cb.type === 'thinking') {
+              thinkingBlockIndices.add(event.index);
+            } else if (cb.type === 'tool_use' && cb.id && cb.name) {
+              toolInputBuffers.set(cb.id, { name: cb.name, json: '' });
+              indexToToolId.set(event.index, cb.id);
               emittedAnyOutput = true;
-              yield { type: 'tool_use_start', id: block.id, name: block.name };
+              yield { type: 'tool_use_start', id: cb.id, name: cb.name };
             }
           } else if (event.type === 'content_block_delta') {
+            if (thinkingBlockIndices.has(event.index)) continue;
             if (event.delta.type === 'text_delta') {
               emittedAnyOutput = true;
               yield { type: 'text', content: event.delta.text };
             } else if (event.delta.type === 'input_json_delta') {
               const partial = event.delta.partial_json;
-              for (const [id, buf] of toolInputBuffers) {
-                buf.json += partial;
-                emittedAnyOutput = true;
-                yield { type: 'tool_use_delta', id, delta: partial };
+              // Route delta to the correct tool buffer by stream index
+              const toolId = indexToToolId.get(event.index);
+              if (toolId) {
+                const buf = toolInputBuffers.get(toolId);
+                if (buf) {
+                  buf.json += partial;
+                  emittedAnyOutput = true;
+                  yield { type: 'tool_use_delta', id: toolId, delta: partial };
+                }
               }
             }
           } else if (event.type === 'content_block_stop') {
-            for (const [id, buf] of toolInputBuffers) {
-              try {
-                const input = JSON.parse(buf.json || '{}') as Record<string, unknown>;
-                emittedAnyOutput = true;
-                yield { type: 'tool_use_end', id, input };
-              } catch {
-                emittedAnyOutput = true;
-                yield { type: 'tool_use_end', id, input: {} };
-              }
+            if (thinkingBlockIndices.has(event.index)) {
+              thinkingBlockIndices.delete(event.index);
+              continue;
             }
-            toolInputBuffers.clear();
+            // Finalize only the tool buffer for this block index
+            const toolId = indexToToolId.get(event.index);
+            if (toolId) {
+              const buf = toolInputBuffers.get(toolId);
+              if (buf) {
+                try {
+                  const input = JSON.parse(buf.json || '{}') as Record<string, unknown>;
+                  emittedAnyOutput = true;
+                  yield { type: 'tool_use_end', id: toolId, input };
+                } catch {
+                  emittedAnyOutput = true;
+                  yield { type: 'tool_use_end', id: toolId, input: {} };
+                }
+                toolInputBuffers.delete(toolId);
+              }
+              indexToToolId.delete(event.index);
+            }
           } else if (event.type === 'message_stop') {
             const finalMessage = await stream.finalMessage();
             emittedAnyOutput = true;

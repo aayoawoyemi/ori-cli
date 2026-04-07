@@ -1,4 +1,4 @@
-import type { Message, ToolCall, ToolDefinition } from './router/types.js';
+import type { Message, ToolCall, ToolDefinition, ContentBlock } from './router/types.js';
 import type { ModelRouter } from './router/index.js';
 import type { ToolRegistry } from './tools/registry.js';
 import type { ToolContext } from './tools/types.js';
@@ -82,15 +82,31 @@ export interface LoopParams {
 }
 
 // ── Result Budget ───────────────────────────────────────────────────────────
+// Cap large outputs at maxChars using head + tail (like Claude Code's 5K+5K).
+// This prevents tool results from accumulating unbounded in conversation history.
 
 function applyResultBudget(messages: Message[], maxChars: number): Message[] {
+  const half = Math.floor(maxChars / 2);
+
+  function capString(s: string): string {
+    if (s.length <= maxChars) return s;
+    const omitted = s.length - maxChars;
+    return `${s.slice(0, half)}\n\n... [${omitted} chars omitted] ...\n\n${s.slice(-half)}`;
+  }
+
   return messages.map(msg => {
-    if (typeof msg.content === 'string' && msg.content.length > maxChars) {
-      const preview = msg.content.slice(0, 2000);
-      const truncated = `${preview}\n\n... (${msg.content.length} chars total, truncated to ${maxChars})`;
-      return { ...msg, content: truncated };
+    if (typeof msg.content === 'string') {
+      return msg.content.length > maxChars ? { ...msg, content: capString(msg.content) } : msg;
     }
-    return msg;
+    const blocks = msg.content as ContentBlock[];
+    const newBlocks = blocks.map(block => {
+      if (block.type === 'tool_result' && block.content.length > maxChars) {
+        return { ...block, content: capString(block.content) };
+      }
+      return block;
+    });
+    const changed = newBlocks.some((b, i) => b !== blocks[i]);
+    return changed ? { ...msg, content: newBlocks } : msg;
   });
 }
 
@@ -108,8 +124,8 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     session,
     hooks,
     maxTurns = 50,
-    maxResultChars = 30_000,
-    compactThreshold = 0.8,
+    maxResultChars = 10_000,
+    compactThreshold = 0.6,
     signal,
     permissionMode = 'default',
     onPermissionRequest,

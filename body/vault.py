@@ -42,11 +42,12 @@ class _McpClient:
         # On Windows, 'ori' is a .cmd shim — use shell=True to resolve it
         is_windows = subprocess.os.name == "nt"
         self._proc = subprocess.Popen(
-            ["ori", "serve", "--mcp", "--vault", vault_path],
+            ["ori-memory", "serve", "--mcp", "--vault", vault_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             bufsize=1,  # line-buffered
             shell=is_windows,
         )

@@ -54,7 +54,7 @@ export class ReplTool implements Tool {
       return { id: '', name: this.name, output: 'Empty code block.', isError: true };
     }
 
-    const result = await handle.exec({ code });
+    const result = await handle.exec({ code }, _ctx.signal);
 
     if (result.rejected) {
       return {

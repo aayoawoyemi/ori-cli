@@ -157,6 +157,16 @@ async function executeSingle(
   hooks?: HooksConfig,
   vaultPath?: string,
 ): Promise<ToolResult> {
+  // Check abort before starting
+  if (ctx.signal?.aborted) {
+    return {
+      id: tc.id,
+      name: tc.name,
+      output: 'Interrupted by user',
+      isError: false,
+    };
+  }
+
   const tool = registry.get(tc.name);
   if (!tool) {
     return {
@@ -199,6 +209,14 @@ async function executeSingle(
 
     return finalResult;
   } catch (err) {
+    if ((err as Error).name === 'AbortError' || ctx.signal?.aborted) {
+      return {
+        id: tc.id,
+        name: tc.name,
+        output: 'Interrupted by user',
+        isError: false,
+      };
+    }
     return {
       id: tc.id,
       name: tc.name,

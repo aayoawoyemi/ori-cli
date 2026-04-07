@@ -11,6 +11,7 @@ interface StatusBarProps {
   vaultNotes?: number;
   isLoading: boolean;
   permissionMode?: PermissionMode;
+  sessionTitle?: string | null;
 }
 
 const EFFORT_SYMBOL: Record<string, string> = {
@@ -40,7 +41,7 @@ function progressBar(fraction: number, width: number): string {
 }
 
 export function StatusBar({
-  model, effort, tokenCount, contextWindow, vaultNotes, isLoading, permissionMode = 'default',
+  model, effort, tokenCount, contextWindow, vaultNotes, isLoading, permissionMode = 'default', sessionTitle,
 }: StatusBarProps): React.ReactElement {
   const pct = contextWindow > 0 ? Math.round((tokenCount / contextWindow) * 100) : 0;
   const effortSym = EFFORT_SYMBOL[effort] ?? figures.effortMedium;
@@ -49,6 +50,12 @@ export function StatusBar({
 
   return (
     <Box flexDirection="column">
+      {/* Session title — shown when set */}
+      {sessionTitle && (
+        <Box>
+          <Text color={colors.suggestion}>{figures.bullet} {sessionTitle}</Text>
+        </Box>
+      )}
       {/* Line 1: model + progress bar + tokens */}
       <Box flexDirection="row">
         <Text dimColor>[{model}] {bar}  </Text>

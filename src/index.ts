@@ -2,7 +2,8 @@
 
 import React from 'react';
 import { render } from 'ink';
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
+import { homedir } from 'node:os';
 import chalk from 'chalk';
 import { loadConfig } from './config/load.js';
 import { ModelRouter } from './router/index.js';
@@ -22,6 +23,29 @@ import { assembleWarmContext } from './memory/warmContext.js';
 import { setupReplBridge, type ReplHandle } from './repl/setup.js';
 import { registerReplTool } from './tools/registry.js';
 import { resolvePreflightEnabled } from './memory/preflight.js';
+
+// ── Parchment Terminal ──────────────────────────────────────────────────
+// Set warm walnut background + cream foreground via OSC escape sequences.
+// Restores original colors on exit (including Ctrl+C).
+const SET_BG = "\x1b]11;#1a1816\x07";
+const SET_FG = "\x1b]10;#e8e0d4\x07";
+const RESET_BG = "\x1b]111\x07";
+const RESET_FG = "\x1b]110\x07";
+
+function enterParchment(): void {
+  if (!process.stdout.isTTY) return;
+  process.stdout.write(SET_BG + SET_FG);
+}
+
+function exitParchment(): void {
+  if (!process.stdout.isTTY) return;
+  process.stdout.write(RESET_FG + RESET_BG);
+}
+
+// Register cleanup for all exit paths
+process.on('exit', exitParchment);
+process.on('SIGINT', () => { exitParchment(); process.exit(0); });
+process.on('SIGTERM', () => { exitParchment(); process.exit(0); });
 
 interface AmbientSignatures {
   codebaseSignatureMd?: string;
@@ -84,27 +108,50 @@ let modelOverride: string | undefined;
 let promptArg: string | undefined;
 let readOnlyMode = false;
 let maxTurns = 50;
+let continueSession = false;
+let resumeArg: string | undefined;
+let sessionName: string | undefined;
 
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--model' || args[i] === '-m') {
     modelOverride = args[++i];
+  } else if (args[i] === '--continue' || args[i] === '-c') {
+    continueSession = true;
+  } else if (args[i] === '--resume' || args[i] === '-r') {
+    // Next arg is the session id/title/number (if it doesn't start with -)
+    const next = args[i + 1];
+    if (next && !next.startsWith('-')) {
+      resumeArg = args[++i];
+    } else {
+      resumeArg = '';  // empty string = show picker
+    }
+  } else if (args[i] === '--name' || args[i] === '-n') {
+    sessionName = args[++i];
   } else if (args[i] === '--help' || args[i] === '-h') {
     console.log(`
 ${chalk.bold('Ori CLI')} - Memory-native coding agent
 
 ${chalk.dim('Usage:')}
-  aries                    Start interactive session
-  aries "prompt here"      Single prompt, then interactive
-  aries --model opus       Use a specific model slot
+  ori                      Start interactive session
+  ori "prompt here"        Single prompt, then interactive
+  ori --model opus         Use a specific model slot
+  ori -c                   Continue most recent session
+  ori -r                   Resume a session (interactive picker)
+  ori -r "title"           Resume session by title or ID
 
 ${chalk.dim('Options:')}
   -m, --model <slot>       Model slot: primary, reasoning, cheap, bulk
+  -c, --continue           Continue most recent session
+  -r, --resume [query]     Resume session by ID, title, or number
+  -n, --name <title>       Name this session
   -h, --help               Show this help
   --version                Show version
 
 ${chalk.dim('In-session commands:')}
   /model <slot>            Switch model for next turn
   /cost                    Show token usage
+  /resume                  Resume a previous session
+  /rename <title>          Rename current session
   /clear                   Clear conversation
   /tools                   List available tools
   /vault                   Show vault status
@@ -181,6 +228,7 @@ if (config.projectBrain.enabled) {
 }
 
 const session = new SessionStorage(cwd);
+session.createMeta(config.models.primary.model, sessionName);
 session.log({
   type: 'meta',
   model: config.models.primary.model,
@@ -189,6 +237,39 @@ session.log({
   agentName: config.agent.name,
   timestamp: Date.now(),
 });
+
+// ── Resume / Continue: load messages from a previous session ──────────
+import { resumeFromSession } from './session/resume.js';
+let resumedMessages: Message[] | null = null;
+
+if (continueSession) {
+  const last = session.getLastSession();
+  if (last) {
+    const result = resumeFromSession(session.getSessionPath(last.id));
+    if (result.messages.length > 0) {
+      resumedMessages = result.messages;
+      console.log(chalk.dim(`  continuing: ${last.userTitle ?? last.title ?? last.id} (${result.messages.length} messages)`));
+    }
+  } else {
+    console.log(chalk.dim('  no previous session to continue'));
+  }
+} else if (resumeArg !== undefined) {
+  if (resumeArg === '') {
+    // Empty = show picker at startup (handled by App via initialResumePicker prop)
+    // We'll pass this through to the UI
+  } else {
+    const match = session.findSession(resumeArg);
+    if (match) {
+      const result = resumeFromSession(session.getSessionPath(match.id));
+      if (result.messages.length > 0) {
+        resumedMessages = result.messages;
+        console.log(chalk.dim(`  resuming: ${match.userTitle ?? match.title ?? match.id} (${result.messages.length} messages)`));
+      }
+    } else {
+      console.log(chalk.yellow(`  no session matching "${resumeArg}"`));
+    }
+  }
+}
 
 const router = new ModelRouter(config.models, config.experimental);
 const registry = createCoreRegistry({ replEnabled: config.repl.enabled });
@@ -302,6 +383,9 @@ async function main(): Promise<void> {
   // Set terminal title
   const { setTitleIdle } = await import('./ui/terminal.js');
   setTitleIdle(agentLabel, cwd);
+
+  // ── Parchment mode ──────────────────────────────────────────────────
+  enterParchment();
 
   // ── Startup banner ──────────────────────────────────────────────────
   // ── Ori elephant (downscaled from ori-website/dist/elephant.png at W=30) ──
@@ -424,6 +508,8 @@ async function main(): Promise<void> {
           : 'default' as const,
       replHandle,
       preflightEnabled: resolvePreflightEnabled(config.preflight, config.repl.enabled),
+      resumedMessages,
+      initialResumePicker: resumeArg === '',
     }),
     { exitOnCtrlC: false },
   );
@@ -434,7 +520,28 @@ async function main(): Promise<void> {
   process.exit(0);
 }
 
+// Global crash handlers — write to file since terminal may be frozen
+import { writeFileSync } from 'node:fs';
+const CRASH_LOG = join(homedir(), '.aries', 'crash.log');
+
+function logCrash(label: string, err: unknown): void {
+  const msg = err instanceof Error ? `${err.message}\n${err.stack}` : String(err);
+  const entry = `[${new Date().toISOString()}] ${label}: ${msg}\n`;
+  try { writeFileSync(CRASH_LOG, entry, { flag: 'a' }); } catch { /* ignore */ }
+}
+
+process.on('uncaughtException', (err) => {
+  logCrash('uncaughtException', err);
+  exitParchment();
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  logCrash('unhandledRejection', reason);
+});
+
 main().catch((err) => {
+  logCrash('main.catch', err);
   console.error(chalk.red(`Fatal: ${err.message}`));
   process.exit(1);
 });

@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__ori__ori_orient",
+      "Bash(npx tsc:*)",
+      "Bash(echo \"done: $?\")",
+      "Bash(npm test:*)",
+      "Bash(echo \"tests: $?\")",
+      "Bash(npm run:*)",
+      "Bash(node --experimental-strip-types --experimental-vm-modules test/anthropicProviderRateLimit.test.ts)",
+      "Bash(echo \"build: $?\")",
+      "Bash(node test/anthropicProviderRateLimit.test.ts)",
+      "Bash(npx tsx:*)"
+    ]
+  }
+}

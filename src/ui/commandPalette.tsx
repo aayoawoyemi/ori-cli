@@ -23,6 +23,7 @@ const COMMANDS: SlashCommand[] = [
   { name: '/display', description: 'Cycle display mode: verbose/normal/quiet', args: '[verbose|normal|quiet]' },
   { name: '/research', description: 'Deep multi-source research', args: '"query" [--depth quick|standard|deep]' },
   { name: '/resume', description: 'Resume a previous session' },
+  { name: '/rename', description: 'Rename current session', args: '<title>' },
   { name: '/undo', description: 'Undo last file edit' },
   { name: '/compact', description: 'Compact conversation to save context' },
   { name: '/clear', description: 'Clear conversation' },
@@ -58,7 +59,7 @@ export function CommandPalette({ filter, selectedIndex, visible }: CommandPalett
             <Text
               bold={isSelected}
               color={isSelected ? 'white' : colors.dim}
-              backgroundColor={isSelected ? '#444444' : undefined}
+              backgroundColor={isSelected ? colors.messageActionsBg : undefined}
             >
               {cmd.name}
             </Text>

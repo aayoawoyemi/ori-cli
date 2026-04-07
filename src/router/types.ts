@@ -101,4 +101,11 @@ export interface ModelProvider {
 
   /** Estimate token count for messages. Exact count is provider-specific. */
   estimateTokens(messages: Message[]): number;
+
+  /**
+   * Set the thinking token budget for the next stream call.
+   * 0 = no thinking (fast). >0 = extended thinking with that budget.
+   * Only implemented by providers that support extended thinking (Anthropic).
+   */
+  setThinkingBudget?(budget: number): void;
 }

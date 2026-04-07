@@ -1,36 +1,37 @@
 // ── Color Palette ──────────────────────────────────────────────────────────
-// Matches Claude Code's dark theme for visual parity.
+// Ori Parchment Theme — warm walnut & gold.
+// Inspired by oriminemos.com. Aged paper under lamplight, not a spaceship.
 // Single source of truth — change here to retheme everything.
 
 export const colors = {
-  // Core text
-  text: '#ffffff',
-  dim: '#999999',
-  subtle: '#afafaf',
-  inactive: '#999999',
+  // Core text — warm cream, never cold white
+  text: '#e8e0d4',           // warm cream — primary text
+  dim: '#978a78',            // warm muted — labels, timestamps, metadata (AA 4.5+)
+  subtle: '#a89880',         // warm mid — secondary text, descriptions
+  inactive: '#7d7168',       // warm dark — disabled, very secondary (AA 3.0+ large)
 
   // Branding
-  claude: '#d77757',       // Claude orange
+  claude: '#c4a46c',         // antique gold — the Ori accent (spinner, headers)
 
-  // Semantic
-  success: '#4eba65',      // green — resolved tools
-  error: '#ff6b80',        // red — errors, rejected tools
-  warning: '#ffc107',      // yellow
+  // Semantic — warm versions, no neon
+  success: '#7d9b6b',        // sage green — resolved tools, confirmations
+  error: '#c47a6c',          // terracotta — errors, rejected tools
+  warning: '#d4a040',        // amber — warnings, caution
 
   // UI elements
-  suggestion: '#b1b9f9',   // blue-lilac — links, selected items, model picker
-  permission: '#99ccff',   // light blue — permission prompts, modal borders
-  autoAccept: '#af87ff',   // purple — auto-accept mode, bash border
+  suggestion: '#c4a46c',     // gold — links, selected items, model picker
+  permission: '#bfa87a',     // warm gold — permission prompts, modal borders
+  autoAccept: '#a89068',     // warm bronze — auto-accept mode
 
-  // Backgrounds
-  userMessageBg: '#373737',       // user message fill
-  messageActionsBg: '#2c323e',    // selected message highlight
-  bashMessageBg: '#413c41',       // bash output
+  // Backgrounds — warm walnut tones
+  userMessageBg: '#2a2520',         // dark walnut — user message fill
+  messageActionsBg: '#302a24',      // slightly lighter walnut — selected message
+  bashMessageBg: '#2e2822',         // warm dark — bash output
 
-  // Borders
-  border: '#666666',
-  promptBorder: '#666666',
-  bashBorder: '#af87ff',
+  // Borders — warm, not cold gray
+  border: '#4a4238',
+  promptBorder: '#4a4238',
+  bashBorder: '#a89068',            // warm bronze — bash mode border
 } as const;
 
 // ── Unicode Glyphs ────────────────────────────────────────────────────────

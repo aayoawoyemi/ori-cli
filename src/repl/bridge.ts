@@ -151,7 +151,7 @@ export class ReplBridge {
     }
   }
 
-  private async request(msg: object, timeoutMs: number): Promise<any> {
+  private async request(msg: object, timeoutMs: number, signal?: AbortSignal): Promise<any> {
     // Ensure process is alive
     if (!this.process?.isAlive()) {
       await this.restart('process not alive at request time');
@@ -164,23 +164,42 @@ export class ReplBridge {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
         resolveReq(result);
+      };
+
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const idx = this.pending.indexOf(resolver);
+        if (idx >= 0) this.pending.splice(idx, 1);
+        rejectReq(new DOMException('The operation was aborted.', 'AbortError'));
       };
 
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
+        signal?.removeEventListener('abort', onAbort);
         // Remove from pending queue if still there
         const idx = this.pending.indexOf(resolver);
         if (idx >= 0) this.pending.splice(idx, 1);
         rejectReq(new Error(`bridge request timed out after ${timeoutMs}ms`));
       }, timeoutMs);
 
+      // Listen for abort before pushing to queue
+      if (signal?.aborted) {
+        rejectReq(new DOMException('The operation was aborted.', 'AbortError'));
+        return;
+      }
+      signal?.addEventListener('abort', onAbort, { once: true });
+
       this.pending.push(resolver);
       const ok = this.process!.write(JSON.stringify(msg));
       if (!ok) {
         settled = true;
         clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
         const idx = this.pending.indexOf(resolver);
         if (idx >= 0) this.pending.splice(idx, 1);
         rejectReq(new Error('bridge write failed (stdin unwritable)'));
@@ -203,7 +222,7 @@ export class ReplBridge {
   /**
    * Execute user code in the REPL body. Returns structured result.
    */
-  async exec(execution: CodeExecution): Promise<ReplResult> {
+  async exec(execution: CodeExecution, signal?: AbortSignal): Promise<ReplResult> {
     this.emit({
       type: 'exec_start',
       code: execution.code,
@@ -219,6 +238,7 @@ export class ReplBridge {
       },
       // Give the body extra wall-clock slack beyond its own timeout
       timeout + 5_000,
+      signal,
     )) as ReplResult;
 
     this.emit({ type: 'exec_end', result, turn_id: execution.turn_id });

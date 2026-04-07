@@ -8,10 +8,11 @@ import { OpenAICompatibleProvider } from './providers/openai-compatible.js';
 
 export type EffortLevel = 'high' | 'medium' | 'low';
 
-const EFFORT_CONFIG: Record<EffortLevel, { maxTokens: number; thinking: boolean }> = {
-  high:   { maxTokens: 32_768, thinking: true },
-  medium: { maxTokens: 16_384, thinking: false },
-  low:    { maxTokens: 4_096,  thinking: false },
+const EFFORT_CONFIG: Record<EffortLevel, { maxTokens: number; thinkingBudget: number }> = {
+  // thinkingBudget = 0 → no thinking (instant); >0 → extended thinking with that token budget
+  high:   { maxTokens: 32_768, thinkingBudget: 10_000 },
+  medium: { maxTokens: 16_384, thinkingBudget: 1_500 },
+  low:    { maxTokens: 8_192,  thinkingBudget: 0 },
 };
 
 // â”€â”€ Model Shortnames â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -240,6 +241,9 @@ export class ModelRouter {
     tools: ToolDefinition[],
     signal?: AbortSignal,
   ): AsyncGenerator<StreamEvent> {
+    // Propagate effort-level thinking budget to providers that support it (Anthropic)
+    const budget = EFFORT_CONFIG[this._effort].thinkingBudget;
+    this.current.setThinkingBudget?.(budget);
     yield* this.current.stream(messages, systemPrompt, tools, signal);
   }
 

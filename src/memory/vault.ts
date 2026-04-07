@@ -53,7 +53,7 @@ class McpClient extends EventEmitter {
 
   async connect(vaultPath: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.proc = spawn('ori', ['serve', '--mcp', '--vault', vaultPath], {
+      this.proc = spawn('ori-memory', ['serve', '--mcp', '--vault', vaultPath], {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env },
         shell: true, // Required on Windows to resolve .cmd shims

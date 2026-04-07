@@ -10,6 +10,7 @@ import { PermissionDialog } from './permissionDialog.js';
 import { PlanExitDialog, type PlanExitChoice } from './planExitDialog.js';
 import { setTitleBusy, setTitleDone, setTitleIdle, flashTaskbar } from './terminal.js';
 import { savePlan } from '../memory/planSave.js';
+import { ResumePicker } from './resumePicker.js';
 import { figures } from './theme.js';
 import { UsageTracker, formatTokenCount, formatCost, formatDuration } from '../telemetry/tracker.js';
 import { ModelRouter, type EffortLevel } from '../router/index.js';
@@ -41,6 +42,8 @@ interface AppProps {
   initialPermissionMode?: PermissionMode;
   replHandle?: ReplHandle | null;
   preflightEnabled?: boolean;
+  resumedMessages?: Message[] | null;
+  initialResumePicker?: boolean;
 }
 
 export function App(props: AppProps): React.ReactElement {
@@ -49,6 +52,7 @@ export function App(props: AppProps): React.ReactElement {
     agentName, cwd, router, registry, vault, projectBrain,
     session, systemPrompt, hooks, vaultNoteCount, initialPrompt,
     initialPermissionMode, replHandle, preflightEnabled = true,
+    resumedMessages: initialResumedMessages, initialResumePicker,
   } = props;
 
   // ── State ───────────────────────────────────────────────────────────
@@ -68,6 +72,8 @@ export function App(props: AppProps): React.ReactElement {
     toolCall: ToolCall;
     resolve: (decision: PermissionDecision) => void;
   } | null>(null);
+  const [showResumePicker, setShowResumePicker] = useState(initialResumePicker ?? false);
+  const [sessionTitle, setSessionTitle] = useState<string | null>(null);
 
   // Conversation messages for the loop (mutable ref to avoid stale closures)
   const messagesRef = useRef<Message[]>([]);
@@ -75,6 +81,20 @@ export function App(props: AppProps): React.ReactElement {
   const alwaysAllowRef = useRef(new Set<string>());
   const trackerRef = useRef(new UsageTracker(session.sessionId, router.current.model));
   const toolTimingRef = useRef(new Map<string, number>());
+  const turnCountRef = useRef(0);
+
+  // ── Load resumed messages on mount ──────────────────────────────────
+  useEffect(() => {
+    if (initialResumedMessages && initialResumedMessages.length > 0) {
+      messagesRef.current = initialResumedMessages;
+      turnCountRef.current = initialResumedMessages.filter(m => m.role === 'user').length;
+      setDisplayMessages([{
+        role: 'system',
+        text: `Session resumed (${initialResumedMessages.length} messages)`,
+        subtype: 'info',
+      }]);
+    }
+  }, []);
 
   // ── Keyboard shortcuts ──────────────────────────────────────────────
   useInput((input, key) => {
@@ -298,7 +318,7 @@ export function App(props: AppProps): React.ReactElement {
         systemPrompt,
         router,
         registry,
-        toolContext: { cwd },
+        toolContext: { cwd, signal: abort.signal },
         vault,
         projectBrain,
         session,
@@ -366,6 +386,12 @@ export function App(props: AppProps): React.ReactElement {
     flashTaskbar();
     setActiveTool(undefined);
 
+    // Track turns and update session metadata
+    turnCountRef.current++;
+    const userMsgCount = messagesRef.current.filter(m => m.role === 'user').length;
+    const totals = trackerRef.current.totals;
+    session.touch(userMsgCount, totals.cost);
+
     if (fullText) {
       // In plan mode, accumulate the model's text as plan content
       if (permissionMode === 'plan') {
@@ -378,6 +404,19 @@ export function App(props: AppProps): React.ReactElement {
         ...(shownText ? [{ role: 'assistant' as const, text: shownText }] : []),
         ...(interrupted ? [{ role: 'system' as const, text: 'Interrupted', subtype: 'info' as const }] : []),
       ]);
+
+      // Auto-title: generate on first completed turn
+      if (turnCountRef.current === 1 && !sessionTitle) {
+        const userMsg = messagesRef.current.find(m => m.role === 'user');
+        const userText = typeof userMsg?.content === 'string' ? userMsg.content : '';
+        if (userText) {
+          import('../session/title.js').then(({ generateSessionTitle }) => {
+            generateSessionTitle(userText, fullText, router, session).then(title => {
+              setSessionTitle(title);
+            }).catch(() => {});
+          }).catch(() => {});
+        }
+      }
     } else if (interrupted) {
       setDisplayMessages(prev => [...prev, { role: 'system', text: 'Interrupted', subtype: 'info' }]);
     }
@@ -485,8 +524,31 @@ export function App(props: AppProps): React.ReactElement {
     }
   }, []);
 
+  // ── Session resume helper ──────────────────────────────────────────
+  const loadSession = useCallback(async (sessionId: string, label: string) => {
+    const sessionPath = session.getSessionPath(sessionId);
+    const { resumeFromSession } = await import('../session/resume.js');
+    const { messages: resumed } = resumeFromSession(sessionPath);
+    if (resumed.length === 0) {
+      setDisplayMessages(prev => [...prev, {
+        role: 'assistant', text: 'Session was empty or could not be loaded.',
+      }]);
+      return;
+    }
+    messagesRef.current = resumed;
+    turnCountRef.current = resumed.filter(m => m.role === 'user').length;
+    setSessionTitle(label);
+    setToolCalls([]);
+    setStreamingText('');
+    setDisplayMessages([{
+      role: 'system',
+      text: `Resumed: ${label} (${resumed.length} messages)`,
+      subtype: 'info',
+    }]);
+  }, [session]);
+
   // ── Slash commands ──────────────────────────────────────────────────
-  const handleSlashCommand = useCallback(async (input: string) => {
+    const handleSlashCommand = useCallback(async (input: string) => {
     const [cmd, ...rest] = input.split(/\s+/);
     const arg = rest.join(' ');
 
@@ -977,7 +1039,8 @@ export function App(props: AppProps): React.ReactElement {
 - \`/index [path]\` — index codebase graph (default: cwd)
 - \`/signature [codebase|vault] [lean|standard|deep|max] [tokens]\` — preview ambient signature
 - \`/repl <code>\` — execute Python in the body (requires /index first)
-- \`/resume\` — resume a previous session
+- \`/resume\` — resume a previous session (interactive picker)
+- \`/rename <title>\` — rename current session
 - \`/undo\` — undo last file edit (\`/undo 3\` for multiple)
 - \`/compact\` — manually compact conversation
 - \`/reload\` — re-index codebase + refresh vault + clear conversation
@@ -989,65 +1052,39 @@ export function App(props: AppProps): React.ReactElement {
         break;
 
       case '/resume': {
-        const { readdirSync, statSync } = await import('node:fs');
-        const { join } = await import('node:path');
-        const sessionsDir = join(cwd, '.aries', 'sessions');
-        try {
-          const files = readdirSync(sessionsDir)
-            .filter(f => f.endsWith('.jsonl'))
-            .sort()
-            .reverse()
-            .slice(0, 5);
-
-          if (files.length === 0) {
-            setDisplayMessages(prev => [...prev, {
-              role: 'assistant', text: 'No previous sessions found.',
-            }]);
-            break;
-          }
-
-          if (!arg) {
-            // List recent sessions
-            const list = files.map((f, i) => {
-              const stat = statSync(join(sessionsDir, f));
-              const date = stat.mtime.toLocaleDateString();
-              return `${i + 1}. ${f} (${date})`;
-            }).join('\n');
-            setDisplayMessages(prev => [...prev, {
-              role: 'assistant',
-              text: `**Recent sessions:**\n${list}\n\n**Usage:** \`/resume 1\` to load most recent`,
-            }]);
-            break;
-          }
-
-          // Load specific session
-          const idx = parseInt(arg, 10) - 1;
-          const file = files[idx] ?? files[0];
-          const sessionPath = join(sessionsDir, file!);
-
-          const { resumeFromSession } = await import('../session/resume.js');
-          const { messages: resumed } = resumeFromSession(sessionPath);
-
-          if (resumed.length === 0) {
-            setDisplayMessages(prev => [...prev, {
-              role: 'assistant', text: 'Session was empty or could not be loaded.',
-            }]);
-            break;
-          }
-
-          messagesRef.current = resumed;
-          setDisplayMessages([{
-            role: 'system',
-            text: `Resumed session: ${file} (${resumed.length} messages)`,
-            subtype: 'info',
-          }]);
+        if (!arg) {
+          // Open interactive picker
+          setShowResumePicker(true);
           break;
-        } catch {
+        }
+        // Quick resume by number, id, or title fragment
+        const match = session.findSession(arg);
+        if (!match) {
           setDisplayMessages(prev => [...prev, {
-            role: 'assistant', text: 'No sessions directory found. Run a session first.',
+            role: 'assistant', text: `No session matching "${arg}". Try \`/resume\` to browse.`,
           }]);
           break;
         }
+        await loadSession(match.id, match.userTitle ?? match.title ?? match.id);
+        break;
+      }
+
+      case '/rename': {
+        if (!arg) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: sessionTitle
+              ? `**Current title:** ${sessionTitle}\n**Usage:** \`/rename My New Title\``
+              : '**Usage:** `/rename My New Title`',
+          }]);
+          break;
+        }
+        session.rename(arg);
+        setSessionTitle(arg);
+        setDisplayMessages(prev => [...prev, {
+          role: 'system', text: `Session renamed: ${arg}`, subtype: 'info',
+        }]);
+        break;
       }
 
       case '/undo': {
@@ -1155,6 +1192,15 @@ export function App(props: AppProps): React.ReactElement {
             onDeny={() => { pendingPermission.resolve('deny'); setPendingPermission(null); }}
             onAlways={() => { pendingPermission.resolve('always'); setPendingPermission(null); }}
           />
+        ) : showResumePicker ? (
+          <ResumePicker
+            sessions={session.listSessions()}
+            onSelect={(s) => {
+              setShowResumePicker(false);
+              loadSession(s.id, s.userTitle ?? s.title ?? s.id);
+            }}
+            onCancel={() => setShowResumePicker(false)}
+          />
         ) : showModelPicker ? (
           <ModelPicker
             currentModel={router.info.model.includes('opus') ? 'opus'
@@ -1187,6 +1233,7 @@ export function App(props: AppProps): React.ReactElement {
               vaultNotes={vaultNoteCount}
               isLoading={isLoading}
               permissionMode={permissionMode}
+              sessionTitle={sessionTitle}
             />
           </>
         )}

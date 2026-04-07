@@ -4,8 +4,7 @@
   "description": "Memory-native coding agent CLI. Built on Ori.",
   "type": "module",
   "bin": {
-    "aries": "./dist/index.js",
-    "ari": "./dist/index.js"
+    "ori": "./dist/index.js"
   },
   "scripts": {
     "build": "tsc",
