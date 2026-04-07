@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
-import { Box, Text, useApp, useInput } from 'ink';
-import { Messages, type DisplayMessage, type DisplayToolCall } from './messages.js';
+import { Box, Text, useApp, useInput, Static } from 'ink';
+import { Messages, type DisplayMessage, type DisplayToolCall, type StreamSegment } from './messages.js';
 import { PromptInput, type AttachedImage } from './input.js';
 import { StatusBar } from './statusBar.js';
 import { Spinner } from './spinner.js';
@@ -57,8 +57,7 @@ export function App(props: AppProps): React.ReactElement {
 
   // ── State ───────────────────────────────────────────────────────────
   const [displayMessages, setDisplayMessages] = useState<DisplayMessage[]>([]);
-  const [toolCalls, setToolCalls] = useState<DisplayToolCall[]>([]);
-  const [streamingText, setStreamingText] = useState('');
+  const [streamSegments, setStreamSegments] = useState<StreamSegment[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [tokenCount, setTokenCount] = useState(0);
   const [activeTool, setActiveTool] = useState<string | undefined>();
@@ -82,6 +81,37 @@ export function App(props: AppProps): React.ReactElement {
   const trackerRef = useRef(new UsageTracker(session.sessionId, router.current.model));
   const toolTimingRef = useRef(new Map<string, number>());
   const turnCountRef = useRef(0);
+
+  // Token buffer: accumulate text, flush to state at 30fps for smooth rendering
+  const textBufferRef = useRef('');
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const segmentsRef = useRef<StreamSegment[]>([]);
+
+  const flushTextBuffer = useCallback(() => {
+    flushTimerRef.current = null;
+    if (!textBufferRef.current) return;
+    const buffered = textBufferRef.current;
+    textBufferRef.current = '';
+    // Append to last text segment, or create a new one
+    setStreamSegments(prev => {
+      const segs = [...prev];
+      const last = segs[segs.length - 1];
+      if (last && last.type === 'text') {
+        segs[segs.length - 1] = { type: 'text', content: last.content + buffered };
+      } else {
+        segs.push({ type: 'text', content: buffered });
+      }
+      segmentsRef.current = segs;
+      return segs;
+    });
+  }, []);
+
+  const bufferText = useCallback((text: string) => {
+    textBufferRef.current += text;
+    if (!flushTimerRef.current) {
+      flushTimerRef.current = setTimeout(flushTextBuffer, 32);
+    }
+  }, [flushTextBuffer]);
 
   // ── Load resumed messages on mount ──────────────────────────────────
   useEffect(() => {
@@ -291,8 +321,10 @@ export function App(props: AppProps): React.ReactElement {
     setDisplayMessages(prev => [...prev, { role: 'user', text: displayText }]);
     setIsLoading(true);
     setTitleBusy(agentName, cwd);
-    setStreamingText('');
-    setToolCalls([]);
+    setStreamSegments([]);
+    segmentsRef.current = [];
+    textBufferRef.current = '';
+    if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
 
     messagesRef.current.push({ role: 'user', content: contentBlocks });
     session.log({ type: 'user', content: displayText, timestamp: Date.now() });
@@ -343,28 +375,19 @@ export function App(props: AppProps): React.ReactElement {
         }
         handleLoopEvent(event, (text) => {
           fullText += text;
-          // Display mode filtering:
-          // - verbose: show everything
-          // - quiet: suppress all interim text (only final response after last tool)
-          // - normal: show everything (prompt discipline handles brevity)
           if (displayMode === 'quiet') {
-            // In quiet mode, reset display on each new text chunk after a tool call
-            // The final text block (after all tools) will be shown
             if (event.type === 'text') {
               displayText2 += text;
-              // Don't update streaming display until we know it's the final block
-              // We'll show it at the end
             }
           } else {
             displayText2 += text;
-            setStreamingText(displayText2);
+            bufferText(text);
           }
         });
-        // Track tool calls for quiet mode
         if (event.type === 'tool_call') {
           hasSeenToolCall = true;
           if (displayMode === 'quiet') {
-            displayText2 = '';  // reset — any text before this was narration
+            displayText2 = '';
           }
         }
       }
@@ -378,9 +401,13 @@ export function App(props: AppProps): React.ReactElement {
 
     abortRef.current = null;
 
-    // Finalize: move streaming text to messages
-    setStreamingText('');
-    setToolCalls([]);
+    // Finalize: flush any remaining buffered text, then clear stream
+    if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
+    textBufferRef.current = '';
+    // Capture segments before clearing — used to preserve tool calls in display history
+    const completedSegments = segmentsRef.current.slice();
+    setStreamSegments([]);
+    segmentsRef.current = [];
     setIsLoading(false);
     setTitleDone(agentName, cwd);
     flashTaskbar();
@@ -399,9 +426,15 @@ export function App(props: AppProps): React.ReactElement {
       }
       // In quiet mode, only show the final text block (after last tool call)
       const shownText = displayMode === 'quiet' ? displayText2.trim() : fullText;
+      // Preserve segments (tool calls + text) if the turn had tool calls, so they persist in history
+      const hasToolCalls = completedSegments.some(s => s.type === 'tool');
       setDisplayMessages(prev => [
         ...prev,
-        ...(shownText ? [{ role: 'assistant' as const, text: shownText }] : []),
+        ...(shownText ? [{
+          role: 'assistant' as const,
+          text: shownText,
+          ...(hasToolCalls ? { segments: completedSegments } : {}),
+        }] : []),
         ...(interrupted ? [{ role: 'system' as const, text: 'Interrupted', subtype: 'info' as const }] : []),
       ]);
 
@@ -430,12 +463,29 @@ export function App(props: AppProps): React.ReactElement {
         break;
 
       case 'tool_call': {
+        // Flush any buffered text so it appears BEFORE the tool in the timeline
+        if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
+        if (textBufferRef.current) {
+          const buffered = textBufferRef.current;
+          textBufferRef.current = '';
+          setStreamSegments(prev => {
+            const segs = [...prev];
+            const last = segs[segs.length - 1];
+            if (last && last.type === 'text') {
+              segs[segs.length - 1] = { type: 'text', content: last.content + buffered };
+            } else {
+              segs.push({ type: 'text', content: buffered });
+            }
+            return segs;
+          });
+        }
         const tc = event.toolCall;
         const summary = getToolSummary(tc.name, tc.input);
         toolTimingRef.current.set(tc.id, Date.now());
-        setToolCalls(prev => [...prev, {
+        const toolData: DisplayToolCall = {
           id: tc.id, name: tc.name, summary, resolved: false, isError: false,
-        }]);
+        };
+        setStreamSegments(prev => [...prev, { type: 'tool', data: toolData }]);
         setActiveTool(tc.name);
         break;
       }
@@ -445,10 +495,10 @@ export function App(props: AppProps): React.ReactElement {
         const startTime = toolTimingRef.current.get(event.id);
         const durationMs = startTime ? Date.now() - startTime : undefined;
         toolTimingRef.current.delete(event.id);
-        setToolCalls(prev => prev.map(tc =>
-          tc.id === event.id
-            ? { ...tc, resolved: true, isError: event.isError, resultPreview: preview, durationMs }
-            : tc
+        setStreamSegments(prev => prev.map(seg =>
+          seg.type === 'tool' && seg.data.id === event.id
+            ? { ...seg, data: { ...seg.data, resolved: true, isError: event.isError, resultPreview: preview, durationMs } }
+            : seg
         ));
         setActiveTool(undefined);
         break;
@@ -467,23 +517,25 @@ export function App(props: AppProps): React.ReactElement {
         break;
 
       case 'tool_denied':
-        setToolCalls(prev => prev.map(tc =>
-          tc.id === event.id
-            ? { ...tc, resolved: true, isError: true, resultPreview: 'Denied by user' }
-            : tc
+        setStreamSegments(prev => prev.map(seg =>
+          seg.type === 'tool' && seg.data.id === event.id
+            ? { ...seg, data: { ...seg.data, resolved: true, isError: true, resultPreview: 'Denied by user' } }
+            : seg
         ));
         setActiveTool(undefined);
         break;
 
       case 'plan_step':
-        // In plan mode, tool calls render as plan steps (not executed)
-        setToolCalls(prev => [...prev, {
-          id: event.toolCall.id,
-          name: event.toolCall.name,
-          summary: getToolSummary(event.toolCall.name, event.toolCall.input),
-          resolved: false,
-          isError: false,
-          resultPreview: '(plan — not executed)',
+        setStreamSegments(prev => [...prev, {
+          type: 'tool',
+          data: {
+            id: event.toolCall.id,
+            name: event.toolCall.name,
+            summary: getToolSummary(event.toolCall.name, event.toolCall.input),
+            resolved: false,
+            isError: false,
+            resultPreview: '(plan — not executed)',
+          },
         }]);
         break;
 
@@ -538,8 +590,8 @@ export function App(props: AppProps): React.ReactElement {
     messagesRef.current = resumed;
     turnCountRef.current = resumed.filter(m => m.role === 'user').length;
     setSessionTitle(label);
-    setToolCalls([]);
-    setStreamingText('');
+    setStreamSegments([]);
+    segmentsRef.current = [];
     setDisplayMessages([{
       role: 'system',
       text: `Resumed: ${label} (${resumed.length} messages)`,
@@ -1162,17 +1214,23 @@ export function App(props: AppProps): React.ReactElement {
   // ── Render ──────────────────────────────────────────────────────────
   return (
     <Box flexDirection="column" height="100%">
-      {/* Scrollable conversation area */}
-      <Box flexDirection="column" flexGrow={1} overflow="hidden">
+      {/* Completed messages — Static renders to terminal scrollback buffer, never redrawn */}
+      <Static items={displayMessages}>
+        {(msg, i) => (
+          <Messages key={i} messages={[msg]} streamSegments={[]} isStreaming={false} />
+        )}
+      </Static>
+
+      {/* Live stream area — only the current turn, redraws during streaming */}
+      <Box flexDirection="column">
         <Messages
-          messages={displayMessages}
-          toolCalls={toolCalls}
-          streamingText={streamingText}
+          messages={[]}
+          streamSegments={streamSegments}
           isStreaming={isLoading}
         />
 
         {/* Spinner */}
-        <Spinner isLoading={isLoading} activeTool={activeTool} hasStreamingText={!!streamingText} />
+        <Spinner isLoading={isLoading} activeTool={activeTool} hasStreamingText={streamSegments.some(s => s.type === 'text')} />
       </Box>
 
       {/* Pinned bottom: model picker OR input + status */}

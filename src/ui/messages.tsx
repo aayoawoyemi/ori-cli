@@ -10,6 +10,8 @@ export interface DisplayMessage {
   role: 'user' | 'assistant' | 'system';
   text: string;
   subtype?: 'compact' | 'error' | 'info';
+  /** For completed assistant turns: the full interleaved text+tool segments, preserved for display. */
+  segments?: StreamSegment[];
 }
 
 export interface DisplayToolCall {
@@ -22,16 +24,21 @@ export interface DisplayToolCall {
   durationMs?: number;
 }
 
+/** A segment in the live stream — text and tools interleaved in arrival order. */
+export type StreamSegment =
+  | { type: 'text'; content: string }
+  | { type: 'tool'; data: DisplayToolCall };
+
 interface MessagesProps {
   messages: DisplayMessage[];
-  toolCalls: DisplayToolCall[];
-  streamingText: string;
+  /** Live stream of the current turn — text and tool calls interleaved. */
+  streamSegments: StreamSegment[];
   isStreaming: boolean;
 }
 
 // ── Messages ────────────────────────────────────────────────────────────────
 
-export function Messages({ messages, toolCalls, streamingText, isStreaming }: MessagesProps): React.ReactElement {
+export function Messages({ messages, streamSegments, isStreaming }: MessagesProps): React.ReactElement {
   return (
     <Box flexDirection="column">
       {(() => {
@@ -48,19 +55,23 @@ export function Messages({ messages, toolCalls, streamingText, isStreaming }: Me
         );
       })()}
 
-      {toolCalls.map(tc => (
-        <ToolCallRow key={tc.id} toolCall={tc} />
-      ))}
-
-      {isStreaming && streamingText && (
-        <AssistantStreamingMessage text={streamingText} />
-      )}
+      {/* Live stream: interleaved text blocks and tool calls */}
+      {isStreaming && streamSegments.map((seg, i) => {
+        if (seg.type === 'text' && seg.content) {
+          // First text segment in the turn gets the ● prefix
+          // Subsequent text segments also get ● — each is a distinct thought
+          return <AssistantStreamingMessage key={`s-${i}`} text={seg.content} addMargin={i > 0} />;
+        }
+        if (seg.type === 'tool') {
+          return <ToolCallRow key={seg.data.id} toolCall={seg.data} addMargin={i > 0} />;
+        }
+        return null;
+      })}
     </Box>
   );
 }
 
 // ── User Message ────────────────────────────────────────────────────────────
-// Claude Code: full-width background fill, no prefix dot, no ❯.
 
 function UserMessage({ text, addMargin }: { text: string; addMargin: boolean }): React.ReactElement {
   return (
@@ -77,7 +88,6 @@ function UserMessage({ text, addMargin }: { text: string; addMargin: boolean }):
 }
 
 // ── Assistant Message ───────────────────────────────────────────────────────
-// Claude Code: ⏺ dot prefix, then markdown body.
 
 function AssistantMessage({ text, addMargin }: { text: string; addMargin: boolean }): React.ReactElement {
   return (
@@ -94,9 +104,9 @@ function AssistantMessage({ text, addMargin }: { text: string; addMargin: boolea
 
 // ── Assistant Streaming ─────────────────────────────────────────────────────
 
-function AssistantStreamingMessage({ text }: { text: string }): React.ReactElement {
+function AssistantStreamingMessage({ text, addMargin }: { text: string; addMargin: boolean }): React.ReactElement {
   return (
-    <Box flexDirection="row" marginTop={1}>
+    <Box flexDirection="row" marginTop={addMargin ? 1 : 0}>
       <Box minWidth={2} flexShrink={0}>
         <Text color={colors.text}>{figures.dot}</Text>
       </Box>
@@ -108,9 +118,6 @@ function AssistantStreamingMessage({ text }: { text: string }): React.ReactEleme
 }
 
 // ── System Message ──────────────────────────────────────────────────────────
-// Compact boundary: ✻ Conversation compacted
-// Error: red text with ⎿ prefix
-// Info: dim text with ⎿ prefix
 
 function SystemMessage({ text, subtype, addMargin }: { text: string; subtype?: string; addMargin: boolean }): React.ReactElement {
   if (subtype === 'compact') {
@@ -130,7 +137,6 @@ function SystemMessage({ text, subtype, addMargin }: { text: string; subtype?: s
     );
   }
 
-  // Default info
   return (
     <Box flexDirection="row" marginTop={addMargin ? 1 : 0}>
       <Text dimColor>{'  '}{figures.toolResult}{'  '}</Text>
@@ -147,6 +153,22 @@ function MessageRow({ message, addMargin }: { message: DisplayMessage; addMargin
   }
   if (message.role === 'system') {
     return <SystemMessage text={message.text} subtype={message.subtype} addMargin={addMargin} />;
+  }
+  // Render completed assistant turns with their full segments (text + tool calls)
+  if (message.segments && message.segments.length > 0) {
+    return (
+      <Box flexDirection="column" marginTop={addMargin ? 1 : 0}>
+        {message.segments.map((seg, i) => {
+          if (seg.type === 'text' && seg.content) {
+            return <AssistantMessage key={`seg-${i}`} text={seg.content} addMargin={false} />;
+          }
+          if (seg.type === 'tool') {
+            return <ToolCallRow key={seg.data.id} toolCall={seg.data} addMargin={i > 0} />;
+          }
+          return null;
+        })}
+      </Box>
+    );
   }
   return <AssistantMessage text={message.text} addMargin={addMargin} />;
 }
@@ -182,7 +204,6 @@ function DiffPreview({ text }: { text: string }): React.ReactElement {
             </Box>
           );
         }
-        // First line (summary) or context lines
         if (i === 0) {
           return (
             <Box key={i} flexDirection="row">
@@ -203,18 +224,15 @@ function DiffPreview({ text }: { text: string }): React.ReactElement {
 }
 
 // ── Tool Call Row ───────────────────────────────────────────────────────────
-// Claude Code: ⏺ (blinking) ToolName(summary)
-//              ⎿  result preview (when resolved)
 
 function formatDurationMs(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
-function ToolCallRow({ toolCall }: { toolCall: DisplayToolCall }): React.ReactElement {
+function ToolCallRow({ toolCall, addMargin }: { toolCall: DisplayToolCall; addMargin?: boolean }): React.ReactElement {
   return (
-    <Box flexDirection="column">
-      {/* Header: dot + tool name + args + duration */}
+    <Box flexDirection="column" marginTop={addMargin ? 1 : 0}>
       <Box flexDirection="row" alignItems="flex-start">
         <ToolDot resolved={toolCall.resolved} isError={toolCall.isError} />
         <Text bold color={colors.text}>{toolCall.name}</Text>
@@ -226,7 +244,6 @@ function ToolCallRow({ toolCall }: { toolCall: DisplayToolCall }): React.ReactEl
         )}
       </Box>
 
-      {/* Result preview with ⎿ prefix */}
       {toolCall.resolved && toolCall.resultPreview && (
         <Box flexDirection="column">
           {toolCall.resultPreview.includes('\n-') || toolCall.resultPreview.includes('\n+') ? (

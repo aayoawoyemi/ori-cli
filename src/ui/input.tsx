@@ -58,23 +58,29 @@ export function PromptInput({ onSubmit, model, isLoading }: PromptInputProps): R
     }
 
     // Alt+V → paste clipboard (text OR image) at cursor
-    if (key.meta && input === 'v' && !isLoading) {
-      const result = readClipboard();
-      if (result.type === 'text') {
-        // Strip trailing newline from pasted text
-        const clean = result.value.replace(/\r?\n$/, '');
-        setValue(prev => prev + clean);
-      } else if (result.type === 'image') {
-        const imageNumber = ++imageCountRef.current;
-        setImages(prev => [...prev, {
-          path: result.path,
-          base64: result.base64,
-          mediaType: result.mediaType,
-        }]);
-        setValue(prev => {
-          const sep = prev && !prev.endsWith(' ') ? ' ' : '';
-          return `${prev}${sep}[Image ${imageNumber}]`;
-        });
+    // On some Windows terminals, Alt sends escape=true instead of meta=true
+    if (((key.meta && input === 'v') || (key.escape && input === 'v')) && !isLoading) {
+      try {
+        const result = readClipboard();
+        if (result.type === 'text') {
+          // Strip trailing newline from pasted text
+          const clean = result.value.replace(/\r?\n$/, '');
+          setValue(prev => prev + clean);
+        } else if (result.type === 'image') {
+          const imageNumber = ++imageCountRef.current;
+          setImages(prev => [...prev, {
+            path: result.path,
+            base64: result.base64,
+            mediaType: result.mediaType,
+          }]);
+          setValue(prev => {
+            const sep = prev && !prev.endsWith(' ') ? ' ' : '';
+            return `${prev}${sep}[Image ${imageNumber}]`;
+          });
+        }
+        // type 'error' or 'empty' — silently ignored (no good UX for this)
+      } catch {
+        // PowerShell clipboard read can fail — don't crash the input handler
       }
       return;
     }

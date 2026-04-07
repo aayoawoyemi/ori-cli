@@ -261,8 +261,8 @@ export class OriVault {
 
   async queryWarmth(context: string, limit = 3): Promise<VaultNote[]> {
     try {
-      const result = await this.client.callTool('ori_warmth', {
-        context, limit,
+      const result = await this.client.callTool('ori_query_warmth', {
+        query: context, limit,
       }) as { success: boolean; data?: { results: Array<{ title: string; score: number; source: string }> } };
 
       return (result.data?.results ?? []).map(r => ({

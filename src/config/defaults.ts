@@ -35,7 +35,7 @@ export const DEFAULT_CONFIG: AriesConfig = {
     maxSubagents: 5,
   },
   permissions: {
-    mode: 'auto',
+    mode: 'manual',
     allowBash: true,
     allowWrite: true,
     allowNetwork: true,

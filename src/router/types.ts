@@ -56,6 +56,15 @@ export interface ToolDefinition {
     properties: Record<string, ToolParameter>;
     required?: string[];
   };
+  /**
+   * When set, this is a server-executed tool — the provider handles execution
+   * internally and no local tool_result round-trip is needed.
+   * Anthropic: "web_search_20250305", "url_context_20250305", etc.
+   * OpenAI: "web_search_preview", "file_search", etc.
+   */
+  serverType?: string;
+  /** Max uses for server tools (default: unlimited). */
+  maxUses?: number;
 }
 
 // ── Tool call / result ──────────────────────────────────────────────────────

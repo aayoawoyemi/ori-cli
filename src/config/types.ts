@@ -85,7 +85,7 @@ export interface SignatureLayerConfig {
 export interface SignatureConfig {
   codebase: SignatureLayerConfig;
   vault: SignatureLayerConfig;
-  /** Insert Anthropic cache_control marker after signatures (Phase 7 wiring). */
+  /** Insert Anthropic cache_control marker after signatures (Anthropic-only). */
   cachePrefix: boolean;
   /** Whether subagents inherit ambient signatures (default: false). */
   includeInSubagents: boolean;

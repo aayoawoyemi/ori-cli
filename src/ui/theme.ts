@@ -1,14 +1,14 @@
 // ── Color Palette ──────────────────────────────────────────────────────────
-// Ori Parchment Theme — warm walnut & gold.
-// Inspired by oriminemos.com. Aged paper under lamplight, not a spaceship.
+// Ori Parchment Theme — warm cream, no yellow tint.
+// Dark parchment feel: like working on aged paper under soft light.
 // Single source of truth — change here to retheme everything.
 
 export const colors = {
-  // Core text — warm cream, never cold white
-  text: '#e8e0d4',           // warm cream — primary text
-  dim: '#978a78',            // warm muted — labels, timestamps, metadata (AA 4.5+)
-  subtle: '#a89880',         // warm mid — secondary text, descriptions
-  inactive: '#7d7168',       // warm dark — disabled, very secondary (AA 3.0+ large)
+  // Core text — warm cream, not yellow
+  text: '#e4e0da',           // parchment cream — primary text (warm, not yellow)
+  dim: '#958e84',            // warm muted — labels, timestamps, metadata
+  subtle: '#a69e94',         // warm mid — secondary text, descriptions
+  inactive: '#7a746c',       // warm dark — disabled, very secondary
 
   // Branding
   claude: '#c4a46c',         // antique gold — the Ori accent (spinner, headers)
@@ -23,14 +23,14 @@ export const colors = {
   permission: '#bfa87a',     // warm gold — permission prompts, modal borders
   autoAccept: '#a89068',     // warm bronze — auto-accept mode
 
-  // Backgrounds — warm walnut tones
-  userMessageBg: '#2a2520',         // dark walnut — user message fill
-  messageActionsBg: '#302a24',      // slightly lighter walnut — selected message
-  bashMessageBg: '#2e2822',         // warm dark — bash output
+  // Backgrounds — dark parchment, warm but not yellow
+  userMessageBg: '#272523',         // dark parchment — user message fill
+  messageActionsBg: '#2c2a27',      // slightly lighter — selected message
+  bashMessageBg: '#2a2825',         // warm dark — bash output
 
-  // Borders — warm, not cold gray
-  border: '#4a4238',
-  promptBorder: '#4a4238',
+  // Borders — warm, not cold
+  border: '#44403a',
+  promptBorder: '#44403a',
   bashBorder: '#a89068',            // warm bronze — bash mode border
 } as const;
 

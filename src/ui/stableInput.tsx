@@ -160,7 +160,9 @@ export function StableInput({
     }
 
     // ── Alt/Meta combos are consumed by parent (Alt+P, Alt+M, Alt+V) ──
+    // On Windows, Alt may arrive as escape instead of meta
     if (key.meta) return;
+    if (key.escape && input && /^[a-z]$/i.test(input)) return;
 
     // ── Regular char input or paste ───────────────────────────────────
     // Ink may deliver multiple chars in a single `input` when stdin

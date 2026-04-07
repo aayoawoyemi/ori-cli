@@ -214,31 +214,7 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       });
     }
 
-    // ── COMPACTION CHECK ─────────────────────────────────────────────
-    if (tokenEst > compactTokenThreshold) {
-      const result = await runCompaction(
-        messages, projectBrain, vault, router, compactTokenThreshold,
-      );
-
-      // Replace messages in-place
-      messages.length = 0;
-      messages.push(...result.messages);
-
-      yield {
-        type: 'compact',
-        summary: result.summary.slice(0, 200),
-        savedCount: result.saved.length,
-        pruneOnly: result.pruneOnly,
-      };
-
-      session?.log({
-        type: 'compact_boundary',
-        summary: result.summary,
-        insightsSaved: result.saved.length,
-        pruneOnly: result.pruneOnly,
-        timestamp: Date.now(),
-      });
-    }
+    // Auto-compaction disabled — never compact mid-task.
 
     // ── RESULT BUDGET ────────────────────────────────────────────────
     const budgetedMessages = applyResultBudget(messages, maxResultChars);
@@ -298,16 +274,6 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
         }
       }
     } catch (err) {
-      // Prompt too long — emergency compaction
-      if (err instanceof Error && (err.message.includes('too long') || err.message.includes('context_length'))) {
-        const result = await runCompaction(
-          messages, projectBrain, vault, router, compactTokenThreshold,
-        );
-        messages.length = 0;
-        messages.push(...result.messages);
-        yield { type: 'compact', summary: 'Emergency compaction triggered', savedCount: result.saved.length, pruneOnly: result.pruneOnly };
-        continue;
-      }
       yield { type: 'error', error: err };
       return;
     }

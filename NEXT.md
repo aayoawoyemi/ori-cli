@@ -65,3 +65,23 @@ preflight retrieves them. Active memory means:
 - Run /research on real queries, evaluate quality
 - Compare output to manual research
 - Tune depth levels, source ranking, reflection loop count
+
+### Native Token Compressor (Build Our Own)
+- RTK validated the approach (19K stars, 60-90% savings) but has device-fingerprinting telemetry that phones home every 23h — rejected
+- Build native compressors in formatToolResult() and tool execution layer instead
+- Port the 5-6 highest-value filters: git status/diff, test runners, ls/tree, build errors, log dedup
+- Each filter: strip ANSI, remove blank lines, group similar entries, truncate at N lines, dedup repeats
+- ~50 lines TypeScript per filter, no external dependency, no telemetry, full control
+- Apply to both Bash tool output AND built-in tool results (RTK couldn't do the latter)
+- Measure: track input/output token counts per tool call to quantify savings
+
+### Nanochat WASM Compute (Future — Post V1)
+- Nanochat (@EastlondonDev) proved a model can be a stack computer where each forward pass is both a compute tick and a token
+- Model learned WASM instructions (i32.const, i32.sub, local.set) as vocabulary tokens
+- No tool-call round-trip — compute is inline with generation
+- Not open source yet (preview only) — track for release
+- Application for Aries: lightweight inline evaluator for deterministic ops (math, string transforms, sorting)
+- Our REPL bridge already does this at the tool-call level; the gap is latency
+- Could build a micro-WASM runtime that intercepts deterministic patterns before they hit the model
+- Philosophy to steal NOW even without the tech: deterministic operations should be computed, not generated
+- Related: body/server.py REPL already has the sandbox; could add a fast-path eval for simple expressions
