@@ -4,7 +4,7 @@
   "description": "Memory-native coding agent CLI. Built on Ori Mnemos.",
   "type": "module",
   "bin": {
-    "ori-cli": "./dist/index.js"
+    "ori": "./dist/index.js"
   },
   "files": [
     "dist",
