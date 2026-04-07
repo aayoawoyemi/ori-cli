@@ -43,22 +43,27 @@ function windowsClipboard(): ClipboardResult {
   const imgPath = join(dir, 'paste.png').replace(/\\/g, '\\\\');
   // Try image first; if clipboard has no image, fall through to text.
   const script = `
-$ErrorActionPreference = 'SilentlyContinue'
-Add-Type -AssemblyName System.Windows.Forms
-$img = [System.Windows.Forms.Clipboard]::GetImage()
-if ($img -ne $null) {
-  New-Item -ItemType Directory -Force -Path '${dir.replace(/\\/g, '\\\\')}' | Out-Null
-  $img.Save('${imgPath}', [System.Drawing.Imaging.ImageFormat]::Png)
-  Write-Output "IMAGE:${imgPath}"
-  exit 0
+try {
+  Add-Type -AssemblyName System.Windows.Forms
+  Add-Type -AssemblyName System.Drawing
+  $img = [System.Windows.Forms.Clipboard]::GetImage()
+  if ($img -ne $null) {
+    New-Item -ItemType Directory -Force -Path '${dir.replace(/\\/g, '\\\\')}' | Out-Null
+    $img.Save('${imgPath}', [System.Drawing.Imaging.ImageFormat]::Png)
+    Write-Output "IMAGE:${imgPath}"
+    exit 0
+  }
+  $text = [System.Windows.Forms.Clipboard]::GetText()
+  if ($text) {
+    Write-Output "TEXT:"
+    Write-Output $text
+    exit 0
+  }
+  Write-Output "EMPTY"
+} catch {
+  Write-Output "ERROR:$($_.Exception.Message)"
+  exit 1
 }
-$text = [System.Windows.Forms.Clipboard]::GetText()
-if ($text) {
-  Write-Output "TEXT:"
-  Write-Output $text
-  exit 0
-}
-Write-Output "EMPTY"
 `;
   try {
     const out = execSync(
@@ -67,6 +72,9 @@ Write-Output "EMPTY"
     );
     const trimmed = out.trimEnd();
     if (trimmed === 'EMPTY') return { type: 'empty' };
+    if (trimmed.startsWith('ERROR:')) {
+      return { type: 'error', reason: trimmed.slice(6).slice(0, 120) };
+    }
     if (trimmed.startsWith('IMAGE:')) {
       const p = trimmed.slice(6).split('\n')[0]!.trim();
       const { base64, mediaType } = readImageAsBase64(p);

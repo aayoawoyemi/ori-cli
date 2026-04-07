@@ -4,3 +4,34 @@ dist/
 .aries/
 .env
 .env.local
+
+# Local dev / Claude settings
+.claude/
+
+# Scratch / artifacts
+test-ddg.mjs
+test-out.txt
+bash.exe.stackdump
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Benchmark results (keep bench/ code, drop results)
+bench/results/
+
+# Spike (superseded by body/)
+spike/
+
+# Internal planning docs
+HANDOFF_*.md
+NEXT.md
+PLAN.md
+PHASE_8_PLAN.md
+OPTIMIZATION_PLAN.md
+ORI_CLI_V1_BUILD_PLAN.md
+UI-PLAN.md
+V1-ROADMAP.md
+
+# Internal docs (competitive intel, eval data)
+docs/

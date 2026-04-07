@@ -25,8 +25,9 @@ export type TaskPhase = 'lean' | 'full';
 
 // Lean: minimal tool set for coding tasks. 3 tools instead of 16+.
 // Saves ~3-5K tokens/turn in tool schema overhead.
-const REPL_LEAN_TOOLS = new Set(['Repl', 'Edit', 'Write', 'Bash']);
-const BARE_LEAN_TOOLS = new Set(['Read', 'Grep', 'Glob', 'Edit', 'Write', 'Bash']);
+// Memory writes are always available regardless of phase — never gate a memory operation.
+const REPL_LEAN_TOOLS = new Set(['Repl', 'Edit', 'Write', 'Bash', 'VaultAdd', 'ProjectSave']);
+const BARE_LEAN_TOOLS = new Set(['Read', 'Grep', 'Glob', 'Edit', 'Write', 'Bash', 'VaultAdd', 'ProjectSave']);
 
 /**
  * Get tool definitions filtered by current phase.

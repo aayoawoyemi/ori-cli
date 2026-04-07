@@ -2,6 +2,7 @@ import type { Tool } from './types.js';
 import type { ToolDefinition } from '../router/types.js';
 import type { OriVault } from '../memory/vault.js';
 import type { ProjectBrain } from '../memory/projectBrain.js';
+import type { WebSearchConfig } from '../config/types.js';
 import { BashTool } from './bash.js';
 import { ReadTool } from './read.js';
 import { WriteTool } from './write.js';
@@ -17,14 +18,22 @@ import { VaultAddTool } from './vaultAdd.js';
 import { VaultExploreTool } from './vaultExplore.js';
 import { VaultWarmthTool } from './vaultWarmth.js';
 import { ProjectSearchTool } from './projectSearch.js';
+import { ProjectSaveTool } from './projectSave.js';
 import { ReplTool } from './repl.js';
 import type { ReplHandle } from '../repl/setup.js';
+import type { PlanContext, PlanApprovalResult } from './planTypes.js';
+import { EnterPlanModeTool } from './enterPlanMode.js';
+import { ExitPlanModeTool } from './exitPlanMode.js';
 
 export class ToolRegistry {
   private tools = new Map<string, Tool>();
 
   register(tool: Tool): void {
     this.tools.set(tool.name, tool);
+  }
+
+  unregister(name: string): void {
+    this.tools.delete(name);
   }
 
   get(name: string): Tool | undefined {
@@ -48,7 +57,7 @@ export class ToolRegistry {
 }
 
 /** Create a registry with all core tools. */
-export function createCoreRegistry(options?: { replEnabled?: boolean }): ToolRegistry {
+export function createCoreRegistry(options?: { replEnabled?: boolean; webSearch?: WebSearchConfig }): ToolRegistry {
   const registry = new ToolRegistry();
   // Core filesystem tools
   registry.register(new BashTool({ replEnabled: options?.replEnabled }));
@@ -59,7 +68,7 @@ export function createCoreRegistry(options?: { replEnabled?: boolean }): ToolReg
   registry.register(new GrepTool());
   // Web tools
   registry.register(new WebFetchTool());
-  registry.register(new WebSearchTool());
+  registry.register(new WebSearchTool(options?.webSearch));
   // Subagent
   registry.register(new AgentTool());
   return registry;
@@ -80,6 +89,7 @@ export function registerMemoryTools(
   }
   if (projectBrain) {
     registry.register(new ProjectSearchTool(projectBrain));
+    registry.register(new ProjectSaveTool(projectBrain));
   }
 }
 
@@ -104,6 +114,21 @@ export function registerReplTool(
  * Mirrors the mandatory-REPL thesis: removing meta-decisions by subtracting
  * escape hatches.
  */
+/** Register EnterPlanMode + ExitPlanMode tools. Returns the shared plan context. */
+export function registerPlanTools(
+  registry: ToolRegistry,
+  options: {
+    cwd: string;
+    onEnter: (filePath: string) => void;
+    onExit: (filePath: string, content: string) => Promise<PlanApprovalResult>;
+  },
+): PlanContext {
+  const planContext: PlanContext = { filePath: null };
+  registry.register(new EnterPlanModeTool(planContext, options.cwd, options.onEnter));
+  registry.register(new ExitPlanModeTool(planContext, options.onExit));
+  return planContext;
+}
+
 export function stripNavigationTools(registry: ToolRegistry): void {
   const legacyNav = [
     'Read', 'Grep', 'Glob',

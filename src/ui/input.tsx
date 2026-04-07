@@ -31,13 +31,14 @@ export interface AttachedImage {
 
 interface PromptInputProps {
   onSubmit: (text: string, images?: AttachedImage[]) => void;
+  onPasteError?: (message: string) => void;
   model: string;
   isLoading: boolean;
 }
 
 // ── Component ──────────────────────────────────────────────────────────────
 
-export function PromptInput({ onSubmit, model, isLoading }: PromptInputProps): React.ReactElement {
+export function PromptInput({ onSubmit, onPasteError, model, isLoading }: PromptInputProps): React.ReactElement {
   const [value, setValue] = useState('');
   const [images, setImages] = useState<AttachedImage[]>([]);
   const imageCountRef = useRef(0);
@@ -45,6 +46,9 @@ export function PromptInput({ onSubmit, model, isLoading }: PromptInputProps): R
   const [historyIdx, setHistoryIdx] = useState(-1);
   const [paletteIdx, setPaletteIdx] = useState(0);
   const [helpOpen, setHelpOpen] = useState(false);
+  // ESC-latch: on Windows ConPTY, Alt+key can arrive as two events (ESC then key).
+  // Latch remembers a bare ESC so the next letter can be recognized as Alt+letter.
+  const escapeLatchRef = useRef(false);
 
   const mode = getModeFromInput(value);
   const showPalette = value.startsWith('/') && !isLoading && !helpOpen;
@@ -57,9 +61,21 @@ export function PromptInput({ onSubmit, model, isLoading }: PromptInputProps): R
       return;
     }
 
+    // Bare ESC with no char — first half of split Alt+key on Windows ConPTY
+    if (key.escape && !input) {
+      escapeLatchRef.current = true;
+      setTimeout(() => { escapeLatchRef.current = false; }, 50);
+      return;
+    }
+
     // Alt+V → paste clipboard (text OR image) at cursor
-    // On some Windows terminals, Alt sends escape=true instead of meta=true
-    if (((key.meta && input === 'v') || (key.escape && input === 'v')) && !isLoading) {
+    // Three detection paths: native meta, coalesced escape+key, ConPTY split (latched ESC + key)
+    const isAltV = (key.meta && input === 'v')
+      || (key.escape && input === 'v')
+      || (escapeLatchRef.current && input === 'v' && !key.escape && !key.ctrl && !key.meta);
+
+    if (isAltV && !isLoading) {
+      escapeLatchRef.current = false;
       try {
         const result = readClipboard();
         if (result.type === 'text') {
@@ -77,12 +93,20 @@ export function PromptInput({ onSubmit, model, isLoading }: PromptInputProps): R
             const sep = prev && !prev.endsWith(' ') ? ' ' : '';
             return `${prev}${sep}[Image ${imageNumber}]`;
           });
+        } else if (result.type === 'error') {
+          onPasteError?.(`Paste failed: ${result.reason}`);
+        } else if (result.type === 'empty') {
+          onPasteError?.('Clipboard is empty');
         }
-        // type 'error' or 'empty' — silently ignored (no good UX for this)
-      } catch {
-        // PowerShell clipboard read can fail — don't crash the input handler
+      } catch (err) {
+        onPasteError?.(`Paste failed: ${(err as Error).message.slice(0, 80)}`);
       }
       return;
+    }
+
+    // Clear latch on any non-V char after ESC
+    if (escapeLatchRef.current && input && input !== 'v') {
+      escapeLatchRef.current = false;
     }
 
     // ? opens help (only on empty input)
@@ -203,6 +227,7 @@ export function PromptInput({ onSubmit, model, isLoading }: PromptInputProps): R
             onChange={handleChange}
             onSubmit={handleSubmit}
             placeholder=""
+            isEscapeLatchActive={escapeLatchRef.current}
           />
         )}
       </Box>

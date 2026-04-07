@@ -1,3 +1,4 @@
+import { resolve } from 'node:path';
 import type { Message, ToolCall, ToolDefinition, ContentBlock } from './router/types.js';
 import type { ModelRouter } from './router/index.js';
 import type { ToolRegistry } from './tools/registry.js';
@@ -10,17 +11,20 @@ import { executeTools, resetDoomLoop } from './tools/execution.js';
 import { PhaseTracker, getToolsForPhase, type TaskPhase } from './tools/toolSets.js';
 import { buildAssistantMessage, buildToolResultMessage, getMessageText } from './utils/messages.js';
 import { estimateTokens } from './utils/tokens.js';
-import { runPreflight, type PreflightContext } from './memory/preflight.js';
+// Preflight disabled pre-ship — import kept for when it comes back
+// import { runPreflight, type PreflightContext } from './memory/preflight.js';
 // current-state injection removed — model calls ori_orient directly
 import { stripSyntheticFromMessages, injectTurnSynthetics } from './memory/syntheticMarkers.js';
 import { runPostflight } from './memory/postflight.js';
 import { runCompaction } from './memory/compact.js';
 import { tickTurn, needsRefresh, assembleWarmContext } from './memory/warmContext.js';
 import { detectEchoFizzle, sendEchoSignals } from './memory/echoFizzle.js';
+import { applyNudges, resetNudgeCounters } from './tools/nudge.js';
+import { getPlanModeSparseReminder } from './tools/planInstructions.js';
 
 // ── Loop Events (yielded to the UI) ────────────────────────────────────────
 
-export type PermissionMode = 'default' | 'accept' | 'plan' | 'yolo';
+export type PermissionMode = 'default' | 'accept' | 'plan' | 'research' | 'yolo';
 export type PermissionDecision = 'allow' | 'deny' | 'always';
 
 export type LoopEvent =
@@ -79,6 +83,8 @@ export interface LoopParams {
    * Default: false (expose all tools every turn, backwards-compatible).
    */
   dynamicTools?: boolean;
+  /** Path to the plan file (set when EnterPlanMode runs). Write/Edit clamped to this file in plan mode. */
+  planFilePath?: string;
 }
 
 // ── Result Budget ───────────────────────────────────────────────────────────
@@ -135,6 +141,7 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     preflightEnabled = true,
     onFileMutated,
     dynamicTools = false,
+    planFilePath,
   } = params;
 
   const allTools: ToolDefinition[] = registry.definitions();
@@ -144,7 +151,8 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
   const compactTokenThreshold = Math.floor(contextLimit * compactThreshold);
   let turnCount = 0;
   let importanceAccumulator = 0;
-  let lastPreflight: PreflightContext | null = null;
+  // Preflight disabled pre-ship — variable kept for when it comes back
+  // let lastPreflight: PreflightContext | null = null;
 
   // Reset doom loop tracking on new user input
   resetDoomLoop();
@@ -158,12 +166,13 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     // Fix 2 + Fix 4 from orientation audit.
     stripSyntheticFromMessages(messages);
 
-    // ── PREFLIGHT: Historical memory retrieval (gated by config) ────
-    if (preflightEnabled) {
-      lastPreflight = await runPreflight(messages, projectBrain, vault, identityContext);
-    } else {
-      lastPreflight = null;
-    }
+    // Reset per-turn nudge counters (sequential read tracking, etc.)
+    resetNudgeCounters();
+
+    // ── PREFLIGHT: Disabled pre-ship. Needs deep learning research to
+    // justify the ~320 tokens/turn cost. Echo/fizzle data showed most
+    // preflight notes go unused. Bring back when retrieval quality earns
+    // the context budget. Warm context + experience log cover ambient needs.
 
     // current-state lane removed (2026-04-07). The model now calls
     // ori_orient directly at session start — one source of truth.
@@ -171,48 +180,17 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     // ── CONTEXT PROPRIOCEPTION ─────────────────────────────────────
     const tokenEst = estimateTokens(messages);
     const utilizationPct = Math.round((tokenEst / contextLimit) * 100);
-    const preflightTitles = lastPreflight
-      ? [...lastPreflight.projectNotes, ...lastPreflight.vaultNotes].map(n => {
-          const tag = n.contradicting ? ' [CONTRADICTS]' : '';
-          return `"${n.title}"${tag}`;
-        })
-      : [];
 
     const proprioceptionBlock = [
       `<context-status>`,
       `Context: ${utilizationPct}% (${tokenEst}/${contextLimit} tokens estimated)`,
-      preflightTitles.length > 0
-        ? `Memories loaded this turn: ${preflightTitles.join(', ')}`
-        : 'No memories retrieved this turn.',
       `</context-status>`,
     ].join('\n');
 
-    // ── INJECTION: wrap all synthetic blocks with stable markers ────
-    // Positional precedence (top→bottom as seen by model):
-    //   1. preflight-before (historical — farthest)
-    //   2. [user message]
-    //   3. preflight-after  (contradictions)
-    //   4. proprio          (closest to generation)
+    // ── INJECTION: proprio only (preflight disabled pre-ship) ─────
     injectTurnSynthetics(messages, {
-      preflightBefore: lastPreflight?.beforeUserBlock || undefined,
-      preflightAfter: lastPreflight?.afterUserBlock || undefined,
       proprio: proprioceptionBlock,
     });
-
-    if (lastPreflight) {
-      yield {
-        type: 'preflight',
-        projectCount: lastPreflight.projectNotes.length,
-        vaultCount: lastPreflight.vaultNotes.length,
-      };
-
-      session?.log({
-        type: 'preflight',
-        projectNotes: lastPreflight.projectNotes.map(n => n.title),
-        vaultNotes: lastPreflight.vaultNotes.map(n => n.title),
-        timestamp: Date.now(),
-      });
-    }
 
     // Auto-compaction disabled — never compact mid-task.
 
@@ -220,15 +198,42 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     const budgetedMessages = applyResultBudget(messages, maxResultChars);
 
     // ── TOOL FILTERING (structural enforcement) ────────────────────
-    // Plan mode: REMOVE write tools so the model can't even consider them.
+    // Plan mode: read-only tools + Write/Edit (clamped to plan file at execution).
+    // Research mode: read-only tools only.
     // Dynamic tools: only expose tools for the current task phase.
     let activeTools: ToolDefinition[];
     if (permissionMode === 'plan') {
+      activeTools = allTools.filter(t => {
+        if (registry.isReadOnly(t.name)) return true;
+        // Write/Edit included in schema — enforced to plan file at execution time
+        if (t.name === 'Write' || t.name === 'Edit') return true;
+        // ExitPlanMode is readOnly=false (triggers approval) — include explicitly
+        if (t.name === 'ExitPlanMode') return true;
+        return false;
+      });
+    } else if (permissionMode === 'research') {
       activeTools = allTools.filter(t => registry.isReadOnly(t.name));
     } else if (phaseTracker) {
       activeTools = getToolsForPhase(registry, phaseTracker.phase, replEnabled);
     } else {
       activeTools = allTools;
+    }
+
+    // ── Plan mode sparse reminder (survives compaction) ──────────────
+    if (permissionMode === 'plan' && planFilePath) {
+      let lastUserIdx = -1;
+      for (let i = budgetedMessages.length - 1; i >= 0; i--) {
+        if (budgetedMessages[i]!.role === 'user') { lastUserIdx = i; break; }
+      }
+      if (lastUserIdx >= 0 && typeof budgetedMessages[lastUserIdx]!.content === 'string') {
+        const content = budgetedMessages[lastUserIdx]!.content as string;
+        if (!content.includes('Plan mode')) {
+          budgetedMessages[lastUserIdx] = {
+            ...budgetedMessages[lastUserIdx]!,
+            content: `<system-reminder>${getPlanModeSparseReminder(planFilePath)}</system-reminder>\n\n${content}`,
+          };
+        }
+      }
     }
 
     // ── MODEL CALL ───────────────────────────────────────────────────
@@ -292,6 +297,22 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       const deniedResults: { id: string; name: string; output: string; isError: boolean }[] = [];
 
       for (const tc of toolCalls) {
+        // Plan mode: clamp Write/Edit to plan file only
+        if (permissionMode === 'plan' && (tc.name === 'Write' || tc.name === 'Edit')) {
+          const targetPath = resolve(toolContext.cwd, tc.input.file_path as string);
+          const planPath = planFilePath ? resolve(planFilePath) : null;
+          if (planPath && targetPath === planPath) {
+            approvedCalls.push(tc);
+          } else {
+            deniedResults.push({
+              id: tc.id, name: tc.name,
+              output: `In plan mode, only the plan file is writable: ${planPath ?? '(call EnterPlanMode first)'}`,
+              isError: true,
+            });
+          }
+          continue;
+        }
+
         const isRead = registry.isReadOnly(tc.name);
 
         if (isRead || permissionMode === 'yolo') {
@@ -340,6 +361,9 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
         }
       }
 
+      // Apply contextual REPL nudges to tool results
+      applyNudges(executedResults, replEnabled);
+
       // Combine ALL results into ONE user message (Anthropic requires all
       // tool_results for one assistant turn in a single message).
       const allResults = [...deniedResults, ...executedResults];
@@ -381,19 +405,12 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     messages.push({ role: 'assistant', content: assistantText });
     session?.log({ type: 'assistant', content: assistantText, timestamp: Date.now() });
 
-    // ── ECHO/FIZZLE: which preflight notes did the model actually use? ──
-    if (lastPreflight && assistantText.length > 50) {
-      const ef = detectEchoFizzle(assistantText, lastPreflight);
-      if (ef.echoed.length > 0 || ef.fizzled.length > 0) {
-        yield { type: 'echo_fizzle', echoed: ef.echoed, fizzled: ef.fizzled };
-        // Send echo signals to Ori (fire-and-forget)
-        sendEchoSignals(ef, vault).catch(() => {});
-      }
-    }
+    // ── ECHO/FIZZLE: disabled with preflight ──────────────────────
+    // Bring back when preflight returns.
 
     // ── POSTFLIGHT ───────────────────────────────────────────────────
     importanceAccumulator = await runPostflight(
-      messages, lastPreflight, projectBrain, vault, importanceAccumulator, router,
+      messages, null, projectBrain, vault, importanceAccumulator, router,
     );
 
     // ── WARM CONTEXT TICK ────────────────────────────────────────────

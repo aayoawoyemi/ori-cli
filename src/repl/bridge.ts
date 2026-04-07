@@ -27,6 +27,7 @@ import type {
   RlmConfigResult,
   SignatureLevel,
 } from './types.js';
+import type { OriVault } from '../memory/vault.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -41,6 +42,7 @@ export class ReplBridge {
   private pending: PendingResolver[] = [];
   private restarting = false;
   private restartCount = 0;
+  private vault: OriVault | null = null;
 
   private opts: {
     serverPath: string;
@@ -79,13 +81,21 @@ export class ReplBridge {
       pythonCmd: this.opts.pythonCmd,
       serverPath: this.opts.serverPath,
       onLine: (line) => {
-        const resolver = this.pending.shift();
-        if (resolver) {
-          try {
-            resolver(JSON.parse(line));
-          } catch {
-            resolver({ error: `bad json from body: ${line.slice(0, 160)}` });
+        try {
+          const msg = JSON.parse(line);
+
+          // Vault callback: Python proxy needs vault data during exec
+          if (msg.vault_request) {
+            this.handleVaultCallback(msg.vault_request);
+            return; // Don't resolve pending — exec is still running
           }
+
+          // Normal response — resolve pending request
+          const resolver = this.pending.shift();
+          if (resolver) resolver(msg);
+        } catch {
+          const resolver = this.pending.shift();
+          if (resolver) resolver({ error: `bad json from body: ${line.slice(0, 160)}` });
         }
       },
       onExit: (code, signal) => {
@@ -371,5 +381,32 @@ export class ReplBridge {
 
   getRestartCount(): number {
     return this.restartCount;
+  }
+
+  /**
+   * Give the bridge a reference to the TS-side vault so it can handle
+   * vault_request callbacks from the Python proxy during exec.
+   */
+  setVault(vault: OriVault | null): void {
+    this.vault = vault;
+  }
+
+  /**
+   * Handle a vault_request from Python: call the TS-owned Ori MCP,
+   * send the result back to Python stdin as vault_response.
+   */
+  private async handleVaultCallback(req: { id: number; method: string; args: Record<string, unknown> }): Promise<void> {
+    let result: unknown = null;
+    try {
+      if (!this.vault?.connected) throw new Error('vault not connected');
+      result = await this.vault.callTool(req.method, req.args);
+    } catch (err) {
+      result = { success: false, error: (err as Error).message };
+    }
+
+    // Send response back to Python's stdin
+    this.process?.write(JSON.stringify({
+      vault_response: { id: req.id, result },
+    }));
   }
 }

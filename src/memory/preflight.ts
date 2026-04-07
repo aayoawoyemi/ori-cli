@@ -86,26 +86,16 @@ export async function runPreflight(
     assistantText,
   ].filter(Boolean).join(' ');
 
-  // ── 5 parallel retrieval signals (queryImportant removed — pure noise) ────
-  // queryImportant returned top-2 PageRank notes regardless of query, surfacing
-  // the same vault maps every turn. Removed Fix 11.
+  // ── Project brain (always local, not in ori_preflight) ────────────────
+  const projectResults = projectBrain
+    ? await searchProjectBrain(projectBrain, rawQuery)
+    : [];
 
-  const [projectResults, ranked, warmth, explored, similar] = await Promise.all([
-    projectBrain ? searchProjectBrain(projectBrain, rawQuery) : Promise.resolve([]),
-    vault?.connected ? vault.queryRanked(query, 5) : Promise.resolve([]),
-    vault?.connected ? vault.queryWarmth(warmthContext, 3) : Promise.resolve([]),
-    vault?.connected ? vault.explore(rawQuery, 5, 2) : Promise.resolve([]),
-    vault?.connected && assistantText.length > 20
-      ? vault.querySimilar(assistantText, 3)
-      : Promise.resolve([]),
-  ]);
-
-  // ── Deduplicate ────────────────────────────────────────────────────
+  // ── Vault retrieval: try compound ori_preflight, fall back to 5-way ──
+  let vaultNotes: PreflightNote[] = [];
+  const projectNotes: PreflightNote[] = [];
 
   const seen = new Set<string>();
-  const projectNotes: PreflightNote[] = [];
-  const vaultNotes: PreflightNote[] = [];
-
   for (const mem of projectResults) {
     const key = mem.title.toLowerCase();
     if (!seen.has(key)) {
@@ -114,28 +104,60 @@ export async function runPreflight(
     }
   }
 
-  const vaultSources: Array<{ notes: VaultNote[]; source: PreflightNote['source'] }> = [
-    { notes: ranked, source: 'ranked' },
-    { notes: warmth, source: 'warmth' },
-    { notes: explored, source: 'explore' },
-    { notes: similar, source: 'similar' },
-  ];
+  // Try single-call preflight (requires ori_preflight in Ori >= 0.5.x)
+  const compoundResult = vault?.connected
+    ? await vault.preflight(query, warmthContext, 12)
+    : null;
 
-  for (const { notes, source } of vaultSources) {
-    for (const note of notes) {
-      const key = note.title.toLowerCase();
+  if (compoundResult && compoundResult.notes.length > 0) {
+    // Server-side dedup + contradiction detection — just map to our type
+    for (const n of compoundResult.notes) {
+      const key = n.title.toLowerCase();
       if (!seen.has(key)) {
         seen.add(key);
-        vaultNotes.push({ title: note.title, score: note.score, source });
+        vaultNotes.push({
+          title: n.title,
+          score: n.score,
+          source: n.source as PreflightNote['source'],
+          contradicting: n.contradicting,
+        });
       }
     }
+  } else if (vault?.connected) {
+    // Fallback: 5-way fan-out (old Ori version or preflight failure)
+    const [ranked, warmth, explored, similar] = await Promise.all([
+      vault.queryRanked(query, 5),
+      vault.queryWarmth(warmthContext, 3),
+      vault.explore(rawQuery, 5, 2),
+      assistantText.length > 20
+        ? vault.querySimilar(assistantText, 3)
+        : Promise.resolve([]),
+    ]);
+
+    const vaultSources: Array<{ notes: VaultNote[]; source: PreflightNote['source'] }> = [
+      { notes: ranked, source: 'ranked' },
+      { notes: warmth, source: 'warmth' },
+      { notes: explored, source: 'explore' },
+      { notes: similar, source: 'similar' },
+    ];
+
+    for (const { notes, source } of vaultSources) {
+      for (const note of notes) {
+        const key = note.title.toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          vaultNotes.push({ title: note.title, score: note.score, source });
+        }
+      }
+    }
+
+    // Legacy keyword contradiction flagging (only in fallback path)
+    flagContradictions([...projectNotes, ...vaultNotes], query);
   }
 
   if (projectNotes.length === 0 && vaultNotes.length === 0) return null;
 
-  // ── Contradiction flagging ─────────────────────────────────────────
   const allNotes = [...projectNotes, ...vaultNotes];
-  flagContradictions(allNotes, query);
 
   // ── Split into positional blocks ───────────────────────────────────
   // Lost in the Middle (Stanford/Meta TACL 2024): 30%+ degradation for

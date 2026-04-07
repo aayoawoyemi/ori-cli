@@ -111,7 +111,7 @@ function AssistantStreamingMessage({ text, addMargin }: { text: string; addMargi
         <Text color={colors.text}>{figures.dot}</Text>
       </Box>
       <Box flexDirection="column" flexGrow={1}>
-        <StreamingMarkdown text={text} />
+        <StreamingMarkdown text={text} isStreaming={true} />
       </Box>
     </Box>
   );
@@ -244,18 +244,36 @@ function ToolCallRow({ toolCall, addMargin }: { toolCall: DisplayToolCall; addMa
         )}
       </Box>
 
-      {toolCall.resolved && toolCall.resultPreview && (
-        <Box flexDirection="column">
-          {toolCall.resultPreview.includes('\n-') || toolCall.resultPreview.includes('\n+') ? (
-            <DiffPreview text={toolCall.resultPreview} />
-          ) : (
+      {toolCall.resolved && toolCall.resultPreview && (() => {
+        const preview = toolCall.resultPreview;
+        const hasDiff = preview.includes('\n-') || preview.includes('\n+');
+        if (hasDiff) {
+          // First line is the human summary ("Added 3 lines, removed 1 line"),
+          // rest is the raw diff for colorization.
+          const newlineIdx = preview.indexOf('\n');
+          const summaryLine = newlineIdx > -1 ? preview.slice(0, newlineIdx) : '';
+          const diffText = newlineIdx > -1 ? preview.slice(newlineIdx + 1) : preview;
+          return (
+            <Box flexDirection="column">
+              {summaryLine ? (
+                <Box flexDirection="row">
+                  <Text dimColor>{'  '}{figures.toolResult}{'  '}</Text>
+                  <Text dimColor>{summaryLine}</Text>
+                </Box>
+              ) : null}
+              <DiffPreview text={diffText} />
+            </Box>
+          );
+        }
+        return (
+          <Box flexDirection="column">
             <Box flexDirection="row">
               <Text dimColor>{'  '}{figures.toolResult}{'  '}</Text>
-              <Text dimColor>{toolCall.resultPreview}</Text>
+              <Text dimColor>{preview}</Text>
             </Box>
-          )}
-        </Box>
-      )}
+          </Box>
+        );
+      })()}
     </Box>
   );
 }

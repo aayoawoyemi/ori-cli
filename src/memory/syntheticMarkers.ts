@@ -62,8 +62,7 @@ function escapeRegex(s: string): string {
  *
  * Order (top to bottom in user.content):
  *   1. preflightBefore  (historical memory context)
- *   2. currentState     (current truth — HIGHEST precedence, closest to user text)
- *   3. [user's actual message]
+ *   2. [user's actual message]
  *   4. preflightAfter   (contradictions as required-response blocks)
  *   5. proprio          (context-status block, highest salience before generation)
  *
@@ -74,7 +73,6 @@ function escapeRegex(s: string): string {
  */
 export interface TurnSynthetics {
   preflightBefore?: string;
-  currentState?: string;
   preflightAfter?: string;
   proprio?: string;
 }
@@ -99,9 +97,6 @@ export function injectTurnSynthetics(
   const beforeParts: string[] = [];
   if (blocks.preflightBefore) {
     beforeParts.push(wrapSynthetic('preflight-before', `<system-reminder>\n<memory-context>\n${blocks.preflightBefore}\n</memory-context>\n</system-reminder>`));
-  }
-  if (blocks.currentState) {
-    beforeParts.push(wrapSynthetic('current-state', `<system-reminder>\n${blocks.currentState}\n</system-reminder>`));
   }
   const leading = beforeParts.length > 0 ? beforeParts.join('\n\n') + '\n\n' : '';
 

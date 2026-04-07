@@ -22,6 +22,7 @@ export const colors = {
   suggestion: '#c4a46c',     // gold — links, selected items, model picker
   permission: '#bfa87a',     // warm gold — permission prompts, modal borders
   autoAccept: '#a89068',     // warm bronze — auto-accept mode
+  research: '#8a9fa8',       // muted slate blue — research/exploration mode
 
   // Backgrounds — dark parchment, warm but not yellow
   userMessageBg: '#272523',         // dark parchment — user message fill
@@ -65,4 +66,5 @@ export const figures = {
   lightning: '\u21AF',                             // ↯
   planMode: '\u23F8',                              // ⏸
   autoMode: '\u23F5\u23F5',                        // ⏵⏵
+  researchMode: '\u2315',                          // ⌕
 } as const;

@@ -1,26 +1,64 @@
 import type { Tool } from './types.js';
 import type { ToolDefinition, ToolResult } from '../router/types.js';
+import type { WebSearchConfig, WebSearchProvider } from '../config/types.js';
 
 /**
  * Web search with resilient multi-backend fallback:
  *
- *   1. Tavily  (best quality, needs TAVILY_API_KEY)
- *   2. Brave   (free 2k/mo, needs BRAVE_SEARCH_API_KEY)
- *   3. DDG JSON instant-answer API  (no key, limited topic coverage)
- *   4. DDG HTML scraping  (no key, fragile — last resort)
+ *   1. Provider from config / env (Tavily, Brave, Serper, SerpAPI)
+ *   2. DDG JSON instant-answer API  (no key, limited topic coverage)
+ *   3. DDG HTML scraping  (no key, fragile — last resort)
  *
- * DDG HTML scraping was the only backend before. It returns HTTP 202 +
- * CAPTCHA pages intermittently, causing silent "no results" failures.
- * The fallback chain means at least one backend will almost always work.
+ * API key resolution order (env wins over config):
+ *   TAVILY_API_KEY / BRAVE_SEARCH_API_KEY / SERPER_API_KEY / SERPAPI_KEY
+ *   overrides config.webSearch.apiKey
  *
- * Future: For Anthropic models, use server-side `web_search_20250305`
- * tool (zero config, server handles everything). Requires stream parser
- * changes — tracked separately.
+ * For Anthropic models, the server-side `web_search_20250305` tool is
+ * injected at the router level — zero config, Claude handles it.
+ * This tool handles all other providers.
+ *
+ * Configuration (in ~/.aries/config.yaml or .aries/config.yaml):
+ *   webSearch:
+ *     provider: brave       # brave | tavily | serper | serpapi
+ *     apiKey: your-key-here
  */
 export class WebSearchTool implements Tool {
   readonly name = 'WebSearch';
-  readonly description = 'Search the web and return results with titles, URLs, and snippets. Uses Brave/Tavily if configured, DuckDuckGo otherwise.';
+  readonly description = 'Search the web and return results with titles, URLs, and snippets. Configure a search provider in .aries/config.yaml for reliable results.';
   readonly readOnly = true;
+
+  private readonly cfg: WebSearchConfig;
+
+  constructor(cfg: WebSearchConfig = {}) {
+    this.cfg = cfg;
+  }
+
+  /** Resolve the active API key: env var wins over config file. */
+  private resolveKey(provider: WebSearchProvider): string | undefined {
+    const envMap: Record<WebSearchProvider, string> = {
+      brave: 'BRAVE_SEARCH_API_KEY',
+      tavily: 'TAVILY_API_KEY',
+      serper: 'SERPER_API_KEY',
+      serpapi: 'SERPAPI_KEY',
+    };
+    return process.env[envMap[provider]] || this.cfg.apiKey || undefined;
+  }
+
+  /** Resolve the active provider. Env vars take precedence over config. */
+  private resolveProvider(): { provider: WebSearchProvider; key: string } | null {
+    // Env-var shortcuts (no config needed)
+    if (process.env.TAVILY_API_KEY) return { provider: 'tavily', key: process.env.TAVILY_API_KEY };
+    if (process.env.BRAVE_SEARCH_API_KEY) return { provider: 'brave', key: process.env.BRAVE_SEARCH_API_KEY };
+    if (process.env.SERPER_API_KEY) return { provider: 'serper', key: process.env.SERPER_API_KEY };
+    if (process.env.SERPAPI_KEY) return { provider: 'serpapi', key: process.env.SERPAPI_KEY };
+
+    // Config file
+    if (this.cfg.provider && this.cfg.apiKey) {
+      return { provider: this.cfg.provider, key: this.cfg.apiKey };
+    }
+
+    return null;
+  }
 
   definition(): ToolDefinition {
     return {
@@ -49,12 +87,20 @@ export class WebSearchTool implements Tool {
 
     const backends: Array<{ name: string; fn: () => Promise<ToolResult | null> }> = [];
 
-    if (process.env.TAVILY_API_KEY) {
-      backends.push({ name: 'tavily', fn: () => this.tavilySearch(query, maxResults) });
+    const resolved = this.resolveProvider();
+    if (resolved) {
+      const { provider, key } = resolved;
+      if (provider === 'tavily') {
+        backends.push({ name: 'tavily', fn: () => this.tavilySearch(query, maxResults, key) });
+      } else if (provider === 'brave') {
+        backends.push({ name: 'brave', fn: () => this.braveSearch(query, maxResults, key) });
+      } else if (provider === 'serper') {
+        backends.push({ name: 'serper', fn: () => this.serperSearch(query, maxResults, key) });
+      } else if (provider === 'serpapi') {
+        backends.push({ name: 'serpapi', fn: () => this.serpapiSearch(query, maxResults, key) });
+      }
     }
-    if (process.env.BRAVE_SEARCH_API_KEY) {
-      backends.push({ name: 'brave', fn: () => this.braveSearch(query, maxResults) });
-    }
+
     backends.push({ name: 'ddg-json', fn: () => this.ddgJsonSearch(query, maxResults) });
     backends.push({ name: 'ddg-html', fn: () => this.ddgHtmlSearch(query, maxResults) });
 
@@ -70,21 +116,41 @@ export class WebSearchTool implements Tool {
       }
     }
 
+    // If no API provider was configured, give a clear setup message instead of a generic failure.
+    if (!resolved) {
+      return {
+        id: '', name: this.name,
+        output: [
+          `Web search has limited coverage without a search API key (tried DDG only).`,
+          `To enable reliable web search, add to ~/.aries/config.yaml or .aries/config.yaml:`,
+          ``,
+          `  webSearch:`,
+          `    provider: brave      # brave | tavily | serper | serpapi`,
+          `    apiKey: your-key-here`,
+          ``,
+          `Or set an env var: BRAVE_SEARCH_API_KEY, TAVILY_API_KEY, SERPER_API_KEY, or SERPAPI_KEY.`,
+          `Free options: Brave (2k/mo) and Serper both have free tiers.`,
+          errors.length ? `\nErrors: ${errors.join('; ')}` : '',
+        ].join('\n').trim(),
+        isError: true,
+      };
+    }
+
     return {
       id: '', name: this.name,
-      output: `Web search failed for "${query}". All backends exhausted.\n${errors.join('\n')}\nTip: set BRAVE_SEARCH_API_KEY (free at brave.com/search/api) or TAVILY_API_KEY for reliable results.`,
+      output: `Web search failed for "${query}". All backends exhausted.\n${errors.join('\n')}`,
       isError: true,
     };
   }
 
   // ── Tavily ────────────────────────────────────────────────────────────
 
-  private async tavilySearch(query: string, maxResults: number): Promise<ToolResult | null> {
+  private async tavilySearch(query: string, maxResults: number, key: string): Promise<ToolResult | null> {
     const response = await fetch('https://api.tavily.com/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        api_key: process.env.TAVILY_API_KEY,
+        api_key: key,
         query,
         max_results: maxResults,
         include_answer: true,
@@ -112,7 +178,7 @@ export class WebSearchTool implements Tool {
 
   // ── Brave Search ──────────────────────────────────────────────────────
 
-  private async braveSearch(query: string, maxResults: number): Promise<ToolResult | null> {
+  private async braveSearch(query: string, maxResults: number, key: string): Promise<ToolResult | null> {
     const encoded = encodeURIComponent(query);
     const response = await fetch(
       `https://api.search.brave.com/res/v1/web/search?q=${encoded}&count=${maxResults}`,
@@ -120,7 +186,7 @@ export class WebSearchTool implements Tool {
         headers: {
           'Accept': 'application/json',
           'Accept-Encoding': 'gzip',
-          'X-Subscription-Token': process.env.BRAVE_SEARCH_API_KEY!,
+          'X-Subscription-Token': key,
         },
         signal: AbortSignal.timeout(10_000),
       },
@@ -139,6 +205,61 @@ export class WebSearchTool implements Tool {
       `${r.title}\n${r.url}\n${r.description}\n`
     );
 
+    return { id: '', name: this.name, output: lines.join('\n'), isError: false };
+  }
+
+  // ── Serper ────────────────────────────────────────────────────────────
+
+  private async serperSearch(query: string, maxResults: number, key: string): Promise<ToolResult | null> {
+    const response = await fetch('https://google.serper.dev/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-KEY': key },
+      body: JSON.stringify({ q: query, num: maxResults }),
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!response.ok) return null;
+
+    const data = await response.json() as {
+      answerBox?: { answer?: string; snippet?: string };
+      organic?: Array<{ title: string; link: string; snippet: string }>;
+    };
+
+    const lines: string[] = [];
+    if (data.answerBox?.answer) lines.push(`Answer: ${data.answerBox.answer}\n`);
+    else if (data.answerBox?.snippet) lines.push(`Answer: ${data.answerBox.snippet}\n`);
+    for (const r of (data.organic ?? []).slice(0, maxResults)) {
+      lines.push(`${r.title}\n${r.link}\n${r.snippet}\n`);
+    }
+
+    if (lines.length === 0) return null;
+    return { id: '', name: this.name, output: lines.join('\n'), isError: false };
+  }
+
+  // ── SerpAPI ───────────────────────────────────────────────────────────
+
+  private async serpapiSearch(query: string, maxResults: number, key: string): Promise<ToolResult | null> {
+    const encoded = encodeURIComponent(query);
+    const response = await fetch(
+      `https://serpapi.com/search.json?q=${encoded}&num=${maxResults}&api_key=${key}`,
+      { signal: AbortSignal.timeout(15_000) },
+    );
+
+    if (!response.ok) return null;
+
+    const data = await response.json() as {
+      answer_box?: { answer?: string; snippet?: string };
+      organic_results?: Array<{ title: string; link: string; snippet: string }>;
+    };
+
+    const lines: string[] = [];
+    if (data.answer_box?.answer) lines.push(`Answer: ${data.answer_box.answer}\n`);
+    else if (data.answer_box?.snippet) lines.push(`Answer: ${data.answer_box.snippet}\n`);
+    for (const r of (data.organic_results ?? []).slice(0, maxResults)) {
+      lines.push(`${r.title}\n${r.link}\n${r.snippet}\n`);
+    }
+
+    if (lines.length === 0) return null;
     return { id: '', name: this.name, output: lines.join('\n'), isError: false };
   }
 

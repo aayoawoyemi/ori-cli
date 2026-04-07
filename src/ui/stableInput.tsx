@@ -26,6 +26,8 @@ interface StableInputProps {
   placeholder?: string;
   /** When true, the component ignores keystrokes (e.g. during loading). */
   disabled?: boolean;
+  /** When true, an ESC-latch is active in the parent — defer single letter keys to parent handler. */
+  isEscapeLatchActive?: boolean;
 }
 
 export function StableInput({
@@ -34,6 +36,7 @@ export function StableInput({
   onSubmit,
   placeholder = '',
   disabled = false,
+  isEscapeLatchActive = false,
 }: StableInputProps): React.ReactElement {
   const bufferRef = useRef<string>(value);
   const cursorRef = useRef<number>(value.length);
@@ -42,13 +45,17 @@ export function StableInput({
 
   // Keep the ref in sync when the parent programmatically sets value
   // (history navigation, palette tab-completion, submit-clears-input, etc.)
+  //
+  // IMPORTANT: only reset when value differs from what WE last sent via onChange.
+  // If value === lastNotifiedRef.current, this is our own onChange roundtrip echoing
+  // back — ignore it, or we race with our own buffer updates during fast typing.
   useEffect(() => {
-    if (bufferRef.current !== value) {
-      bufferRef.current = value;
-      cursorRef.current = value.length;
-      lastNotifiedRef.current = value;
-      forceRender();
-    }
+    if (value === lastNotifiedRef.current) return;
+    // Parent changed value externally (history nav, clear, etc.) — sync buffer.
+    bufferRef.current = value;
+    cursorRef.current = value.length;
+    lastNotifiedRef.current = value;
+    forceRender();
   }, [value]);
 
   // Post-render sync: if the buffer changed but onChange wasn't called
@@ -163,6 +170,9 @@ export function StableInput({
     // On Windows, Alt may arrive as escape instead of meta
     if (key.meta) return;
     if (key.escape && input && /^[a-z]$/i.test(input)) return;
+    // ESC-latch active: parent saw a bare ESC and is waiting for the letter half
+    // of a split Alt+key. Defer so parent's useInput can claim it.
+    if (isEscapeLatchActive && input && /^[a-z]$/i.test(input) && !key.ctrl && !key.meta && !key.escape) return;
 
     // ── Regular char input or paste ───────────────────────────────────
     // Ink may deliver multiple chars in a single `input` when stdin

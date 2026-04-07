@@ -8,6 +8,7 @@ import { ReplBridge } from './bridge.js';
 import { TrajectoryLogger, defaultTrajectoryPath } from './trajectory.js';
 import type { ReplConfig } from '../config/types.js';
 import type { CodeExecution, ReplResult, ReplEvent } from './types.js';
+import type { OriVault } from '../memory/vault.js';
 
 export interface ReplHandle {
   bridge: ReplBridge;
@@ -30,6 +31,8 @@ export interface SetupOptions {
   rlmModel?: string;
   /** Event callback (restart notifications, errors). */
   onEvent?: (e: ReplEvent) => void;
+  /** Vault reference for proxy callbacks. */
+  vault?: OriVault | null;
 }
 
 /**
@@ -90,6 +93,11 @@ export async function setupReplBridge(
   });
 
   await bridge.start();
+
+  // Give bridge the vault reference for proxy callbacks
+  if (opts.vault) {
+    bridge.setVault(opts.vault);
+  }
 
   // Optional: auto-connect vault at startup
   if (opts.vaultPath) {

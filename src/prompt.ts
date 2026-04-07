@@ -25,6 +25,8 @@ export interface PromptContext {
   vaultSignature?: string;
   /** Whether the Repl tool is available (Phase 7). */
   replEnabled?: boolean;
+  /** Experience log entries (project-local, cached prefix). */
+  experienceLog?: string;
 }
 
 /** Build the frozen system prompt (Layer 1). Compiled once at session start. */
@@ -49,7 +51,7 @@ export function buildSystemPrompt(ctx: PromptContext): string {
   // ── Goals ──────────────────────────────────────────────────────────────
   // NOT loaded from self/goals.md (goes stale within minutes of session start).
   // Fresh goals are injected per-turn via assembleCurrentState() → ori_orient().
-  // See src/memory/currentState.ts for the live path.
+  // Model calls ori_orient directly at session start.
 
   // ── User Model (from vault) ─────────────────────────────────────────────
   if (ctx.vaultIdentity?.userModel) {
@@ -101,7 +103,7 @@ You are a tool, not a narrator. Your output token budget is precious.
 
   // ── Memory ──────────────────────────────────────────────────────────────
   sections.push(`## Memory
-You have persistent memory — a knowledge graph with wiki-links, semantic embeddings, and learned retrieval weights. Your harness retrieves relevant notes before each turn via 5 parallel strategies (semantic, warmth, graph-adjacent, structurally similar, project brain). Notes tagged [CONTRADICTS] MUST be addressed. Use VaultExplore for manual graph traversal. When you learn something durable, say so — the harness will persist it. Context compaction preserves durable insights before summarizing. Nothing load-bearing is lost.`);
+You have persistent memory — a knowledge graph with wiki-links, semantic embeddings, and learned retrieval weights. Your harness retrieves relevant notes before each turn via compound preflight (semantic, warmth, graph-adjacent, structurally similar signals fused with server-side dedup and contradiction detection). Notes tagged [CONTRADICTS] MUST be addressed. Use VaultExplore for manual graph traversal. When you learn something durable, say so — the harness will persist it. Context compaction preserves durable insights before summarizing. Nothing load-bearing is lost.`);
 
   // ── Ambient Signatures (stable prefix, Phase 5-7) ──────────────────────
   // Loaded every turn. Gives the agent architectural + identity proprioception
@@ -113,6 +115,10 @@ You have persistent memory — a knowledge graph with wiki-links, semantic embed
   }
   if (ctx.vaultSignature) {
     sections.push(`# Memory Proprioception\n${ctx.vaultSignature}`);
+    hasAmbientSignature = true;
+  }
+  if (ctx.experienceLog) {
+    sections.push(`## Experience Log\n${ctx.experienceLog}`);
     hasAmbientSignature = true;
   }
   if (ctx.config.signature.cachePrefix && hasAmbientSignature) {

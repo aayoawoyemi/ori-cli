@@ -23,8 +23,9 @@ const EFFORT_SYMBOL: Record<string, string> = {
 const MODE_DISPLAY: Record<PermissionMode, { symbol: string; label: string; color: string } | null> = {
   default: null,
   accept: { symbol: figures.autoMode, label: 'accept edits on', color: colors.autoAccept },
-  plan: { symbol: figures.planMode, label: 'plan mode on', color: colors.permission },
-  yolo: { symbol: figures.autoMode, label: 'yolo on', color: colors.error },
+  plan: { symbol: figures.planMode, label: 'plan mode', color: colors.permission },
+  research: { symbol: figures.researchMode, label: 'research mode', color: colors.research },
+  yolo: { symbol: figures.autoMode, label: 'yolo', color: colors.error },
 };
 
 function formatTokens(n: number): string {

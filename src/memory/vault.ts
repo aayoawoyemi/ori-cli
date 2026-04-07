@@ -1,7 +1,24 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { createRequire } from 'node:module';
+
+// Resolve ori-memory binary from our own node_modules (installed as dependency).
+// Falls back to global 'ori-memory' command if resolution fails (dev / linked installs).
+let _oriMemoryBin: { cmd: string; args: string[] } | null = null;
+function getOriMemoryBin(): { cmd: string; args: string[] } {
+  if (_oriMemoryBin) return _oriMemoryBin;
+  try {
+    const require = createRequire(import.meta.url);
+    const entryPoint = require.resolve('ori-memory/dist/index.js');
+    _oriMemoryBin = { cmd: process.execPath, args: [entryPoint] };
+  } catch {
+    // Fallback: assume ori-memory is globally installed
+    _oriMemoryBin = { cmd: 'ori-memory', args: [] };
+  }
+  return _oriMemoryBin;
+}
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -53,10 +70,11 @@ class McpClient extends EventEmitter {
 
   async connect(vaultPath: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.proc = spawn('ori-memory', ['serve', '--mcp', '--vault', vaultPath], {
+      const bin = getOriMemoryBin();
+      this.proc = spawn(bin.cmd, [...bin.args, 'serve', '--mcp', '--vault', vaultPath], {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env },
-        shell: true, // Required on Windows to resolve .cmd shims
+        shell: bin.cmd === 'ori-memory', // Only need shell for global .cmd shim fallback
       });
 
       this.proc.stdout!.on('data', (chunk: Buffer) => {
@@ -261,7 +279,7 @@ export class OriVault {
 
   async queryWarmth(context: string, limit = 3): Promise<VaultNote[]> {
     try {
-      const result = await this.client.callTool('ori_query_warmth', {
+      const result = await this.client.callTool('ori_warmth', {
         query: context, limit,
       }) as { success: boolean; data?: { results: Array<{ title: string; score: number; source: string }> } };
 
@@ -336,6 +354,39 @@ export class OriVault {
       }));
     } catch {
       return [];
+    }
+  }
+
+  // ── Raw MCP access (used by REPL bridge for vault proxy callbacks) ────
+
+  async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+    return this.client.callTool(name, args);
+  }
+
+  // ── Compound Retrieval ──────────────────────────────────────────────────
+
+  /**
+   * Single-call preflight: ranked + warmth + explore + similar, deduped and
+   * contradiction-flagged server-side. Returns null if ori_preflight is not
+   * available (older Ori version), allowing fallback to 5-way fan-out.
+   */
+  async preflight(query: string, context?: string, limit = 12): Promise<{
+    notes: Array<{ title: string; score: number; source: string; contradicting: boolean }>;
+    contradictions: string[];
+    count: number;
+  } | null> {
+    try {
+      const result = await this.client.callTool('ori_preflight', {
+        query, context, limit, include_contradictions: true,
+      }) as { success: boolean; data?: {
+        notes: Array<{ title: string; score: number; source: string; contradicting: boolean }>;
+        contradictions: string[];
+        count: number;
+      } };
+
+      return result.data ?? null;
+    } catch {
+      return null; // Graceful fallback — ori_preflight not available
     }
   }
 

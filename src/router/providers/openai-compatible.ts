@@ -136,6 +136,10 @@ interface SSEChunk {
     prompt_tokens?: number;
     completion_tokens?: number;
     total_tokens?: number;
+    /** OpenAI-style cache breakdown (also used by Moonshot/Kimi). */
+    prompt_tokens_details?: {
+      cached_tokens?: number;
+    };
   };
 }
 
@@ -241,6 +245,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
     const pendingToolCalls = new Map<number, { id: string; name: string; args: string }>();
     let inputTokens = 0;
     let outputTokens = 0;
+    let cacheReadTokens = 0;
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -273,6 +278,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
           if (chunk.usage) {
             inputTokens = chunk.usage.prompt_tokens ?? 0;
             outputTokens = chunk.usage.completion_tokens ?? 0;
+            cacheReadTokens = chunk.usage.prompt_tokens_details?.cached_tokens ?? 0;
           }
 
           const choice = chunk.choices?.[0];
@@ -327,6 +333,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
       inputTokens,
       outputTokens,
       totalTokens: inputTokens + outputTokens,
+      cacheReadTokens,
     };
     yield { type: 'done' };
   }

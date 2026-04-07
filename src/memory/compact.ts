@@ -5,6 +5,7 @@ import type { ProjectBrain } from './projectBrain.js';
 import { estimateTokens } from '../utils/tokens.js';
 import { getMessageText } from '../utils/messages.js';
 import { getWarmContextForCompaction } from './warmContext.js';
+import { appendExperience } from './experienceLog.js';
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -76,6 +77,7 @@ async function extractAndSave(
   router: ModelRouter,
   projectBrain: ProjectBrain | null,
   vault: OriVault | null,
+  projectDir?: string,
 ): Promise<SavedInsight[]> {
   const conversationText = messages
     .filter(m => m.role === 'user' || m.role === 'assistant')
@@ -115,6 +117,13 @@ Return ONLY a JSON array: [{"title": "prose claim", "content": "brief explanatio
       } else if (insight.tier === 'project' && projectBrain) {
         projectBrain.save(insight.title, insight.content, insight.type || 'learning');
         saved.push({ ...insight, tier: 'project', destination: 'project' });
+      }
+    }
+
+    // Append to experience log (project-local ambient memory)
+    if (saved.length > 0 && projectDir) {
+      for (const s of saved) {
+        await appendExperience(projectDir, s.title).catch(() => {});
       }
     }
 
@@ -190,6 +199,7 @@ export async function runCompaction(
   vault: OriVault | null,
   router: ModelRouter,
   contextThreshold: number,
+  projectDir?: string,
 ): Promise<CompactResult> {
 
   // ── Phase 0: Prune ──────────────────────────────────────────────────
@@ -207,7 +217,7 @@ export async function runCompaction(
   }
 
   // ── Phase 1+2: Extract and save insights ────────────────────────────
-  const saved = await extractAndSave(messages, router, projectBrain, vault);
+  const saved = await extractAndSave(messages, router, projectBrain, vault, projectDir);
 
   // ── Phase 3: Structured summary ─────────────────────────────────────
   const summary = await generateStructuredSummary(messages, saved, router);
@@ -232,6 +242,28 @@ export async function runCompaction(
       },
     },
   ];
+
+  // ── Post-compaction breadcrumb ──────────────────────────────────────
+  // Write a lightweight vault note marking the compaction. Not forced into
+  // retrieval — just there if you go looking. Gives the model a felt sense
+  // of session compression history.
+  if (vault?.connected) {
+    const ts = new Date().toISOString();
+    const vaultCount = saved.filter(s => s.tier === 'vault').length;
+    const projectCount = saved.filter(s => s.tier === 'project').length;
+    const breadcrumbContent = [
+      `Session compacted at ${ts}.`,
+      `Insights saved: ${saved.length} total (${vaultCount} vault, ${projectCount} project brain).`,
+      saved.length > 0 ? `Saved: ${saved.map(s => `"${s.title}"`).join(', ')}.` : '',
+      `Summary excerpt: ${summary.slice(0, 200)}`,
+    ].filter(Boolean).join(' ');
+
+    await vault.add(
+      `Compaction at ${ts} — ${saved.length} insights saved`,
+      breadcrumbContent,
+      'learning',
+    ).catch(() => { /* breadcrumb failure is non-fatal */ });
+  }
 
   return {
     messages: compactedMessages,

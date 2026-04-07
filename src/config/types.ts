@@ -47,6 +47,17 @@ export interface ToolsConfig {
   maxSubagents: number;
 }
 
+export type WebSearchProvider = 'brave' | 'tavily' | 'serper' | 'serpapi';
+
+export interface WebSearchConfig {
+  /**
+   * Which search API to use. Env vars for each provider also work and take
+   * precedence over this config (BRAVE_SEARCH_API_KEY, TAVILY_API_KEY, etc.).
+   */
+  provider?: WebSearchProvider;
+  apiKey?: string;
+}
+
 export interface PermissionsConfig {
   mode: 'auto' | 'ask' | 'manual';
   allowBash: boolean;
@@ -135,7 +146,7 @@ export interface LocalConfig {
   models: Record<string, { path: string; contextWindow?: number }>;
 }
 
-export type DisplayMode = 'verbose' | 'normal' | 'quiet';
+export type DisplayMode = 'verbose' | 'normal' | 'quiet' | 'cerebral';
 
 export interface AriesConfig {
   agent: AgentConfig;
@@ -147,6 +158,7 @@ export interface AriesConfig {
   projectBrain: ProjectBrainConfig;
   compact: CompactConfig;
   tools: ToolsConfig;
+  webSearch: WebSearchConfig;
   permissions: PermissionsConfig;
   hooks: HooksConfig;
   repl: ReplConfig;

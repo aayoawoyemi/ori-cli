@@ -9,11 +9,16 @@ Protocol:
     {"op": "reset"}                             → {"ok": true}
     {"op": "shutdown"}                          → (process exits)
 
+  Vault callback protocol (during exec):
+    Python stdout: {"vault_request": {"id": 1, "method": "ori_query_ranked", "args": {...}}}
+    TS stdin:      {"vault_response": {"id": 1, "result": {...}}}
+
 Phase 1: minimal namespace (safe builtins only). Phases 2-4 add codebase,
 vault, rlm_call to the namespace.
 """
 import sys
 import json
+import threading
 import builtins as _builtins
 from pathlib import Path
 
@@ -28,7 +33,7 @@ _codebase_module = None
 _vault_module = None
 _rlm_module = None
 CODEBASE = None  # CodebaseGraph instance, exposed via REPL namespace
-VAULT = None  # Vault instance, exposed via REPL namespace
+VAULT = None  # Vault proxy instance, exposed via REPL namespace
 
 
 def _lazy_load_indexer():
@@ -140,7 +145,7 @@ def _build_namespace() -> dict:
     # Phase 2: expose codebase object if indexed
     if CODEBASE is not None:
         ns["codebase"] = CODEBASE
-    # Phase 3: expose vault object if connected
+    # Phase 3: expose vault proxy if connected
     if VAULT is not None:
         ns["vault"] = VAULT
     # Phase 4: expose rlm_call / rlm_batch if configured
@@ -159,34 +164,30 @@ def _rebuild_namespace():
 NAMESPACE = _build_namespace()
 DEFAULT_TIMEOUT_MS = 30000
 
+# Lock for stdout writes — both main thread and exec worker may write
+_stdout_lock = threading.Lock()
 
-def handle(msg: dict):
-    """Handle one JSON-RPC request. Returns response dict or None for shutdown."""
+
+def _write_response(response: dict) -> None:
+    """Thread-safe write to stdout."""
+    with _stdout_lock:
+        sys.__stdout__.write(json.dumps(response) + "\n")
+        sys.__stdout__.flush()
+
+
+def handle_sync(msg: dict):
+    """Handle synchronous (non-exec) ops. Returns response dict or None for shutdown."""
     global NAMESPACE, CODEBASE, VAULT
     op = msg.get("op")
 
     if op == "ping":
-        return {"pong": True, "version": "0.1.0-phase1"}
-
-    elif op == "exec":
-        code = msg.get("code", "")
-        timeout_ms = msg.get("timeout_ms", DEFAULT_TIMEOUT_MS)
-        # Reset rlm stats before exec, attach to result after
-        if _rlm_module is not None:
-            _rlm_module.reset_stats()
-        result = repl.execute(code, NAMESPACE, timeout_ms)
-        if _rlm_module is not None and _rlm_module.is_configured():
-            stats = _rlm_module.get_stats()
-            if stats["call_count"] > 0:
-                result["rlm_stats"] = stats
-        return result
+        return {"pong": True, "version": "0.2.0-single-mcp"}
 
     elif op == "reset":
         NAMESPACE = _build_namespace()
         return {"ok": True}
 
     elif op == "index":
-        # Build codebase graph
         repo_path = msg.get("repo_path", ".")
         include_exts = msg.get("include_exts")
         exclude_dirs = msg.get("exclude_dirs")
@@ -240,15 +241,10 @@ def handle(msg: dict):
             return {"error": f"signature failed: {e}", "traceback": traceback.format_exc()}
 
     elif op == "vault_signature":
+        # Handled in background thread via _run_vault_op (proxy deadlock prevention)
         if VAULT is None:
             return {"error": "vault not connected"}
-        try:
-            level = msg.get("level", "standard")
-            max_tokens = msg.get("max_tokens", 1500)
-            return VAULT.signature(level=level, max_tokens=max_tokens)
-        except Exception as e:
-            import traceback
-            return {"error": f"vault_signature failed: {e}", "traceback": traceback.format_exc()}
+        return {"error": "vault_signature should be routed to background thread"}
 
     elif op == "connect_vault":
         vault_path = msg.get("vault_path")
@@ -261,15 +257,15 @@ def handle(msg: dict):
                     VAULT.disconnect()
                 except Exception:
                     pass
+            # Create proxy — no MCP subprocess spawned.
+            # Vault calls route through TS bridge via stdout/stdin callbacks.
             VAULT = v_mod.Vault(vault_path)
-            VAULT.connect(timeout=15.0)
+            VAULT.connect()
             _rebuild_namespace()
-            status = VAULT.status()
             return {
                 "ok": True,
                 "vault_path": vault_path,
-                "note_count": status.get("noteCount"),
-                "inbox_count": status.get("inboxCount"),
+                "proxy": True,  # Signal to TS that this is the proxy pattern
             }
         except Exception as e:
             import traceback
@@ -286,12 +282,10 @@ def handle(msg: dict):
         return {"ok": True}
 
     elif op == "vault_status":
+        # Handled in background thread via _run_vault_op (proxy deadlock prevention)
         if VAULT is None:
             return {"error": "vault not connected"}
-        try:
-            return VAULT.status()
-        except Exception as e:
-            return {"error": str(e)}
+        return {"error": "vault_status should be routed to background thread"}
 
     elif op == "configure_rlm":
         api_key = msg.get("api_key")
@@ -317,9 +311,43 @@ def handle(msg: dict):
         return {"error": f"unknown op: {op}"}
 
 
+def _run_exec(msg: dict) -> None:
+    """Run exec in a thread, write result to stdout when done."""
+    code = msg.get("code", "")
+    timeout_ms = msg.get("timeout_ms", DEFAULT_TIMEOUT_MS)
+    if _rlm_module is not None:
+        _rlm_module.reset_stats()
+    result = repl.execute(code, NAMESPACE, timeout_ms)
+    if _rlm_module is not None and _rlm_module.is_configured():
+        stats = _rlm_module.get_stats()
+        if stats["call_count"] > 0:
+            result["rlm_stats"] = stats
+    _write_response(result)
+
+
+def _run_vault_op(op: str, msg: dict) -> None:
+    """Run vault ops in a thread so vault proxy callbacks don't deadlock."""
+    try:
+        if op == "vault_signature":
+            level = msg.get("level", "standard")
+            max_tokens = msg.get("max_tokens", 1500)
+            result = VAULT.signature(level=level, max_tokens=max_tokens)
+        elif op == "vault_status":
+            result = VAULT.status()
+        else:
+            result = {"error": f"unknown vault op: {op}"}
+        _write_response(result)
+    except Exception as e:
+        import traceback
+        _write_response({"error": f"{op} failed: {e}", "traceback": traceback.format_exc()})
+
+
 def main():
     sys.stderr.write("[body] ready\n")
     sys.stderr.flush()
+
+    # Track whether an exec is in flight so we know to route vault_responses
+    exec_thread: threading.Thread | None = None
 
     for line in sys.stdin:
         line = line.strip()
@@ -329,15 +357,48 @@ def main():
         try:
             msg = json.loads(line)
         except json.JSONDecodeError as e:
-            print(json.dumps({"error": f"bad json: {e}"}), flush=True)
+            _write_response({"error": f"bad json: {e}"})
             continue
 
-        response = handle(msg)
+        # Route vault responses to the proxy (arrives from TS during exec)
+        if "vault_response" in msg:
+            if VAULT is not None:
+                vr = msg["vault_response"]
+                VAULT.resolve(vr["id"], vr["result"])
+            continue
+
+        # If there's a previous exec thread, wait for it before accepting new ops
+        if exec_thread is not None:
+            exec_thread.join()
+            exec_thread = None
+
+        op = msg.get("op")
+
+        if op == "exec":
+            # Run exec in a background thread so the main loop stays responsive
+            # for vault_response messages that arrive during execution.
+            exec_thread = threading.Thread(target=_run_exec, args=(msg,), daemon=True)
+            exec_thread.start()
+            continue
+
+        # Vault ops that make proxy calls must also run in a thread to avoid
+        # deadlocking the main loop (proxy writes vault_request to stdout,
+        # then blocks waiting for vault_response on stdin — main loop must
+        # be free to route those responses).
+        if op in ("vault_signature", "vault_status") and VAULT is not None:
+            exec_thread = threading.Thread(target=_run_vault_op, args=(op, msg), daemon=True)
+            exec_thread.start()
+            continue
+
+        response = handle_sync(msg)
         if response is None:
-            # shutdown
-            print(json.dumps({"ok": True, "shutdown": True}), flush=True)
+            _write_response({"ok": True, "shutdown": True})
             break
-        print(json.dumps(response), flush=True)
+        _write_response(response)
+
+    # Clean up any running exec thread
+    if exec_thread is not None:
+        exec_thread.join(timeout=5.0)
 
 
 if __name__ == "__main__":
