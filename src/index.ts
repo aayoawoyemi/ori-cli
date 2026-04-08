@@ -53,6 +53,19 @@ interface AmbientSignatures {
   vaultSignatureMd?: string;
 }
 
+// Project markers — if none exist in cwd, skip codebase indexing
+const PROJECT_MARKERS = [
+  '.git', 'package.json', 'Cargo.toml', 'pyproject.toml', 'go.mod',
+  'pom.xml', 'build.gradle', 'Makefile', 'CMakeLists.txt', '.project',
+  'deno.json', 'composer.json', 'Gemfile', 'mix.exs', 'setup.py',
+];
+
+function isProjectDirectory(dir: string): boolean {
+  const { existsSync } = require('node:fs');
+  const { join } = require('node:path');
+  return PROJECT_MARKERS.some(marker => existsSync(join(dir, marker)));
+}
+
 async function compileAmbientSignatures(
   replHandle: ReplHandle,
   options: {
@@ -64,7 +77,10 @@ async function compileAmbientSignatures(
 ): Promise<AmbientSignatures> {
   const out: AmbientSignatures = {};
 
-  try {
+  // Skip codebase indexing if cwd isn't a project directory
+  if (!isProjectDirectory(options.cwd)) {
+    options.log?.('codebase signature: skipped (no project detected)');
+  } else try {
     const idxResult = await replHandle.bridge.index({ repoPath: options.cwd });
     if (idxResult.ok) {
       const sig = await replHandle.bridge.codebaseSignature(
