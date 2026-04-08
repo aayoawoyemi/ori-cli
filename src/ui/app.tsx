@@ -411,6 +411,7 @@ export function App(props: AppProps): React.ReactElement {
         identityContext: identityCtx,
         maxSubagents: 5,
         preflightEnabled,
+        dynamicTools: true,
         planFilePath: planFilePathRef.current ?? undefined,
         onPermissionRequest: (tc: ToolCall) => {
           return new Promise<PermissionDecision>((resolve) => {

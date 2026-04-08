@@ -54,7 +54,7 @@ export class AgentTool implements Tool {
     try {
       const result = await new Promise<string>((resolvePromise, reject) => {
         const child = fork(
-          resolve(import.meta.dirname ?? '.', 'index.js'),
+          resolve(import.meta.dirname ?? '.', '..', 'index.js'),
           childArgs,
           {
             cwd: agentCwd,
