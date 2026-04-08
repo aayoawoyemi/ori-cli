@@ -73,7 +73,8 @@ export function resumeFromSession(sessionPath: string): {
         // Start a new assistant buffer. If there's already one pending, flush it.
         flushAssistant();
         const e = entry as Extract<SessionEntry, { type: 'assistant' }>;
-        assistantBuffer = [{ type: 'text', text: e.content }];
+        // Skip empty text blocks — Anthropic API rejects messages with empty text content
+        assistantBuffer = e.content ? [{ type: 'text', text: e.content }] : [];
         break;
       }
       case 'tool_call': {

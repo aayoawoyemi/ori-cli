@@ -641,11 +641,42 @@ export function App(props: AppProps): React.ReactElement {
     setSessionTitle(label);
     setStreamSegments([]);
     segmentsRef.current = [];
-    setDisplayMessages([{
+
+    // Convert resumed messages into display messages so the user sees prior conversation
+    const historyDisplay: DisplayMessage[] = [{
       role: 'system',
       text: `Resumed: ${label} (${resumed.length} messages)`,
       subtype: 'info',
-    }]);
+    }];
+    for (const msg of resumed) {
+      if (msg.role === 'user') {
+        const text = typeof msg.content === 'string'
+          ? msg.content
+          : Array.isArray(msg.content)
+            ? msg.content
+                .filter((b: any) => b.type === 'text')
+                .map((b: any) => b.text)
+                .join('\n')
+            : '';
+        // Skip tool_result-only user messages and compaction markers
+        if (text && !text.startsWith('<compaction-summary>')) {
+          historyDisplay.push({ role: 'user', text });
+        }
+      } else if (msg.role === 'assistant') {
+        const text = typeof msg.content === 'string'
+          ? msg.content
+          : Array.isArray(msg.content)
+            ? msg.content
+                .filter((b: any) => b.type === 'text')
+                .map((b: any) => b.text)
+                .join('\n')
+            : '';
+        if (text) {
+          historyDisplay.push({ role: 'assistant', text });
+        }
+      }
+    }
+    setDisplayMessages(historyDisplay);
   }, [session]);
 
   // ── Slash commands ──────────────────────────────────────────────────

@@ -452,54 +452,7 @@ async function main(): Promise<void> {
   }
   console.log('');
 
-  let replHandle: ReplHandle | null = null;
-  let codebaseSignatureMd: string | undefined;
-  let vaultSignatureMd: string | undefined;
-
-  if (config.repl.enabled) {
-    try {
-      const anthropicKey = process.env.ANTHROPIC_API_KEY;
-      replHandle = await setupReplBridge({
-        config: config.repl,
-        cwd,
-        vaultPath: vaultPath ?? undefined,
-        anthropicApiKey: anthropicKey,
-        rlmModel: config.models.primary.model,
-        vault,
-        onEvent: (e) => {
-          if (e.type === 'bridge_restart' || e.type === 'bridge_error') {
-            console.error(chalk.yellow(`  [repl] ${e.type}`));
-          }
-        },
-      });
-      replHandleRef = replHandle;
-
-      if (replHandle) {
-        const parts: string[] = [config.repl.sandbox];
-        if (vaultPath) parts.push('vault');
-        if (anthropicKey) parts.push('rlm');
-        console.log(chalk.dim(`  repl: body ready (${parts.join(' + ')})`));
-
-        const sigs = await compileAmbientSignatures(replHandle, {
-          cwd,
-          vaultPath: vaultPath ?? undefined,
-          signature: config.signature,
-          log: (line, isError) => {
-            const msg = chalk.dim(`  ${line}`);
-            if (isError) console.error(chalk.yellow(msg));
-            else console.log(msg);
-          },
-        });
-        codebaseSignatureMd = sigs.codebaseSignatureMd;
-        vaultSignatureMd = sigs.vaultSignatureMd;
-      }
-    } catch (err) {
-      console.error(chalk.yellow(`  repl: disabled (${(err as Error).message})`));
-      replHandle = null;
-      replHandleRef = null;
-    }
-  }
-
+  // ── Build initial system prompt (no REPL yet — render immediately) ──
   const systemPrompt = buildSystemPrompt({
     cwd,
     config,
@@ -508,12 +461,13 @@ async function main(): Promise<void> {
     projectBrainCount: projectBrain?.count,
     vaultIdentity,
     warmContext,
-    codebaseSignature: codebaseSignatureMd,
-    vaultSignature: vaultSignatureMd,
-    replEnabled: !!replHandle,
+    codebaseSignature: undefined,
+    vaultSignature: undefined,
+    replEnabled: config.repl.enabled, // declare intent — REPL tool is registered even before bridge is ready
     experienceLog: readExperienceLog(cwd),
   });
 
+  // ── Render the Ink app IMMEDIATELY — user can type right away ──────
   const { waitUntilExit } = render(
     React.createElement(App, {
       agentName: agentLabel,
@@ -530,7 +484,7 @@ async function main(): Promise<void> {
       initialPermissionMode: config.permissions.mode === 'auto' ? 'yolo' as const
         : config.permissions.mode === 'manual' ? 'default' as const
           : 'default' as const,
-      replHandle,
+      replHandle: null, // will be set async
       preflightEnabled: resolvePreflightEnabled(config.preflight, config.repl.enabled),
       resumedMessages,
       initialResumePicker: resumeArg === '',
@@ -538,9 +492,54 @@ async function main(): Promise<void> {
     { exitOnCtrlC: false },
   );
 
+  // ── REPL bridge setup (background — doesn't block input) ──────────
+  if (config.repl.enabled) {
+    (async () => {
+      try {
+        const anthropicKey = process.env.ANTHROPIC_API_KEY;
+        const handle = await setupReplBridge({
+          config: config.repl,
+          cwd,
+          vaultPath: vaultPath ?? undefined,
+          anthropicApiKey: anthropicKey,
+          rlmModel: config.models.primary.model,
+          vault,
+          onEvent: (e) => {
+            if (e.type === 'bridge_restart' || e.type === 'bridge_error') {
+              console.error(chalk.yellow(`  [repl] ${e.type}`));
+            }
+          },
+        });
+        replHandleRef = handle;
+
+        if (handle) {
+          const parts: string[] = [config.repl.sandbox];
+          if (vaultPath) parts.push('vault');
+          if (anthropicKey) parts.push('rlm');
+          console.log(chalk.dim(`  repl: body ready (${parts.join(' + ')})`));
+
+          // Compile signatures in background — they'll be available for future turns
+          compileAmbientSignatures(handle, {
+            cwd,
+            vaultPath: vaultPath ?? undefined,
+            signature: config.signature,
+            log: (line, isError) => {
+              const msg = chalk.dim(`  ${line}`);
+              if (isError) console.error(chalk.yellow(msg));
+              else console.log(msg);
+            },
+          }).catch(() => {});
+        }
+      } catch (err) {
+        console.error(chalk.yellow(`  repl: disabled (${(err as Error).message})`));
+        replHandleRef = null;
+      }
+    })();
+  }
+
   await waitUntilExit();
   vault?.disconnect();
-  if (replHandle) await replHandle.shutdown();
+  if (replHandleRef) await replHandleRef.shutdown();
   process.exit(0);
 }
 
