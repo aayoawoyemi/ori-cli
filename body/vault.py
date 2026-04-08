@@ -215,6 +215,38 @@ class Vault:
             args["content"] = content
         return _unwrap_data(self._call("ori_add", args))
 
+    # -------- File Reading (bounded to vault) --------
+
+    def read(self, path: str) -> str:
+        """Read a file from the vault by relative path. Bounded to vault directory."""
+        import os
+        full = os.path.normpath(os.path.join(self._path, path))
+        if not full.startswith(os.path.normpath(self._path)):
+            raise VaultError(f"path escapes vault: {path}")
+        if not os.path.isfile(full):
+            raise VaultError(f"not found: {path}")
+        with open(full, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def get_note(self, title: str) -> str:
+        """Read a note by title (searches notes/, ops/, self/, inbox/)."""
+        import os
+        slug = title.lower().replace(" ", "-")
+        if not slug.endswith(".md"):
+            slug += ".md"
+        for prefix in ["notes", "ops", "self", "inbox"]:
+            candidate = os.path.join(prefix, slug)
+            full = os.path.normpath(os.path.join(self._path, candidate))
+            if os.path.isfile(full):
+                return self.read(candidate)
+        # Try as direct relative path
+        for variant in [slug, title if title.endswith(".md") else title + ".md", title]:
+            try:
+                return self.read(variant)
+            except VaultError:
+                continue
+        raise VaultError(f"note not found: {title}")
+
     # -------- Ambient Signature Compilation --------
 
     SCHEMA_VERSION = "0.1.0"
