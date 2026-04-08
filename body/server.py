@@ -62,6 +62,16 @@ def _lazy_load_rlm():
     return _rlm_module
 
 
+def _reindex(path: str) -> dict:
+    """Reindex the codebase on a new directory. Available in REPL as reindex()."""
+    global CODEBASE
+    idx_mod, cb_mod = _lazy_load_indexer()
+    idx_result = idx_mod.index_repo(path)
+    CODEBASE = cb_mod.CodebaseGraph(idx_result)
+    _rebuild_namespace()
+    return CODEBASE.stats()
+
+
 # Phase 1 namespace — safe builtins only. No codebase, no vault, no rlm_call yet.
 def _build_namespace() -> dict:
     # Essential language machinery needed by class statements, decorators, etc.
@@ -142,6 +152,8 @@ def _build_namespace() -> dict:
         "True": True,
         "False": False,
     }
+    # Always available: reindex to point the body at a different project
+    ns["reindex"] = _reindex
     # Phase 2: expose codebase object if indexed
     if CODEBASE is not None:
         ns["codebase"] = CODEBASE

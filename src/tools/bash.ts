@@ -156,7 +156,10 @@ export class BashTool implements Tool {
   }
 
   async execute(input: Record<string, unknown>, ctx: { cwd: string }): Promise<ToolResult> {
-    const command = input.command as string;
+    // Sanitize curly quotes from Windows terminals (ConPTY)
+    const command = (input.command as string)
+      .replace(/[\u201C\u201D]/g, '"')
+      .replace(/[\u2018\u2019]/g, "'");
     const timeout = Math.min((input.timeout as number) || 120_000, 600_000);
 
     // Constraint check

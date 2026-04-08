@@ -61,6 +61,15 @@ export function PromptInput({ onSubmit, onPasteError, model, isLoading }: Prompt
       return;
     }
 
+    // ESC clears input when idle (no text streaming, nothing loading)
+    if (key.escape && !input && !isLoading && value !== '') {
+      setValue('');
+      setImages([]);
+      imageCountRef.current = 0;
+      setPaletteIdx(0);
+      return;
+    }
+
     // Bare ESC with no char — first half of split Alt+key on Windows ConPTY
     if (key.escape && !input) {
       escapeLatchRef.current = true;

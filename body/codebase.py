@@ -141,6 +141,7 @@ class CodebaseGraph:
     def stats(self) -> dict:
         return {
             "schema_version": self.SCHEMA_VERSION,
+            "root": self.root,
             "file_count": self.file_count,
             "edge_count": self._edge_count,
             "symbol_count": sum(len(r.symbols) for r in self.files.values()),
