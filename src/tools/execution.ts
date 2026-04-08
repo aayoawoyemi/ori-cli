@@ -194,7 +194,16 @@ async function executeSingle(
   }
 
   try {
-    const result = await tool.execute(tc.input, ctx);
+    // Race tool execution against abort signal so Ctrl+C / Esc can interrupt stuck tools
+    const abortPromise = ctx.signal
+      ? new Promise<never>((_, reject) => {
+          if (ctx.signal!.aborted) reject(new DOMException('Aborted', 'AbortError'));
+          ctx.signal!.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+        })
+      : null;
+    const result = abortPromise
+      ? await Promise.race([tool.execute(tc.input, ctx), abortPromise])
+      : await tool.execute(tc.input, ctx);
     const finalResult = { ...result, id: tc.id };
 
     // ── PostToolUse hook (fire-and-forget) ─────────────────────────────
