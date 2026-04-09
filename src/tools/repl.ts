@@ -27,7 +27,7 @@ export class ReplTool implements Tool {
           code: {
             type: 'string',
             description:
-              'Python code to execute. Use print() to return output. Available: codebase.search/top_files/get_context/show_dependents/find_symbol/hits/communities, vault.query_ranked/query_important/query_warmth/explore/status, rlm_call(slice, question, budget), rlm_batch([(slice, q), ...], budget_per). Imports are forbidden; the namespace is pre-loaded.',
+              'Python code to execute. Use print() to return output. Available: fs.read(path, offset?, limit?) — read any file by absolute or relative path; codebase.search/top_files/get_context/show_dependents/find_symbol/hits/communities, vault.query_ranked/query_important/query_warmth/explore/status, rlm_call(slice, question, budget), rlm_batch([(slice, q), ...], budget_per). Imports are forbidden; the namespace is pre-loaded.',
           },
         },
         required: ['code'],

@@ -152,6 +152,22 @@ def _build_namespace() -> dict:
         "True": True,
         "False": False,
     }
+    # Always available: fs.read() for arbitrary file access
+    import types as _types
+    import pathlib as _pathlib
+
+    def _fs_read(path: str, offset: int = 0, limit: int | None = None) -> str:
+        p = _pathlib.Path(path).expanduser().resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"fs.read: no file at {p}")
+        if p.stat().st_size > 2_000_000:
+            raise ValueError(f"fs.read: file exceeds 2MB ({p.stat().st_size} bytes)")
+        text = p.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines(keepends=True)
+        end = offset + limit if limit is not None else len(lines)
+        return "".join(lines[offset:end])
+
+    ns["fs"] = _types.SimpleNamespace(read=_fs_read)
     # Always available: reindex to point the body at a different project
     ns["reindex"] = _reindex
     # Phase 2: expose codebase object if indexed
