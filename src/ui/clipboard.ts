@@ -9,7 +9,7 @@
  * is returned so it can be inserted as a placeholder in the input.
  */
 import { execSync } from 'node:child_process';
-import { mkdirSync, existsSync, readFileSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, tmpdir, platform } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -40,7 +40,10 @@ function readImageAsBase64(path: string): { base64: string; mediaType: string } 
 
 function windowsClipboard(): ClipboardResult {
   const dir = join(cacheDir(), randomUUID());
-  const imgPath = join(dir, 'paste.png').replace(/\\/g, '\\\\');
+  const imgPath = join(dir, 'paste.png');
+  // Escape single quotes for PowerShell string literals
+  const psDir = dir.replace(/'/g, "''");
+  const psImg = imgPath.replace(/'/g, "''");
   // Try image first; if clipboard has no image, fall through to text.
   const script = `
 try {
@@ -48,9 +51,9 @@ try {
   Add-Type -AssemblyName System.Drawing
   $img = [System.Windows.Forms.Clipboard]::GetImage()
   if ($img -ne $null) {
-    New-Item -ItemType Directory -Force -Path '${dir.replace(/\\/g, '\\\\')}' | Out-Null
-    $img.Save('${imgPath}', [System.Drawing.Imaging.ImageFormat]::Png)
-    Write-Output "IMAGE:${imgPath}"
+    New-Item -ItemType Directory -Force -Path '${psDir}' | Out-Null
+    $img.Save('${psImg}', [System.Drawing.Imaging.ImageFormat]::Png)
+    Write-Output "IMAGE:${psImg}"
     exit 0
   }
   $text = [System.Windows.Forms.Clipboard]::GetText()
@@ -65,10 +68,13 @@ try {
   exit 1
 }
 `;
+  // Write to temp .ps1 file — `-Command -` (stdin) breaks STA clipboard access on Windows
+  const ps1Path = join(tmpdir(), `aries-clip-${randomUUID()}.ps1`);
   try {
+    writeFileSync(ps1Path, script, 'utf-8');
     const out = execSync(
-      `powershell -NoProfile -NonInteractive -STA -Command -`,
-      { input: script, encoding: 'utf-8', timeout: 5000 },
+      `powershell -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File "${ps1Path}"`,
+      { encoding: 'utf-8', timeout: 5000 },
     );
     const trimmed = out.trimEnd();
     if (trimmed === 'EMPTY') return { type: 'empty' };
@@ -86,6 +92,8 @@ try {
     return { type: 'empty' };
   } catch (err) {
     return { type: 'error', reason: (err as Error).message.slice(0, 120) };
+  } finally {
+    try { unlinkSync(ps1Path); } catch { /* best-effort cleanup */ }
   }
 }
 

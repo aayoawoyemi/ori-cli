@@ -45,6 +45,12 @@ export interface ToolsConfig {
   maxResultChars: number;
   parallelReadTools: boolean;
   maxSubagents: number;
+  /**
+   * Enable dynamic tool exposure — only expose tools relevant to the current
+   * task phase (lean: Repl/Edit/Write/Bash/VaultAdd/ProjectSave). Widens to
+   * full if model requests a tool outside the lean set. Saves ~3-5K tokens/turn.
+   */
+  dynamicTools: boolean;
 }
 
 export type WebSearchProvider = 'brave' | 'tavily' | 'serper' | 'serpapi';

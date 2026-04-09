@@ -33,6 +33,7 @@ export const DEFAULT_CONFIG: AriesConfig = {
     maxResultChars: 10_000,
     parallelReadTools: true,
     maxSubagents: 5,
+    dynamicTools: true,
   },
   webSearch: {},
   permissions: {

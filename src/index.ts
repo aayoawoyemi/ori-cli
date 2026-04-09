@@ -442,7 +442,7 @@ async function main(): Promise<void> {
     ? `~/${vault.vaultPath?.split(/[/\\]/).pop() ?? 'brain'}`
     : '';
   const infoParts = [
-    'v1.0-beta',
+    'v1.0-beta.2',
     agentLabel !== 'Ori' ? agentLabel : null,
     vaultLabel || null,
   ].filter(Boolean) as string[];
@@ -462,7 +462,7 @@ async function main(): Promise<void> {
   // Ring + info line below the elephant
   if (!vault?.connected) {
     // No vault — nudge them toward setup
-    console.log(`  ${brightGold('○')}  ${chalk.dim('v1.0-beta')}  ${chalk.hex('#c4a46c')('type /setup to configure your vault')}`);
+    console.log(`  ${brightGold('○')}  ${chalk.dim('v1.0-beta.2')}  ${chalk.hex('#c4a46c')('type /setup to configure your vault')}`);
   } else {
     console.log(`  ${brightGold('○')}  ${infoLine}`);
   }
