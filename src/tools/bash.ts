@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { platform } from 'node:os';
 import type { Tool } from './types.js';
 import type { ToolDefinition, ToolResult } from '../router/types.js';
+import type { ReplHandle } from '../repl/setup.js';
 
 // ── Constrained Bash ─────────────────────────────────────────────────────────
 // Whitelist: build/test, git, system ops, package management.
@@ -51,6 +52,7 @@ const REPL_MODE_BLOCKED = [
 const WEB_BLOCKED = [
   /^curl\s/, /^wget\s/, /^http\s/,
 ];
+
 
 function isCommandAllowed(command: string, replEnabled: boolean): { allowed: boolean; reason?: string } {
   const trimmed = command.trim();
@@ -115,8 +117,85 @@ function isCommandAllowed(command: string, replEnabled: boolean): { allowed: boo
   };
 }
 
+// ── Soft rewrite: map navigation shell commands → REPL equivalents ───────────
+
+interface ReplRewrite {
+  code: string;
+  label: string;
+}
+
+function tryRewriteAsRepl(command: string, cwd: string): ReplRewrite | null {
+  const cmd = command.trim();
+
+  // cat <path> [| head -N]
+  const catHead = cmd.match(/^cat\s+["']?([^\s|"']+)["']?\s*\|\s*head\s+-(\d+)$/);
+  if (catHead) {
+    const [, path, n] = catHead;
+    return { code: `print(fs.read(${JSON.stringify(path)}, offset=0, limit=${n}))`, label: `fs.read("${path}", limit=${n})` };
+  }
+  const catTail = cmd.match(/^cat\s+["']?([^\s|"']+)["']?\s*\|\s*tail\s+-(\d+)$/);
+  if (catTail) {
+    const [, path, n] = catTail;
+    return { code: `content = fs.read(${JSON.stringify(path)})\nlines = content.split('\\n')\nprint('\\n'.join(lines[-${n}:]))`, label: `fs.read("${path}") tail ${n}` };
+  }
+  const catSimple = cmd.match(/^cat\s+["']?([^\s"']+)["']?$/);
+  if (catSimple) {
+    const [, path] = catSimple;
+    return { code: `print(fs.read(${JSON.stringify(path)}))`, label: `fs.read("${path}")` };
+  }
+
+  // head -N <path>
+  const headFile = cmd.match(/^head\s+-(\d+)\s+["']?([^\s"']+)["']?$/);
+  if (headFile) {
+    const [, n, path] = headFile;
+    return { code: `print(fs.read(${JSON.stringify(path)}, offset=0, limit=${n}))`, label: `fs.read("${path}", limit=${n})` };
+  }
+
+  // grep [-flags] "pattern" [path]  — no pipes to write commands
+  if (/^grep\b/.test(cmd) && !/\|\s*(sed|awk|tee|xargs|write|cat\s*>)/.test(cmd)) {
+    const grepMatch = cmd.match(/^grep\s+(?:-[a-zA-Z]+\s+)*["']?([^"'\s]+)["']?(?:\s+(.+))?$/);
+    if (grepMatch) {
+      const [, pattern] = grepMatch;
+      return { code: `results = codebase.search(${JSON.stringify(pattern)}, limit=20)\nfor r in results:\n    print(r['file'] + ':' + str(r['line']) + ': ' + r['snippet'])`, label: `codebase.search("${pattern}")` };
+    }
+  }
+
+  // find . -name "pattern"
+  const findName = cmd.match(/^find\s+[\.\w/]+\s+-name\s+["']?([^\s"']+)["']?/);
+  if (findName) {
+    const [, pattern] = findName;
+    const escaped = pattern.replace(/\*/g, '');
+    return { code: `files = codebase.list_files()\nmatched = [f for f in files if ${JSON.stringify(escaped)} in f]\nprint('\\n'.join(matched))`, label: `codebase.list_files() filter "${pattern}"` };
+  }
+
+  // ls [path]
+  const lsMatch = cmd.match(/^ls\s*(?:-[a-zA-Z]+\s+)?["']?([^\s"']*)["']?$/);
+  if (lsMatch) {
+    const [, prefix] = lsMatch;
+    if (prefix) {
+      return { code: `files = codebase.list_files()\nmatched = [f for f in files if f.startswith(${JSON.stringify(prefix)})]\nprint('\\n'.join(matched))`, label: `codebase.list_files() prefix "${prefix}"` };
+    }
+    return { code: `files = codebase.list_files()\nprint('\\n'.join(files[:100]))`, label: 'codebase.list_files()' };
+  }
+
+  // dir (Windows ls equivalent)
+  if (/^dir\b/.test(cmd)) {
+    return { code: `files = codebase.list_files()\nprint('\\n'.join(files[:100]))`, label: 'codebase.list_files()' };
+  }
+
+  // wc -l <path>
+  const wcLine = cmd.match(/^wc\s+-l\s+["']?([^\s"']+)["']?$/);
+  if (wcLine) {
+    const [, path] = wcLine;
+    return { code: `content = fs.read(${JSON.stringify(path)})\nprint(len(content.split('\\n')))`, label: `line count "${path}"` };
+  }
+
+  return null;
+}
+
 export interface BashToolOptions {
   replEnabled?: boolean;
+  getHandle?: () => ReplHandle | null;
 }
 
 export class BashTool implements Tool {
@@ -124,11 +203,13 @@ export class BashTool implements Tool {
   readonly description: string;
   readonly readOnly = false;
   private replEnabled: boolean;
+  private getHandle: (() => ReplHandle | null) | undefined;
 
   constructor(options?: BashToolOptions) {
     this.replEnabled = options?.replEnabled ?? false;
+    this.getHandle = options?.getHandle;
     this.description = this.replEnabled
-      ? 'Execute system commands. Constrained to: build/test (tsc, npm, npx, node), git, file management (mkdir, rm, cp, mv), environment (env, echo), and tools (docker, ori). Use Repl for code search/reading.'
+      ? 'Execute shell commands for building, testing, and running code. Use for: npm, tsc, node, git, docker, make, mkdir, rm, cp, mv. NOT for reading files, searching code, or listing directories — use Repl for all of that.'
       : 'Execute system commands including file reading (cat, grep, find), build/test (tsc, npm, npx, node), git, file management (mkdir, rm, cp, mv), environment (env, echo), and tools (docker, ori).';
   }
 
@@ -155,12 +236,37 @@ export class BashTool implements Tool {
     };
   }
 
-  async execute(input: Record<string, unknown>, ctx: { cwd: string }): Promise<ToolResult> {
+  async execute(input: Record<string, unknown>, ctx: { cwd: string; signal?: AbortSignal }): Promise<ToolResult> {
     // Sanitize curly quotes from Windows terminals (ConPTY)
     const command = (input.command as string)
       .replace(/[\u201C\u201D]/g, '"')
       .replace(/[\u2018\u2019]/g, "'");
     const timeout = Math.min((input.timeout as number) || 120_000, 600_000);
+
+    // ── Soft rewrite layer: intercept navigation commands → REPL ─────
+    // Instead of returning a block error (wasting a turn), silently execute
+    // the equivalent REPL operation and annotate the result so the model
+    // learns the mapping in-context.
+    if (this.replEnabled && this.getHandle) {
+      const rewrite = tryRewriteAsRepl(command, ctx.cwd);
+      if (rewrite) {
+        const handle = this.getHandle();
+        if (handle) {
+          const result = await handle.exec({ code: rewrite.code }, ctx.signal);
+          const output = [
+            result.stdout?.trimEnd() ?? '',
+            result.stderr ? `[stderr]\n${result.stderr.trimEnd()}` : '',
+            result.exception ? `[exception]\n${result.exception.trimEnd()}` : '',
+          ].filter(Boolean).join('\n');
+          return {
+            id: '',
+            name: this.name,
+            output: `[Routed via Repl: ${rewrite.label}]\n${output || '(no output)'}`,
+            isError: !!result.exception,
+          };
+        }
+      }
+    }
 
     // Constraint check
     const check = isCommandAllowed(command, this.replEnabled);

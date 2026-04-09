@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import type { Tool, ToolContext } from './types.js';
 import type { ToolDefinition, ToolResult } from '../router/types.js';
 import type { PlanContext } from './planTypes.js';
@@ -62,7 +63,7 @@ export class EnterPlanModeTool implements Tool {
     }
 
     const slug = generateSlug();
-    const plansDir = join(this.cwd, '.aries', 'plans');
+    const plansDir = join(tmpdir(), 'aries-plans');
     mkdirSync(plansDir, { recursive: true });
     const filePath = join(plansDir, `${slug}.md`);
     writeFileSync(filePath, '', 'utf-8');

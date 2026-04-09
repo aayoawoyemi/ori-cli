@@ -11,7 +11,8 @@ import { PlanApprovalDialog, type PlanAcceptMode } from './planApprovalDialog.js
 import { setTitleBusy, setTitleDone, setTitleIdle, flashTaskbar } from './terminal.js';
 import { registerPlanTools } from '../tools/registry.js';
 import type { PlanApprovalResult } from '../tools/planTypes.js';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdirSync, copyFileSync } from 'node:fs';
+import { join, basename } from 'node:path';
 import { ResumePicker } from './resumePicker.js';
 import { figures, colors } from './theme.js';
 import { UsageTracker, formatTokenCount, formatCost, formatDuration } from '../telemetry/tracker.js';
@@ -65,6 +66,7 @@ export function App(props: AppProps): React.ReactElement {
   const [activeTool, setActiveTool] = useState<string | undefined>();
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(initialPermissionMode ?? 'default');
+  const [taskMode, setTaskMode] = useState<'normal' | 'explore'>('normal');
   const [showPlanApproval, setShowPlanApproval] = useState(false);
   const [planApprovalData, setPlanApprovalData] = useState<{ path: string; content: string } | null>(null);
   const planFilePathRef = useRef<string | null>(null);
@@ -178,18 +180,48 @@ export function App(props: AppProps): React.ReactElement {
       return;
     }
 
+    // Alt+Q → "just plan" nudge (only in plan mode)
+    if (key.meta && input === 'q') {
+      if (!isLoading && permissionMode === 'plan') {
+        const nudge = 'Stop asking questions. Write the plan based on what we\'ve discussed and call ExitPlanMode.';
+        handleSubmit(nudge);
+      }
+      return;
+    }
+
+    // Alt+Z → toggle explore mode (Repl-only, no mutations)
+    if (key.meta && input === 'z') {
+      if (!isLoading) {
+        setTaskMode(prev => {
+          const next = prev === 'normal' ? 'explore' : 'normal';
+          setDisplayMessages(p => [...p, {
+            role: 'system',
+            text: next === 'explore'
+              ? '🔍 Explore mode — read-only. Only Repl, VaultAdd, ProjectSave visible. Alt+Z to exit.'
+              : '⚡ Normal mode restored.',
+            subtype: 'info',
+          }]);
+          return next;
+        });
+      }
+      return;
+    }
+
     // Alt+M (meta+m) or Shift+Tab → cycle permission mode
     if ((key.meta && input === 'm') || (key.shift && key.tab)) {
       if (!isLoading) {
-        // If in plan mode, Alt+M keeps planning (use /plan off or ExitPlanMode to exit)
-        if (permissionMode === 'plan') {
-          setDisplayMessages(p => [...p, { role: 'system', text: `${figures.planMode} Already in plan mode. Use /plan off or let the model call ExitPlanMode.`, subtype: 'info' }]);
-          return;
-        }
         setPermissionMode(prev => {
           const modes: PermissionMode[] = ['default', 'accept', 'plan', 'research', 'yolo'];
           const idx = modes.indexOf(prev);
           const next = modes[(idx + 1) % modes.length]!;
+
+          // Leaving plan mode → unregister plan tools
+          if (prev === 'plan' && next !== 'plan') {
+            registry.unregister('EnterPlanMode');
+            registry.unregister('ExitPlanMode');
+            planFilePathRef.current = null;
+            setDisplayMessages(p => [...p, { role: 'system', text: `${figures.planMode} Exited plan mode → ${next}. Plan file preserved if written.`, subtype: 'info' }]);
+          }
 
           // Entering plan mode → register plan tools + inject directive
           if (next === 'plan') {
@@ -274,6 +306,20 @@ export function App(props: AppProps): React.ReactElement {
       } catch { /* file read error — fall through */ }
     }
 
+    if (mode === 'save_plan' && planFilePathRef.current) {
+      try {
+        const plansDir = join(cwd, '.aries', 'plans');
+        mkdirSync(plansDir, { recursive: true });
+        const dest = join(plansDir, basename(planFilePathRef.current));
+        copyFileSync(planFilePathRef.current, dest);
+        setDisplayMessages(prev => [...prev, {
+          role: 'system',
+          text: `${figures.planMode} Plan saved to ${dest}`,
+          subtype: 'info',
+        }]);
+      } catch { /* copy error — temp file still exists */ }
+    }
+
     const nextMode = mode === 'accept_edits' ? 'accept' as PermissionMode : prePlanModeRef.current;
     setPermissionMode(nextMode);
     registry.unregister('EnterPlanMode');
@@ -281,7 +327,7 @@ export function App(props: AppProps): React.ReactElement {
     planFilePathRef.current = null;
     setDisplayMessages(prev => [...prev, {
       role: 'system',
-      text: `${figures.autoMode} Plan approved — now in ${nextMode} mode. Plan saved at .aries/plans/.`,
+      text: `${figures.autoMode} Plan approved — now in ${nextMode} mode.`,
       subtype: 'info',
     }]);
   }, [registry]);
@@ -412,7 +458,8 @@ export function App(props: AppProps): React.ReactElement {
         maxSubagents: 5,
         preflightEnabled,
         dynamicTools: true,
-        planFilePath: planFilePathRef.current ?? undefined,
+        planFilePathRef,
+        taskMode,
         onPermissionRequest: (tc: ToolCall) => {
           return new Promise<PermissionDecision>((resolve) => {
             setPendingPermission({ toolCall: tc, resolve });
@@ -1483,6 +1530,7 @@ export function App(props: AppProps): React.ReactElement {
               isLoading={isLoading}
               permissionMode={permissionMode}
               sessionTitle={sessionTitle}
+              taskMode={taskMode}
             />
           </>
         )}

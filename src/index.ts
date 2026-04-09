@@ -24,6 +24,9 @@ import { assembleWarmContext } from './memory/warmContext.js';
 import { setupReplBridge, type ReplHandle } from './repl/setup.js';
 import { registerReplTool } from './tools/registry.js';
 import { resolvePreflightEnabled } from './memory/preflight.js';
+import { checkForUpdate, getLocalVersion } from './update/check.js';
+import { printUpdateNotification } from './update/notify.js';
+import type { UpdateResult } from './update/check.js';
 
 // ── Parchment Terminal ──────────────────────────────────────────────────
 // Set warm walnut background + cream foreground via OSC escape sequences.
@@ -62,7 +65,12 @@ const PROJECT_MARKERS = [
 
 function isProjectDirectory(dir: string): boolean {
   const { existsSync } = require('node:fs');
-  const { join } = require('node:path');
+  const { join, resolve } = require('node:path');
+  const home = homedir();
+  const resolved = resolve(dir);
+  // Never index the home directory — stray config files (package.json etc.)
+  // can trick the marker check, and indexing ~/ is always catastrophic.
+  if (resolved === resolve(home)) return false;
   return PROJECT_MARKERS.some(marker => existsSync(join(dir, marker)));
 }
 
@@ -178,7 +186,7 @@ ${chalk.dim('In-session commands:')}
 `);
     process.exit(0);
   } else if (args[i] === '--version') {
-    console.log('0.1.0');
+    console.log(getLocalVersion());
     process.exit(0);
   } else if (args[i] === '--read-only') {
     readOnlyMode = true;
@@ -192,6 +200,11 @@ ${chalk.dim('In-session commands:')}
 const config = loadConfig(cwd);
 process.env.TZ = config.timezone;
 const isSubagent = process.env.ARIES_SUBAGENT === '1';
+
+// Fire update check early — non-blocking, resolves in background
+const updateCheckPromise: Promise<UpdateResult | null> = isSubagent
+  ? Promise.resolve(null)
+  : checkForUpdate().catch(() => null);
 
 const detection = detectExistingSetup(cwd, config.vault.path);
 if (!isSubagent && detection.isFirstRun) {
@@ -289,10 +302,10 @@ if (continueSession) {
 }
 
 const router = new ModelRouter(config.models, config.experimental);
-const registry = createCoreRegistry({ replEnabled: config.repl.enabled, webSearch: config.webSearch });
+let replHandleRef: ReplHandle | null = null;
+const registry = createCoreRegistry({ replEnabled: config.repl.enabled, webSearch: config.webSearch, getHandle: () => replHandleRef });
 registerMemoryTools(registry, vault, projectBrain);
 
-let replHandleRef: ReplHandle | null = null;
 if (config.repl.enabled) {
   registerReplTool(registry, () => replHandleRef);
 }
@@ -319,6 +332,7 @@ if (isSubagent) {
 
   let subCodebaseSignatureMd: string | undefined;
   let subVaultSignatureMd: string | undefined;
+  const isProject = isProjectDirectory(cwd);
 
   if (config.signature.includeInSubagents && config.repl.enabled) {
     let subRepl: ReplHandle | null = null;
@@ -330,6 +344,7 @@ if (isSubagent) {
         anthropicApiKey: process.env.ANTHROPIC_API_KEY,
         rlmModel: config.models.primary.model,
         vault,
+        shouldIndex: isProject,
       });
       if (subRepl) {
         const sigs = await compileAmbientSignatures(subRepl, {
@@ -438,11 +453,12 @@ async function main(): Promise<void> {
     ' ██████  ██   ██ ██     ██████ ██████  ██',
   ];
 
+  const cliVersion = `v${getLocalVersion()}`;
   const vaultLabel = vault?.connected
     ? `~/${vault.vaultPath?.split(/[/\\]/).pop() ?? 'brain'}`
     : '';
   const infoParts = [
-    'v0.2.0',
+    cliVersion,
     agentLabel !== 'Ori' ? agentLabel : null,
     vaultLabel || null,
   ].filter(Boolean) as string[];
@@ -462,11 +478,15 @@ async function main(): Promise<void> {
   // Ring + info line below the elephant
   if (!vault?.connected) {
     // No vault — nudge them toward setup
-    console.log(`  ${brightGold('○')}  ${chalk.dim('v0.2.0')}  ${chalk.hex('#c4a46c')('type /setup to configure your vault')}`);
+    console.log(`  ${brightGold('○')}  ${chalk.dim(cliVersion)}  ${chalk.hex('#c4a46c')('type /setup to configure your vault')}`);
   } else {
     console.log(`  ${brightGold('○')}  ${infoLine}`);
   }
   console.log('');
+
+  // ── Update notification (non-blocking, already started) ─────────────
+  const updateResult = await updateCheckPromise;
+  printUpdateNotification(updateResult);
 
   // ── Build initial system prompt (no REPL yet — render immediately) ──
   const systemPrompt = buildSystemPrompt({
@@ -520,6 +540,7 @@ async function main(): Promise<void> {
           anthropicApiKey: anthropicKey,
           rlmModel: config.models.primary.model,
           vault,
+          shouldIndex: isProjectDirectory(cwd),
           onEvent: (e) => {
             if (e.type === 'bridge_restart' || e.type === 'bridge_error') {
               console.error(chalk.yellow(`  [repl] ${e.type}`));

@@ -1,6 +1,6 @@
 {
-  "name": "@ori-memory/cli",
-  "version": "0.2.0",
+  "name": "@orimnemos/cli",
+  "version": "0.3.0",
   "description": "Memory-native coding agent CLI. Built on Ori Mnemos.",
   "type": "module",
   "bin": {

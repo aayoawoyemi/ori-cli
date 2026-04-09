@@ -9,5 +9,5 @@ export interface PlanContext {
 
 /** Result from the plan approval dialog. */
 export type PlanApprovalResult =
-  | { action: 'accepted'; mode: 'keep_context' | 'clear_context' | 'accept_edits' }
+  | { action: 'accepted'; mode: 'keep_context' | 'clear_context' | 'accept_edits' | 'save_plan' }
   | { action: 'rejected'; feedback: string };

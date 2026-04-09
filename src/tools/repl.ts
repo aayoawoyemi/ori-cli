@@ -12,7 +12,7 @@ import type { ReplHandle } from '../repl/setup.js';
 export class ReplTool implements Tool {
   readonly name = 'Repl';
   readonly description =
-    'Execute Python in the body subprocess. Use for code exploration, memory retrieval, and any compositional work. Available objects: codebase, vault, rlm_call, rlm_batch. This is the PREFERRED way to navigate code and memory — it composes operations in one turn.';
+    'Primary tool for all code exploration, file reading, memory retrieval, and compositional reasoning. Use this first — before Bash, before anything else. Available: codebase.search/get_context/find_symbol/list_files, fs.read(path), vault.query_ranked/explore, rlm_call/rlm_batch. Composes multiple operations in one call. Far more efficient than shell commands for reading or searching.';
   readonly readOnly = false;
 
   constructor(private getHandle: () => ReplHandle | null) {}

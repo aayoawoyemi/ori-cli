@@ -7,7 +7,7 @@ import { colors, figures } from './theme.js';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
-export type PlanAcceptMode = 'keep_context' | 'clear_context' | 'accept_edits';
+export type PlanAcceptMode = 'keep_context' | 'clear_context' | 'accept_edits' | 'save_plan';
 
 export interface PlanApprovalDialogProps {
   planFilePath: string;
@@ -19,8 +19,6 @@ export interface PlanApprovalDialogProps {
 }
 
 // ── Component ──────────────────────────────────────────────────────────────
-
-const MAX_PREVIEW_LINES = 25;
 
 export function PlanApprovalDialog({
   planFilePath,
@@ -38,7 +36,8 @@ export function PlanApprovalDialog({
     { key: '1', label: 'Accept — continue working', action: () => onAccept('keep_context') },
     { key: '2', label: 'Accept — clear context, inject plan', action: () => onAccept('clear_context') },
     { key: '3', label: 'Accept — auto-accept edits', action: () => onAccept('accept_edits') },
-    { key: '4', label: 'Reject — give feedback', action: () => setMode('feedback') },
+    { key: '4', label: 'Accept — save plan to .aries/plans/', action: () => onAccept('save_plan') },
+    { key: '5', label: 'Reject — give feedback', action: () => setMode('feedback') },
   ];
 
   const editInEditor = useCallback(() => {
@@ -63,7 +62,7 @@ export function PlanApprovalDialog({
       return;
     }
 
-    // Number shortcuts
+    // Number shortcuts (1-5)
     const num = parseInt(input, 10);
     if (num >= 1 && num <= options.length) {
       options[num - 1]!.action();
@@ -91,11 +90,12 @@ export function PlanApprovalDialog({
     }
   });
 
-  // Preview: truncate long plans
-  const lines = planContent.split('\n');
-  const truncated = lines.length > MAX_PREVIEW_LINES;
-  const preview = truncated
-    ? lines.slice(0, MAX_PREVIEW_LINES).join('\n') + `\n... (${lines.length - MAX_PREVIEW_LINES} more lines)`
+  // Show full plan, using terminal height as the natural limit
+  const termRows = process.stdout.rows || 40;
+  const scrollLines = Math.max(10, termRows - 16);
+  const planLines = planContent.split('\n');
+  const preview = planLines.length > scrollLines
+    ? planLines.slice(0, scrollLines).join('\n') + `\n... (${planLines.length - scrollLines} more lines — Ctrl+G to open in $EDITOR)`
     : planContent;
 
   const cols = (process.stdout.columns || 80) - 2;

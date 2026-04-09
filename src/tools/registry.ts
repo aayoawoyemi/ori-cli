@@ -57,10 +57,10 @@ export class ToolRegistry {
 }
 
 /** Create a registry with all core tools. */
-export function createCoreRegistry(options?: { replEnabled?: boolean; webSearch?: WebSearchConfig }): ToolRegistry {
+export function createCoreRegistry(options?: { replEnabled?: boolean; webSearch?: WebSearchConfig; getHandle?: () => ReplHandle | null }): ToolRegistry {
   const registry = new ToolRegistry();
   // Core filesystem tools
-  registry.register(new BashTool({ replEnabled: options?.replEnabled }));
+  registry.register(new BashTool({ replEnabled: options?.replEnabled, getHandle: options?.getHandle }));
   registry.register(new ReadTool());
   registry.register(new WriteTool());
   registry.register(new EditTool());

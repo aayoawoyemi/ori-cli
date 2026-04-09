@@ -33,6 +33,8 @@ export interface SetupOptions {
   onEvent?: (e: ReplEvent) => void;
   /** Vault reference for proxy callbacks. */
   vault?: OriVault | null;
+  /** Whether to auto-index the codebase. Set false when cwd is not a project dir. */
+  shouldIndex?: boolean;
 }
 
 /**
@@ -57,13 +59,15 @@ export async function setupReplBridge(
     onRestart: async () => {
       // Re-initialize everything after body process restarts.
       // Without this, codebase/vault/rlm_call are undefined after restart.
-      try {
-        await bridge.index({ repoPath: opts.cwd });
-      } catch (err) {
-        opts.onEvent?.({
-          type: 'bridge_error',
-          error: `post-restart re-index failed: ${(err as Error).message}`,
-        });
+      if (opts.shouldIndex !== false) {
+        try {
+          await bridge.index({ repoPath: opts.cwd });
+        } catch (err) {
+          opts.onEvent?.({
+            type: 'bridge_error',
+            error: `post-restart re-index failed: ${(err as Error).message}`,
+          });
+        }
       }
       if (opts.vaultPath) {
         try {

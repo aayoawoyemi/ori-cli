@@ -12,6 +12,7 @@ interface StatusBarProps {
   isLoading: boolean;
   permissionMode?: PermissionMode;
   sessionTitle?: string | null;
+  taskMode?: 'normal' | 'explore';
 }
 
 const EFFORT_SYMBOL: Record<string, string> = {
@@ -42,7 +43,7 @@ function progressBar(fraction: number, width: number): string {
 }
 
 export function StatusBar({
-  model, effort, tokenCount, contextWindow, vaultNotes, isLoading, permissionMode = 'default', sessionTitle,
+  model, effort, tokenCount, contextWindow, vaultNotes, isLoading, permissionMode = 'default', sessionTitle, taskMode = 'normal',
 }: StatusBarProps): React.ReactElement {
   const pct = contextWindow > 0 ? Math.round((tokenCount / contextWindow) * 100) : 0;
   const effortSym = EFFORT_SYMBOL[effort] ?? figures.effortMedium;
@@ -72,7 +73,16 @@ export function StatusBar({
       {modeInfo ? (
         <Box flexDirection="row">
           <Text color={modeInfo.color}>{modeInfo.symbol} {modeInfo.label}</Text>
-          <Text dimColor> (meta+m to cycle)</Text>
+          {permissionMode === 'plan'
+            ? <Text dimColor> (meta+q: finish plan · meta+m to cycle)</Text>
+            : <Text dimColor> (meta+m to cycle)</Text>
+          }
+        </Box>
+      ) : null}
+      {taskMode === 'explore' ? (
+        <Box flexDirection="row">
+          <Text color={colors.research}>🔍 explore mode</Text>
+          <Text dimColor> (meta+z to exit)</Text>
         </Box>
       ) : null}
     </Box>

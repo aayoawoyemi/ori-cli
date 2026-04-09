@@ -83,8 +83,10 @@ export interface LoopParams {
    * Default: false (expose all tools every turn, backwards-compatible).
    */
   dynamicTools?: boolean;
-  /** Path to the plan file (set when EnterPlanMode runs). Write/Edit clamped to this file in plan mode. */
-  planFilePath?: string;
+  /** Ref to the plan file path (set when EnterPlanMode runs). Using a ref so loop reads live value. */
+  planFilePathRef?: { current: string | null };
+  /** Task mode: 'explore' restricts to Repl + VaultAdd + ProjectSave only. */
+  taskMode?: 'normal' | 'explore';
 }
 
 // ── Result Budget ───────────────────────────────────────────────────────────
@@ -141,7 +143,8 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     preflightEnabled = true,
     onFileMutated,
     dynamicTools = false,
-    planFilePath,
+    planFilePathRef,
+    taskMode = 'normal',
   } = params;
 
   const allTools: ToolDefinition[] = registry.definitions();
@@ -198,11 +201,16 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     const budgetedMessages = applyResultBudget(messages, maxResultChars);
 
     // ── TOOL FILTERING (structural enforcement) ────────────────────
+    // Explore mode (highest priority): Repl + VaultAdd + ProjectSave only.
     // Plan mode: read-only tools + Write/Edit (clamped to plan file at execution).
     // Research mode: read-only tools only.
     // Dynamic tools: only expose tools for the current task phase.
     let activeTools: ToolDefinition[];
-    if (permissionMode === 'plan') {
+    if (taskMode === 'explore') {
+      activeTools = allTools.filter(t =>
+        t.name === 'Repl' || t.name === 'VaultAdd' || t.name === 'ProjectSave'
+      );
+    } else if (permissionMode === 'plan') {
       activeTools = allTools.filter(t => {
         if (registry.isReadOnly(t.name)) return true;
         // Write/Edit included in schema — enforced to plan file at execution time
@@ -219,7 +227,32 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       activeTools = allTools;
     }
 
+    // ── Explore mode reminder ─────────────────────────────────────────
+    if (taskMode === 'explore') {
+      let lastUserIdx = -1;
+      for (let i = budgetedMessages.length - 1; i >= 0; i--) {
+        if (budgetedMessages[i]!.role === 'user') { lastUserIdx = i; break; }
+      }
+      if (lastUserIdx >= 0 && typeof budgetedMessages[lastUserIdx]!.content === 'string') {
+        const content = budgetedMessages[lastUserIdx]!.content as string;
+        if (!content.includes('EXPLORE mode')) {
+          budgetedMessages[lastUserIdx] = {
+            ...budgetedMessages[lastUserIdx]!,
+            content: `<system-reminder>You are in EXPLORE mode. You can only use Repl, VaultAdd, and ProjectSave. No file modifications, no shell commands. If the user asks you to make changes, tell them to switch to Normal mode (Alt+Z).</system-reminder>\n\n${content}`,
+          };
+        }
+      }
+    }
+
     // ── Plan mode sparse reminder (survives compaction) ──────────────
+    const planFilePath = planFilePathRef?.current ?? null;
+
+    // ── Plan mode Gate 1: force EnterPlanMode if no plan file yet ────
+    if (permissionMode === 'plan' && !planFilePath) {
+      const enterTool = allTools.find(t => t.name === 'EnterPlanMode');
+      if (enterTool) activeTools = [enterTool];
+    }
+
     if (permissionMode === 'plan' && planFilePath) {
       let lastUserIdx = -1;
       for (let i = budgetedMessages.length - 1; i >= 0; i--) {
@@ -297,18 +330,23 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       const deniedResults: { id: string; name: string; output: string; isError: boolean }[] = [];
 
       for (const tc of toolCalls) {
-        // Plan mode: clamp Write/Edit to plan file only
-        if (permissionMode === 'plan' && (tc.name === 'Write' || tc.name === 'Edit')) {
-          const targetPath = resolve(toolContext.cwd, tc.input.file_path as string);
-          const planPath = planFilePath ? resolve(planFilePath) : null;
-          if (planPath && targetPath === planPath) {
-            approvedCalls.push(tc);
+        // Plan mode: clamp Write/Edit to plan file only, auto-approve everything else
+        if (permissionMode === 'plan') {
+          if (tc.name === 'Write' || tc.name === 'Edit') {
+            const targetPath = resolve(toolContext.cwd, tc.input.file_path as string);
+            const planPath = planFilePath ? resolve(planFilePath) : null;
+            if (planPath && targetPath === planPath) {
+              approvedCalls.push(tc); // auto-approve — it's the plan file
+            } else {
+              deniedResults.push({
+                id: tc.id, name: tc.name,
+                output: `In plan mode, only the plan file is writable: ${planPath ?? '(call EnterPlanMode first)'}`,
+                isError: true,
+              });
+            }
           } else {
-            deniedResults.push({
-              id: tc.id, name: tc.name,
-              output: `In plan mode, only the plan file is writable: ${planPath ?? '(call EnterPlanMode first)'}`,
-              isError: true,
-            });
+            // Everything else in plan mode (reads, ExitPlanMode) auto-approved
+            approvedCalls.push(tc);
           }
           continue;
         }
@@ -399,6 +437,24 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       }
 
       continue;
+    }
+
+    // ── Plan mode Gate 2: force continuation if model dumps text without ExitPlanMode ──
+    if (permissionMode === 'plan' && planFilePath) {
+      // Model responded with text only — it must call ExitPlanMode or AskUserQuestion to end.
+      // Inject a system nudge and continue the loop (max 2 forced continuations).
+      const forcedKey = '__planForcedContinuations';
+      const forced = ((params as unknown as Record<string, unknown>)[forcedKey] as number) ?? 0;
+      if (forced < 2) {
+        (params as unknown as Record<string, unknown>)[forcedKey] = forced + 1;
+        messages.push({ role: 'assistant', content: assistantText });
+        messages.push({
+          role: 'user',
+          content: `<system-reminder>You're still in plan mode. Write your plan to the plan file and call ExitPlanMode, or ask the user a question with AskUserQuestion. Do not end turns with text only.</system-reminder>`,
+        });
+        turnCount++;
+        continue;
+      }
     }
 
     // ── TURN COMPLETE (text-only response) ───────────────────────────
