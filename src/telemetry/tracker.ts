@@ -56,6 +56,9 @@ const COST_PER_M: Record<string, CostTier> = {
   // Qwen (DashScope)
   'qwen3.6-plus':                 { input: 0.8, output: 2,   cacheRead: 0.2, cacheWrite: 0.8 },
   'qwen3-235b-a22b':              { input: 0.8, output: 2,   cacheRead: 0.2, cacheWrite: 0.8 },
+  // Gemma 4 (via OpenRouter)
+  'google/gemma-4-26b-a4b-it':      { input: 0.12, output: 0.40, cacheRead: 0.12, cacheWrite: 0.12 },
+  'google/gemma-4-26b-a4b-it:free': { input: 0,    output: 0,    cacheRead: 0,    cacheWrite: 0 },
   // Groq (free tier for now)
   'llama-3.3-70b-versatile':      { input: 0.59, output: 0.79, cacheRead: 0, cacheWrite: 0 },
 };

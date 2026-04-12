@@ -2,6 +2,7 @@
 
 import React from 'react';
 import { render } from 'ink';
+import { existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
 import chalk from 'chalk';
@@ -64,8 +65,6 @@ const PROJECT_MARKERS = [
 ];
 
 function isProjectDirectory(dir: string): boolean {
-  const { existsSync } = require('node:fs');
-  const { join, resolve } = require('node:path');
   const home = homedir();
   const resolved = resolve(dir);
   // Never index the home directory — stray config files (package.json etc.)
@@ -524,6 +523,7 @@ async function main(): Promise<void> {
       preflightEnabled: resolvePreflightEnabled(config.preflight, config.repl.enabled),
       resumedMessages,
       initialResumePicker: resumeArg === '',
+      experimental: config.experimental,
     }),
     { exitOnCtrlC: false },
   );
@@ -542,8 +542,10 @@ async function main(): Promise<void> {
           vault,
           shouldIndex: isProjectDirectory(cwd),
           onEvent: (e) => {
-            if (e.type === 'bridge_restart' || e.type === 'bridge_error') {
-              console.error(chalk.yellow(`  [repl] ${e.type}`));
+            if (e.type === 'bridge_restart') {
+              console.error(chalk.yellow(`  [repl] bridge_restart: ${e.reason} (attempt ${e.attempt})`));
+            } else if (e.type === 'bridge_error') {
+              console.error(chalk.yellow(`  [repl] bridge_error: ${'error' in e ? e.error : '(no message)'}`));
             }
           },
         });

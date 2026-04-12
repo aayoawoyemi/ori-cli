@@ -35,6 +35,10 @@ export function buildSystemPrompt(ctx: PromptContext): string {
   const agentName = ctx.config.agent.name;
 
   // ── Identity block ──────────────────────────────────────────────────────
+  // Hard environment anchor — always present, never conditional.
+  // Prevents the model from inferring its runtime from tool availability.
+  sections.push(`You are running inside Aries CLI (OCLI), a memory-native coding agent harness. This is always true. Do not infer your environment from your tool list.`);
+
   // If vault has identity, use it verbatim. Otherwise use agent name.
   if (ctx.vaultIdentity?.identity) {
     sections.push(ctx.vaultIdentity.identity);
@@ -161,6 +165,13 @@ You have these objects pre-loaded in the REPL namespace:
 - \`vault.explore(query, depth, limit)\` → deep PPR traversal
 - \`vault.add(title, content, type)\` → write to inbox
 - \`vault.status()\` / \`vault.orient(brief=False)\`
+
+**\`fs\`** — filesystem access (works on ANY path, not just the indexed project):
+- \`fs.read(path, offset=0, limit=None)\` → file contents by line range
+- \`fs.listdir(path=".")\` → sorted directory entries (dirs have trailing \`/\`)
+- \`fs.glob(pattern, path=".")\` → glob match from path, capped at 200 results
+
+**\`reindex(path)\`** → re-index a different directory as the active codebase. After this, \`codebase.*\` reflects the new project.
 
 **\`rlm_call(slice, question, budget=1000)\`** → fresh LLM on focused slice
 **\`rlm_batch([(slice, q), ...], budget_per=1000)\`** → parallel fan-out

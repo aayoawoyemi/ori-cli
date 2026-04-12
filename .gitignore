@@ -24,6 +24,7 @@ bench/results/
 spike/
 
 # Internal planning docs
+advisor-models-analysis.md
 HANDOFF_*.md
 NEXT.md
 PLAN.md

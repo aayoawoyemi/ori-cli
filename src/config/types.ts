@@ -4,6 +4,11 @@ export interface ExperimentalConfig {
    * already present on this machine instead of ANTHROPIC_API_KEY.
    */
   localClaudeSubscription: boolean;
+  /**
+   * Local-only experimental path that uses ChatGPT/Codex subscription credentials
+   * from ~/.codex/auth.json instead of OPENAI_API_KEY.
+   */
+  localChatGPTSubscription: boolean;
 }
 export interface ModelConfig {
   provider: 'anthropic' | 'google' | 'openai' | 'openai-compatible' | 'moonshot' | 'deepseek' | 'groq' | 'fireworks' | 'openrouter' | 'ollama' | 'custom';

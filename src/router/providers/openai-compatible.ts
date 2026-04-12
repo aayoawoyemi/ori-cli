@@ -25,6 +25,10 @@
 
 import type { ModelProvider, Message, ToolDefinition, StreamEvent, ContentBlock } from '../types.js';
 import type { ModelConfig } from '../../config/types.js';
+import {
+  OpenAILocalOAuthSource,
+  type OpenAIOAuthCredentials,
+} from '../../auth/openAILocalOAuth.js';
 
 // ── Message Conversion ─────────────────────────────────────────────────────
 
@@ -145,6 +149,11 @@ interface SSEChunk {
 
 // ── Provider ───────────────────────────────────────────────────────────────
 
+interface OpenAICompatibleProviderOptions {
+  allowLocalOAuth?: boolean;
+  oauthSource?: OpenAILocalOAuthSource;
+}
+
 export class OpenAICompatibleProvider implements ModelProvider {
   readonly name: string;
   readonly model: string;
@@ -152,12 +161,16 @@ export class OpenAICompatibleProvider implements ModelProvider {
   private baseUrl: string;
   private apiKey: string;
   private maxTokens: number;
+  private useOAuth: boolean;
+  private oauthSource: OpenAILocalOAuthSource | null = null;
+  private oauthCreds: OpenAIOAuthCredentials | null = null;
 
-  constructor(config: ModelConfig) {
+  constructor(config: ModelConfig, options: OpenAICompatibleProviderOptions = {}) {
     this.model = config.model;
     this.contextWindow = config.contextWindow ?? 128_000;
     this.maxTokens = config.maxTokens ?? 16_384;
     this.name = `openai-compatible:${config.model}`;
+    this.useOAuth = config.auth === 'oauth';
 
     // Resolve base URL: explicit config > provider-specific default
     const providerDefaults: Record<string, { url: string; envKey: string }> = {
@@ -188,6 +201,22 @@ export class OpenAICompatibleProvider implements ModelProvider {
       || (defaults.envKey ? (process.env[defaults.envKey] ?? '') : '')
       || process.env.OPENAI_API_KEY
       || '';
+
+    // OAuth path — load credentials from ~/.codex/auth.json
+    if (this.useOAuth && (config.provider === 'openai' || config.provider === 'openai-compatible')) {
+      if (!options.allowLocalOAuth) {
+        throw new Error(
+          'OpenAI OAuth mode is disabled. Set experimental.localChatGPTSubscription: true to use the local ChatGPT subscription path.',
+        );
+      }
+      this.oauthSource = options.oauthSource ?? new OpenAILocalOAuthSource();
+      try {
+        this.oauthCreds = this.oauthSource.loadCredentials();
+        this.apiKey = this.oauthCreds.accessToken;
+      } catch (err) {
+        throw new Error(`OpenAI local ChatGPT subscription auth failed: ${(err as Error).message}`);
+      }
+    }
   }
 
   async *stream(
@@ -196,6 +225,12 @@ export class OpenAICompatibleProvider implements ModelProvider {
     tools: ToolDefinition[],
     signal?: AbortSignal,
   ): AsyncGenerator<StreamEvent> {
+    // Refresh OAuth token if expired before making the request
+    if (this.useOAuth && this.oauthSource && this.oauthCreds) {
+      this.oauthCreds = await this.oauthSource.ensureFreshToken(this.oauthCreds);
+      this.apiKey = this.oauthCreds.accessToken;
+    }
+
     const oaiMessages = toOAIMessages(messages, systemPrompt);
     const oaiTools = toOAITools(tools);
 

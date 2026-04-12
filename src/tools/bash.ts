@@ -17,8 +17,8 @@ const ALLOWED_PREFIXES = new Set([
   'python', 'pip', 'uv',
   // Directory/file management
   'dir', 'ls', 'mkdir', 'rm', 'del', 'cp', 'copy', 'mv', 'move', 'touch',
-  // Environment
-  'env', 'set', 'echo', 'printenv', 'which', 'where',
+  // Environment / navigation
+  'cd', 'env', 'set', 'echo', 'printenv', 'which', 'where',
   // Editor/tools
   'code', 'cursor', 'ori',
   // System
@@ -43,8 +43,9 @@ const ALWAYS_BLOCKED = [
 const REPL_MODE_BLOCKED = [
   /^cat\s/, /^head\s/, /^tail\s/, /^less\s/, /^more\s/, /^bat\s/,
   /^grep\s/, /^rg\s/, /^find\s/, /^fd\s/, /^ag\s/, /^ack\s/,
-  /^ls\b/, /^dir\b/,                                     // codebase.list_files()
-  /^powershell\b/, /^cmd\b/,                              // escape hatches
+  // ls/dir are NOT blocked — codebase.list_files() is a poor substitute
+  // for actual filesystem navigation (especially outside the project).
+  /^cmd\b/,                                                // cmd blocked; powershell allowed
   /^code\b/, /^cursor\b/,                                 // no editor launching
 ];
 
@@ -74,7 +75,7 @@ function isCommandAllowed(command: string, replEnabled: boolean): { allowed: boo
       if (pattern.test(trimmed)) {
         return {
           allowed: false,
-          reason: `Blocked: "${trimmed.split(' ')[0]}" duplicates REPL capabilities. Use the Repl tool with codebase.search(), codebase.get_context(), or vault.* instead.`,
+          reason: `Blocked: "${trimmed.split(' ')[0]}" — use Repl instead. fs.listdir(path) for directory listing, fs.glob(pattern, path) for file search, fs.read(path) for file contents, codebase.search(query) for code search (project-scoped only).`,
         };
       }
     }
@@ -160,27 +161,27 @@ function tryRewriteAsRepl(command: string, cwd: string): ReplRewrite | null {
     }
   }
 
-  // find . -name "pattern"
-  const findName = cmd.match(/^find\s+[\.\w/]+\s+-name\s+["']?([^\s"']+)["']?/);
+  // find <path> -type d → fs.listdir filtered to directories
+  const findTypeD = cmd.match(/^find\s+["']?([^\s"']+)["']?\s+-type\s+d/);
+  if (findTypeD) {
+    const [, path] = findTypeD;
+    return { code: `entries = fs.listdir(${JSON.stringify(path)})\nprint('\\n'.join(e for e in entries if e.endswith('/')))`, label: `fs.listdir("${path}") dirs only` };
+  }
+
+  // find <path> -name "pattern" → fs.glob
+  const findName = cmd.match(/^find\s+["']?([^\s"']+)["']?\s+-name\s+["']?([^\s"']+)["']?/);
   if (findName) {
-    const [, pattern] = findName;
-    const escaped = pattern.replace(/\*/g, '');
-    return { code: `files = codebase.list_files()\nmatched = [f for f in files if ${JSON.stringify(escaped)} in f]\nprint('\\n'.join(matched))`, label: `codebase.list_files() filter "${pattern}"` };
+    const [, findPath, pattern] = findName;
+    const globPattern = (pattern ?? '').replace(/^["']|["']$/g, '');
+    return { code: `print('\\n'.join(fs.glob(${JSON.stringify(globPattern)}, ${JSON.stringify(findPath)})))`, label: `fs.glob("${globPattern}", "${findPath}")` };
   }
 
-  // ls [path]
-  const lsMatch = cmd.match(/^ls\s*(?:-[a-zA-Z]+\s+)?["']?([^\s"']*)["']?$/);
-  if (lsMatch) {
-    const [, prefix] = lsMatch;
-    if (prefix) {
-      return { code: `files = codebase.list_files()\nmatched = [f for f in files if f.startswith(${JSON.stringify(prefix)})]\nprint('\\n'.join(matched))`, label: `codebase.list_files() prefix "${prefix}"` };
-    }
-    return { code: `files = codebase.list_files()\nprint('\\n'.join(files[:100]))`, label: 'codebase.list_files()' };
+  // ls / dir — rewrite bare commands to fs.listdir (works on any directory)
+  if (/^ls\s*$/.test(cmd)) {
+    return { code: `print('\\n'.join(fs.listdir('.')))`, label: 'fs.listdir(".")' };
   }
-
-  // dir (Windows ls equivalent)
-  if (/^dir\b/.test(cmd)) {
-    return { code: `files = codebase.list_files()\nprint('\\n'.join(files[:100]))`, label: 'codebase.list_files()' };
+  if (/^dir\s*$/.test(cmd)) {
+    return { code: `print('\\n'.join(fs.listdir('.')))`, label: 'fs.listdir(".")' };
   }
 
   // wc -l <path>

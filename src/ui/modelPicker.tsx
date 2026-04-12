@@ -3,6 +3,7 @@ import { Box, Text, useInput } from 'ink';
 import { Select, type SelectOption } from './select.js';
 import { colors } from './theme.js';
 import type { EffortLevel } from '../router/index.js';
+import type { ExperimentalConfig } from '../config/types.js';
 
 // ── Effort ────────────────────────────────────────────────────────────────
 
@@ -56,11 +57,20 @@ const MODEL_FAMILIES: ModelFamily[] = [
     ],
   },
   {
-    name: 'OpenAI',
+    name: 'OpenAI (API key)',
     models: [
       { value: 'gpt5',    label: 'GPT-5',    description: '1M',                supportsEffort: false, defaultEffort: 'medium' },
       { value: 'gpt4o',   label: 'GPT-4o',   description: '128K',              supportsEffort: false, defaultEffort: 'medium' },
       { value: 'o4-mini', label: 'o4-mini',   description: '200K · Reasoning',  supportsEffort: false, defaultEffort: 'medium' },
+    ],
+  },
+  {
+    name: 'ChatGPT (subscription)',
+    models: [
+      { value: 'gpt-5.4',      label: 'gpt-5.4 (default)', description: 'Latest frontier agentic coding model',          supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'gpt-5.4-mini', label: 'gpt-5.4-mini',      description: 'Smaller frontier agentic coding model',         supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'gpt-5.3',      label: 'gpt-5.3-codex',     description: 'Frontier Codex-optimized agentic coding model', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'gpt-5.2',      label: 'gpt-5.2',           description: 'Optimized for professional work and long-running agents', supportsEffort: false, defaultEffort: 'medium' },
     ],
   },
   {
@@ -72,6 +82,7 @@ const MODEL_FAMILIES: ModelFamily[] = [
       { value: 'qwen3',       label: 'Qwen3 235B',       description: '131K · DashScope',  supportsEffort: false, defaultEffort: 'medium' },
       { value: 'kimi',        label: 'Kimi K2',          description: '128K · Moonshot',   supportsEffort: false, defaultEffort: 'medium' },
       { value: 'llama',       label: 'Llama 3.3 70B',    description: '128K · Groq',       supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'gemma4',      label: 'Gemma 4 26B',      description: '262K · OpenRouter', supportsEffort: false, defaultEffort: 'medium' },
     ],
   },
   {
@@ -88,6 +99,7 @@ const MODEL_FAMILIES: ModelFamily[] = [
     models: [
       { value: 'qwen3.6-free', label: 'Qwen3.6 (free)',     description: '131K · Rate-limited', supportsEffort: false, defaultEffort: 'medium' },
       { value: 'qwen3-free',   label: 'Qwen3 235B (free)',   description: '131K · Rate-limited', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'gemma4-free',  label: 'Gemma 4 26B (free)',  description: '262K · Rate-limited', supportsEffort: false, defaultEffort: 'medium' },
     ],
   },
 ];
@@ -107,17 +119,22 @@ export interface ModelPickerProps {
   currentEffort: EffortLevel;
   onSelect: (model: string, effort: EffortLevel) => void;
   onCancel: () => void;
+  experimental?: ExperimentalConfig;
 }
 
 // ── ModelPicker Component ──────────────────────────────────────────────────
 // Two-tier: families → models. Enter drills in, Backspace goes back.
+
+const SUBSCRIPTION_MODELS = new Set(['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3', 'gpt-5.2']);
 
 export function ModelPicker({
   currentModel,
   currentEffort,
   onSelect,
   onCancel,
+  experimental,
 }: ModelPickerProps): React.ReactElement {
+  const oauthEnabled = experimental?.localChatGPTSubscription ?? false;
   const [phase, setPhase] = useState<'family' | 'model'>('family');
   const [selectedFamily, setSelectedFamily] = useState(findCurrentFamily(currentModel));
   const [effort, setEffort] = useState<EffortLevel>(currentEffort);
@@ -160,8 +177,13 @@ export function ModelPicker({
   );
 
   const handleModelSelect = useCallback((value: string) => {
+    if (SUBSCRIPTION_MODELS.has(value) && !oauthEnabled) {
+      // Don't call onSelect — the render will show the notice instead.
+      // We just ignore the selection silently; the notice is visible above.
+      return;
+    }
     onSelect(value, effort);
-  }, [onSelect, effort]);
+  }, [onSelect, effort, oauthEnabled]);
 
   const handleModelFocus = useCallback((value: string) => {
     setFocusedModel(value);
@@ -250,6 +272,15 @@ export function ModelPicker({
           </Text>
         )}
       </Box>
+
+      {/* ChatGPT subscription notice */}
+      {family.name === 'ChatGPT (subscription)' && !oauthEnabled && (
+        <Box marginTop={1}>
+          <Text color={colors.warning}>
+            ⚠ Requires experimental.localChatGPTSubscription: true in ~/.aries/config.yaml
+          </Text>
+        </Box>
+      )}
 
       <Text dimColor italic>Enter confirm | Backspace back | Esc cancel</Text>
     </Box>

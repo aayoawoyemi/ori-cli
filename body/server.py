@@ -167,7 +167,28 @@ def _build_namespace() -> dict:
         end = offset + limit if limit is not None else len(lines)
         return "".join(lines[offset:end])
 
-    ns["fs"] = _types.SimpleNamespace(read=_fs_read)
+    def _fs_listdir(path: str = ".") -> list[str]:
+        p = _pathlib.Path(path).expanduser().resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"fs.listdir: no directory at {p}")
+        if not p.is_dir():
+            raise ValueError(f"fs.listdir: {p} is not a directory")
+        return sorted(entry.name + ("/" if entry.is_dir() else "") for entry in p.iterdir())
+
+    def _fs_glob(pattern: str, path: str = ".") -> list[str]:
+        p = _pathlib.Path(path).expanduser().resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"fs.glob: no directory at {p}")
+        if not p.is_dir():
+            raise ValueError(f"fs.glob: {p} is not a directory")
+        results = []
+        for match in p.glob(pattern):
+            results.append(str(match.relative_to(p)))
+            if len(results) >= 200:
+                break
+        return sorted(results)
+
+    ns["fs"] = _types.SimpleNamespace(read=_fs_read, listdir=_fs_listdir, glob=_fs_glob)
     # Always available: reindex to point the body at a different project
     ns["reindex"] = _reindex
     # Phase 2: expose codebase object if indexed

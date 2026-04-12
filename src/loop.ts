@@ -9,7 +9,7 @@ import type { SessionStorage } from './session/storage.js';
 import type { HooksConfig } from './config/types.js';
 import { executeTools, resetDoomLoop } from './tools/execution.js';
 import { PhaseTracker, getToolsForPhase, type TaskPhase } from './tools/toolSets.js';
-import { buildAssistantMessage, buildToolResultMessage, getMessageText } from './utils/messages.js';
+import { buildAssistantMessage, buildToolResultMessage, getMessageText, healOrphanedToolUses } from './utils/messages.js';
 import { estimateTokens } from './utils/tokens.js';
 // Preflight disabled pre-ship — import kept for when it comes back
 // import { runPreflight, type PreflightContext } from './memory/preflight.js';
@@ -168,6 +168,14 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     // top of every previous turn's, linearly accumulating stale context.
     // Fix 2 + Fix 4 from orientation audit.
     stripSyntheticFromMessages(messages);
+
+    // ── HEAL orphaned tool_use blocks ────────────────────────────────
+    // If a prior turn was interrupted (Ctrl+C mid-tool, executeTools threw,
+    // permission flow abandoned), an assistant message with tool_use blocks
+    // may be sitting in history without matching tool_result entries. The
+    // Anthropic API rejects this with a 400. Inject synthetic error results
+    // so the conversation stays valid.
+    healOrphanedToolUses(messages);
 
     // Reset per-turn nudge counters (sequential read tracking, etc.)
     resetNudgeCounters();
@@ -384,8 +392,20 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       // Execute approved tools
       let executedResults: { id: string; name: string; output: string; isError: boolean }[] = [];
       if (approvedCalls.length > 0) {
-        const results = await executeTools(approvedCalls, registry, toolContext, hooks, vault?.vaultPath, maxSubagents);
-        executedResults = results;
+        try {
+          executedResults = await executeTools(approvedCalls, registry, toolContext, hooks, vault?.vaultPath, maxSubagents);
+        } catch (err) {
+          // Never leave orphaned tool_use in history. Synthesize an error
+          // result for every approved call so the conversation stays valid.
+          const msg = (err as Error)?.message ?? String(err);
+          executedResults = approvedCalls.map(tc => ({
+            id: tc.id,
+            name: tc.name,
+            output: `Tool execution failed: ${msg}`,
+            isError: true,
+          }));
+          yield { type: 'error', error: err };
+        }
 
         // Post-edit refresh
         const mutatedPaths: string[] = [];

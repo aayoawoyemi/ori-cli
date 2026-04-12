@@ -38,10 +38,15 @@ const MODEL_SHORTCUTS: Record<string, ModelShortcut> = {
   'gemini':   { provider: 'google', model: 'gemini-2.5-pro', contextWindow: 1_000_000 },
   'flash':    { provider: 'google', model: 'gemini-2.5-flash', contextWindow: 1_000_000 },
 
-  // â”€â”€ OpenAI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  'gpt4o':    { provider: 'openai', model: 'gpt-4o', contextWindow: 128_000 },
-  'gpt5':     { provider: 'openai', model: 'gpt-5', contextWindow: 1_000_000 },
-  'o4-mini':  { provider: 'openai', model: 'o4-mini', contextWindow: 200_000 },
+  // ── OpenAI ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  'gpt4o':       { provider: 'openai', model: 'gpt-4o',       contextWindow: 128_000 },
+  'gpt5':        { provider: 'openai', model: 'gpt-5',        contextWindow: 1_000_000 },
+  'o4-mini':     { provider: 'openai', model: 'o4-mini',      contextWindow: 200_000 },
+  // ChatGPT subscription models (require localChatGPTSubscription: true + ~/.codex/auth.json)
+  'gpt-5.4':     { provider: 'openai', model: 'gpt-5.4',      contextWindow: 1_000_000, auth: 'oauth' },
+  'gpt-5.4-mini':{ provider: 'openai', model: 'gpt-5.4-mini', contextWindow: 1_000_000, auth: 'oauth' },
+  'gpt-5.3':     { provider: 'openai', model: 'gpt-5.3-codex',contextWindow: 1_000_000, auth: 'oauth' },
+  'gpt-5.2':     { provider: 'openai', model: 'gpt-5.2',      contextWindow: 1_000_000, auth: 'oauth' },
 
   // â”€â”€ Moonshot / Kimi â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   'kimi':     { provider: 'moonshot', model: 'kimi-k2', contextWindow: 128_000 },
@@ -63,6 +68,7 @@ const MODEL_SHORTCUTS: Record<string, ModelShortcut> = {
   // Free tier models (no cost, rate-limited)
   'qwen3.6-free':  { provider: 'openrouter', model: 'qwen/qwen3.6-plus:free',       contextWindow: 131_072 },
   'qwen3-free':    { provider: 'openrouter', model: 'qwen/qwen3-235b-a22b:free',    contextWindow: 131_072 },
+  'gemma4-free':   { provider: 'openrouter', model: 'google/gemma-4-26b-a4b-it:free', contextWindow: 262_144 },
 
   // Paid OpenRouter models (much cheaper than direct APIs)
   'qwen3.6-or':    { provider: 'openrouter', model: 'qwen/qwen3.6-plus',            contextWindow: 131_072 },
@@ -70,6 +76,7 @@ const MODEL_SHORTCUTS: Record<string, ModelShortcut> = {
   'deepseek-v3':   { provider: 'openrouter', model: 'deepseek/deepseek-v3.2',       contextWindow: 131_072 },
   'gemini-flash':  { provider: 'openrouter', model: 'google/gemini-3-flash-preview', contextWindow: 1_000_000 },
   'glm5':          { provider: 'openrouter', model: 'zai-org/glm-5',               contextWindow: 128_000 },
+  'gemma4':        { provider: 'openrouter', model: 'google/gemma-4-26b-a4b-it',    contextWindow: 262_144 },
 
   // â”€â”€ Local (llama.cpp via openai-compatible API on port 8080) â”€â”€â”€â”€â”€â”€
   // llama-server ignores the model field â€” it serves whatever GGUF is loaded.
@@ -122,7 +129,9 @@ function createProvider(config: ModelConfig, experimental?: ExperimentalConfig):
     case 'openrouter':
     case 'ollama':
     case 'custom':
-      return new OpenAICompatibleProvider(config);
+      return new OpenAICompatibleProvider(config, {
+        allowLocalOAuth: experimental?.localChatGPTSubscription ?? false,
+      });
     default:
       throw new Error(`Unsupported provider: ${config.provider}. Available: anthropic, google, openai-compatible, deepseek, moonshot, groq, fireworks, openrouter, ollama`);
   }
@@ -207,9 +216,23 @@ export class ModelRouter {
       // Resolve API key: local models (no baseUrl override) need none;
       // apiKeyEnv overrides the provider default (e.g. DashScope vs generic openai-compatible)
       const envKey = shortcut.apiKeyEnv ?? PROVIDER_ENV_KEYS[shortcut.provider];
-      const resolvedApiKey = (shortcut.baseUrl && !shortcut.apiKeyEnv)
-        ? ''  // local llama.cpp â€” no key needed
-        : (process.env[envKey ?? ''] ?? this.primaryConfig.apiKey ?? '');
+      let resolvedApiKey: string;
+      if (shortcut.baseUrl && !shortcut.apiKeyEnv) {
+        resolvedApiKey = ''; // local llama.cpp — no key needed
+      } else if (shortcut.apiKeyEnv) {
+        // Explicit env var required (e.g. DASHSCOPE_API_KEY). Do NOT fall back
+        // to primaryConfig.apiKey — that would send the wrong provider's key
+        // and produce a confusing 401 from the remote API.
+        const v = process.env[shortcut.apiKeyEnv];
+        if (!v) {
+          throw new Error(
+            `Model "${modelName}" requires ${shortcut.apiKeyEnv} to be set in your environment.`,
+          );
+        }
+        resolvedApiKey = v;
+      } else {
+        resolvedApiKey = process.env[envKey ?? ''] ?? this.primaryConfig.apiKey ?? '';
+      }
 
       const config: ModelConfig = {
         provider: shortcut.provider,

@@ -134,13 +134,15 @@ export class AnthropicLocalOAuthSource {
 
     let response: Response;
     try {
-      response = await this.fetchImpl('https://console.anthropic.com/v1/oauth/token', {
+      response = await this.fetchImpl('https://platform.claude.com/v1/oauth/token', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
           grant_type: 'refresh_token',
           refresh_token: creds.refreshToken,
-        }).toString(),
+          client_id: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
+          scope: (creds.scopes.length ? creds.scopes : ['user:inference']).join(' '),
+        }),
         signal: AbortSignal.timeout(10_000),
       });
     } catch (err) {

@@ -25,7 +25,7 @@ import type { SessionStorage } from '../session/storage.js';
 import type { Message } from '../router/types.js';
 import { syncSession } from '../session/sync.js';
 import { runHooks } from '../hooks/runner.js';
-import type { HooksConfig, DisplayMode } from '../config/types.js';
+import type { HooksConfig, DisplayMode, ExperimentalConfig } from '../config/types.js';
 import { runResearch } from '../research/index.js';
 import type { ResearchDepth } from '../research/types.js';
 import type { ReplHandle } from '../repl/setup.js';
@@ -47,6 +47,7 @@ interface AppProps {
   preflightEnabled?: boolean;
   resumedMessages?: Message[] | null;
   initialResumePicker?: boolean;
+  experimental?: ExperimentalConfig;
 }
 
 export function App(props: AppProps): React.ReactElement {
@@ -56,6 +57,7 @@ export function App(props: AppProps): React.ReactElement {
     session, systemPrompt, hooks, vaultNoteCount, initialPrompt,
     initialPermissionMode, replHandle, preflightEnabled = true,
     resumedMessages: initialResumedMessages, initialResumePicker,
+    experimental,
   } = props;
 
   // ── State ───────────────────────────────────────────────────────────
@@ -133,6 +135,19 @@ export function App(props: AppProps): React.ReactElement {
         subtype: 'info',
       }]);
     }
+  }, []);
+
+  // ── Always-register plan tools (121 tokens, prevents identity confusion) ──
+  useEffect(() => {
+    registerPlanTools(registry, {
+      cwd,
+      onEnter: (path) => { planFilePathRef.current = path; },
+      onExit: (path, content) => new Promise<PlanApprovalResult>(resolve => {
+        setPlanApprovalData({ path, content });
+        setShowPlanApproval(true);
+        planApprovalResolveRef.current = resolve;
+      }),
+    });
   }, []);
 
   // ── Keyboard shortcuts ──────────────────────────────────────────────
@@ -215,27 +230,16 @@ export function App(props: AppProps): React.ReactElement {
           const idx = modes.indexOf(prev);
           const next = modes[(idx + 1) % modes.length]!;
 
-          // Leaving plan mode → unregister plan tools
+          // Leaving plan mode
           if (prev === 'plan' && next !== 'plan') {
-            registry.unregister('EnterPlanMode');
-            registry.unregister('ExitPlanMode');
             planFilePathRef.current = null;
             setDisplayMessages(p => [...p, { role: 'system', text: `${figures.planMode} Exited plan mode → ${next}. Plan file preserved if written.`, subtype: 'info' }]);
           }
 
-          // Entering plan mode → register plan tools + inject directive
+          // Entering plan mode → inject directive (tools always registered)
           if (next === 'plan') {
             prePlanModeRef.current = prev;
             planFilePathRef.current = null;
-            registerPlanTools(registry, {
-              cwd,
-              onEnter: (path) => { planFilePathRef.current = path; },
-              onExit: (path, content) => new Promise<PlanApprovalResult>(resolve => {
-                setPlanApprovalData({ path, content });
-                setShowPlanApproval(true);
-                planApprovalResolveRef.current = resolve;
-              }),
-            });
             setDisplayMessages(p => [...p, { role: 'system', text: `${figures.planMode} Plan mode — model will call EnterPlanMode to begin. Alt+M to cycle.`, subtype: 'info' }]);
             messagesRef.current.push({ role: 'user', content: 'You are now in plan mode. Call EnterPlanMode to begin.' });
           }
@@ -322,8 +326,6 @@ export function App(props: AppProps): React.ReactElement {
 
     const nextMode = mode === 'accept_edits' ? 'accept' as PermissionMode : prePlanModeRef.current;
     setPermissionMode(nextMode);
-    registry.unregister('EnterPlanMode');
-    registry.unregister('ExitPlanMode');
     planFilePathRef.current = null;
     setDisplayMessages(prev => [...prev, {
       role: 'system',
@@ -832,8 +834,6 @@ export function App(props: AppProps): React.ReactElement {
           if (permissionMode === 'plan') {
             // Force exit without approval — restore mode, clean up
             setPermissionMode(prePlanModeRef.current);
-            registry.unregister('EnterPlanMode');
-            registry.unregister('ExitPlanMode');
             planFilePathRef.current = null;
             setDisplayMessages(prev => [...prev, {
               role: 'system',
@@ -844,15 +844,7 @@ export function App(props: AppProps): React.ReactElement {
         } else {
           prePlanModeRef.current = permissionMode;
           planFilePathRef.current = null;
-          registerPlanTools(registry, {
-            cwd,
-            onEnter: (path) => { planFilePathRef.current = path; },
-            onExit: (path, content) => new Promise<PlanApprovalResult>(resolve => {
-              setPlanApprovalData({ path, content });
-              setShowPlanApproval(true);
-              planApprovalResolveRef.current = resolve;
-            }),
-          });
+          // Plan tools already registered at mount — just switch mode
           setPermissionMode('plan');
           setDisplayMessages(prev => [...prev, {
             role: 'system',
@@ -870,8 +862,6 @@ export function App(props: AppProps): React.ReactElement {
         if (permissionMode === 'plan') {
           // Force exit to accept mode
           setPermissionMode('accept');
-          registry.unregister('EnterPlanMode');
-          registry.unregister('ExitPlanMode');
           planFilePathRef.current = null;
           setDisplayMessages(prev => [...prev, {
             role: 'system',
@@ -1491,15 +1481,25 @@ export function App(props: AppProps): React.ReactElement {
           />
         ) : showModelPicker ? (
           <ModelPicker
-            currentModel={router.info.model.includes('opus') ? 'opus'
+            currentModel={
+              router.info.model.includes('opus') ? 'opus'
               : router.info.model.includes('sonnet') ? 'sonnet'
               : router.info.model.includes('haiku') ? 'haiku'
               : router.info.model.includes('gemini-2.5-pro') ? 'gemini'
               : router.info.model.includes('flash') ? 'flash'
-              : 'sonnet'}
+              : router.info.model === 'gpt-5.4' ? 'gpt-5.4'
+              : router.info.model === 'gpt-5.4-mini' ? 'gpt-5.4-mini'
+              : router.info.model === 'gpt-5.3-codex' ? 'gpt-5.3'
+              : router.info.model === 'gpt-5.2' ? 'gpt-5.2'
+              : router.info.model === 'gpt-5' ? 'gpt5'
+              : router.info.model === 'gpt-4o' ? 'gpt4o'
+              : router.info.model === 'o4-mini' ? 'o4-mini'
+              : 'sonnet'
+            }
             currentEffort={router.effort}
             onSelect={handleModelSelect}
             onCancel={handleModelCancel}
+            experimental={experimental}
           />
         ) : (
           <>

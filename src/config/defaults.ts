@@ -73,6 +73,7 @@ export const DEFAULT_CONFIG: AriesConfig = {
   },
   experimental: {
     localClaudeSubscription: false,
+    localChatGPTSubscription: false,
   },
   mcp: {
     servers: {},
