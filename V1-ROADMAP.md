@@ -117,9 +117,9 @@ Q-values learn what's relevant to THIS agent.
 
 ---
 
-## Phase 4: SLEEP — Episodic Few-Shot
+## Phase 4: SLEEP — Episodic Few-Shot + Session Learning
 
-*Size: Medium | Depends: Phase 3*
+*Size: Medium-Large | Depends: Phase 3*
 
 ### 4A. Structured session reflection — `src/memory/sessionReflection.ts` (NEW)
 At session end (before `vault.disconnect()`), cheap model call produces:
@@ -136,7 +136,102 @@ Saved to vault as `session-reflection: <tags> — <date>`.
 ### 4B. Episodic retrieval at session start — `src/memory/warmContext.ts`
 During warm context assembly, query `vault.queryRanked('session reflection ' + cwd_name, 2)`. If matching session reflections found, inject as `<episodic-example>` in warm context. Model starts knowing how past similar sessions went.
 
-**Verify:** Two sessions on same codebase. Third session shows `<episodic-example>` from prior reflections.
+### 4C. Detailed session logging — `src/session/learningLog.ts` (NEW)
+Structured JSON log written throughout each session. This is the data layer everything else learns from.
+
+```
+.aries/logs/{timestamp}.jsonl
+```
+
+Events logged:
+- `retrieval` — query, returned notes, signal sources (which RRF signal contributed each note)
+- `tool_call` — name, args, success/failure, duration
+- `tool_result` — output summary, isError
+- `user_correction` — when user redirects approach, corrects framing, rejects plan
+- `plan_decision` — accepted/rejected with feedback
+- `echo` — note title, context (what task type it echoed in)
+- `fizzle` — note title, context
+- `model_switch` — when cheap vs expensive model was used and why
+
+Wire into `loop.ts`: log after every tool result, after every echo/fizzle detection, after plan approval/rejection.
+
+### 4D. Decouple experience log from compaction — `src/memory/experienceLog.ts`
+**Current state (broken):** `appendExperience()` only fires from `compact.ts extractAndSave()`. Compaction rarely fires in practice — users start new sessions instead. The experience log is effectively dead.
+
+**Fix:** Add new write triggers:
+- **Session end** — sessionReflection (4A) writes its `what_to_avoid` entries as experience entries
+- **User correction** — when the user pushes back on approach/framing, detect and log the pattern
+- **Task outcome** — after an edit passes/fails tests, after a plan is accepted/rejected
+- **Sleep mode** — the agent reviews session logs and writes synthesized learnings
+
+Redesign the log format from append-only FIFO to categorized + utility-weighted:
+```markdown
+# Experience Log
+
+## Communication [utility: 0.9]
+- [2026-04-09] When analyzing related work, absorb and learn — don't frame competitively
+
+## Retrieval [utility: 0.7]
+- [2026-04-09] Graph exploration produces high-echo notes for architecture questions
+
+## Tool Use [utility: 0.8]
+- [2026-04-06] Always run Repl search before Bash grep — Repl is faster and indexed
+
+## Failure Modes [utility: 0.95]
+- [2026-04-09] Experience log gated behind compaction — decouple learning from compression
+```
+
+Utility scores updated during sleep mode. Contradictions resolved (new entry replaces old, not appended alongside).
+
+### 4E. Sleep mode — `src/session/sleepMode.ts` (NEW), `aries sleep` CLI command
+Dedicated processing time for the agent to learn from accumulated experience. Triggered manually (`aries sleep`) or at session end.
+
+**What happens during sleep:**
+1. Load session logs from `.aries/logs/` (all since last sleep)
+2. Compute statistics — tool success rates, retrieval hit rates, correction frequency
+3. Analyze retrieval quality — which RRF signal source produced notes that echoed vs fizzled
+4. Process user corrections — identify behavioral patterns, update experience log
+5. Vault maintenance — find contradictions between notes, update stale info, strengthen connections
+6. Update agent config — write learned parameters to `.aries/agent-config.yaml`
+7. Write experience entries — synthesized procedural learnings
+
+Uses cheap model calls for analysis. The agent has the best vantage point for self-evaluation — it knows what information it needed and didn't have, what it had and didn't use.
+
+Research backing: Advisor Models paper (arXiv:2510.02453) proves small models can learn to steer large models through RL on task outcomes. Sleep mode is the reflective-practice analog — review, analyze, adjust — before we have infrastructure for real RL.
+
+### 4F. Agent configuration as learning medium — `.aries/agent-config.yaml` (NEW)
+A harness-readable, agent-writable config file that encodes procedural knowledge:
+
+```yaml
+# Written by the agent during sleep mode. Read by harness at session start.
+retrieval:
+  rrf_weights:
+    semantic: 2.0
+    keyword: 1.0
+    graph: 1.5
+    warmth: 0.25
+
+communication:
+  default_depth: terse
+  depth_triggers:
+    - pattern: "paper analysis"
+      depth: thorough
+    - pattern: "quick fix"
+      depth: minimal
+
+tools:
+  preferred_first:
+    refactoring: [Repl, Edit]
+    debugging: [Repl, Bash]
+
+failure_modes:
+  - pattern: "competitive framing when analyzing related work"
+    correction: "absorb and learn, don't differentiate"
+```
+
+The harness reads this at session start and injects relevant sections into context. The agent updates it during sleep mode. This is procedural memory — it changes how the agent behaves, not just what it knows.
+
+**Verify:** Run two sessions with logging. Run `aries sleep`. Confirm experience log updated, agent-config written. Start third session — confirm config entries appear in context.
 
 ---
 
@@ -409,6 +504,9 @@ Phase 0 (bugs) ─────────────────────�
 | `src/memory/warmContext.ts` | 1 | Always-present identity block |
 | `src/memory/echoFizzle.ts` | 3 | Usage tracking for retrieved notes |
 | `src/memory/sessionReflection.ts` | 4 | Structured session-end synthesis |
+| `src/session/learningLog.ts` | 4 | Structured JSONL session logging for learning |
+| `src/session/sleepMode.ts` | 4 | Sleep mode — retroactive session analysis and learning |
+| `.aries/agent-config.yaml` | 4 | Agent-writable config for procedural learning |
 | `src/tools/snapshot.ts` | 5 | Pre-edit file capture for undo |
 | `src/cognition/entropyMonitor.ts` | 9 | Rolling entropy from logprobs, spike detection |
 | `src/cognition/cognitiveInterrupt.ts` | 9 | Abort/query Ori/decide remember vs think/restart |
@@ -417,17 +515,18 @@ Phase 0 (bugs) ─────────────────────�
 
 | File | Phases | What changes |
 |------|--------|--------------|
-| `src/loop.ts` | 0,2,3,6 | Reflection wiring, plan tool filtering, echo/fizzle call, new events |
+| `src/loop.ts` | 0,2,3,4,6 | Reflection wiring, plan tool filtering, echo/fizzle call, learning log writes, new events |
 | `src/memory/preflight.ts` | 2,3 | Layered injection, structural contradictions, identity-conditioned queries |
 | `src/memory/postflight.ts` | 0 | Wire real reflection |
 | `src/memory/compact.ts` | 1 | Warm context preservation |
+| `src/memory/experienceLog.ts` | 4 | Decouple from compaction, categorized format, utility weighting, contradiction resolution |
 | `src/memory/vault.ts` | 3 | Add `update()` method |
-| `src/prompt.ts` | 1 | Warm context injection |
+| `src/prompt.ts` | 1,4 | Warm context injection, agent-config injection at session start |
 | `src/ui/app.tsx` | 0,4,5 | Casing fix, /resume, /undo, session reflection, UX |
 | `src/ui/messages.tsx` | 5 | Virtualization, rich tool rendering |
 | `src/router/providers/google.ts` | 0 | Tool name fix |
 | `src/auth/oauth.ts` | 0 | Persist refresh tokens |
-| `src/index.ts` | 0,1 | Orient call, config→permission, warm context init |
+| `src/index.ts` | 0,1,4 | Orient call, config→permission, warm context init, load agent-config |
 | `src/router/providers/openai-compatible.ts` | 9 | Logprobs parsing from SSE stream |
 | `src/router/providers/anthropic.ts` | 9 | Self-reported confidence fallback |
 

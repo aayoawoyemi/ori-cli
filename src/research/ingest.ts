@@ -1,5 +1,7 @@
 import type { DiscoveredSource, IngestedSource } from './types.js';
 import { fetchArxivAbstract } from './apis/arxiv.js';
+import { fetchExaContent } from './apis/exa.js';
+import { fetchRedditThread } from './apis/reddit.js';
 
 /**
  * Phase 2: Deep-read sources. Fetch full content for each source.
@@ -37,6 +39,10 @@ async function ingestSingle(
       case 'repo':
         return await ingestRepo(source, fetchFn);
       case 'article':
+        // Reddit threads get native JSON ingestion (richer than page fetch)
+        if (source.sourceApi === 'reddit') {
+          return await ingestRedditThread(source);
+        }
         return await ingestArticle(source, fetchFn);
       default:
         return null;
@@ -106,11 +112,39 @@ async function ingestArticle(
   source: DiscoveredSource,
   fetchFn: (url: string) => Promise<string>,
 ): Promise<IngestedSource> {
-  const content = await fetchFn(source.url);
+  // Try Exa content extraction first (handles JS-rendered pages better than Jina)
+  let content = '';
+  if (source.sourceApi === 'exa') {
+    content = (await fetchExaContent(source.url)) ?? '';
+  }
+  // Fall back to Jina Reader (the fetchFn passed from the CLI)
+  if (!content) {
+    content = await fetchFn(source.url).catch(() => '');
+  }
+  // Last resort: use the abstract we already have
+  if (!content && source.abstract) {
+    content = source.abstract;
+  }
 
   return {
     ...source,
     sections: [{ heading: 'Article', content: content.slice(0, 20_000) }],
+    references: [],
+    fullText: content.slice(0, 30_000),
+  };
+}
+
+async function ingestRedditThread(source: DiscoveredSource): Promise<IngestedSource> {
+  // Extract the permalink path from the full URL
+  const urlObj = new URL(source.url);
+  const permalink = urlObj.pathname;
+
+  const threadContent = await fetchRedditThread(permalink);
+  const content = threadContent ?? source.abstract ?? source.title;
+
+  return {
+    ...source,
+    sections: [{ heading: 'Reddit Thread', content: content.slice(0, 20_000) }],
     references: [],
     fullText: content.slice(0, 30_000),
   };

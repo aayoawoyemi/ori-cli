@@ -1,31 +1,23 @@
 import React, { useState, useCallback, useMemo } from 'react';
 import { Box, Text, useInput } from 'ink';
 import { Select, type SelectOption } from './select.js';
-import { colors } from './theme.js';
+import { colors, figures } from './theme.js';
 import type { EffortLevel } from '../router/index.js';
 import type { ExperimentalConfig } from '../config/types.js';
 
-// ── Effort ────────────────────────────────────────────────────────────────
-
-import { figures } from './theme.js';
-
 const EFFORT_SYMBOLS: Record<EffortLevel, string> = {
-  low:    figures.effortLow,
+  low: figures.effortLow,
   medium: figures.effortMedium,
-  high:   figures.effortHigh,
+  high: figures.effortHigh,
 };
 
 const EFFORT_LEVELS: EffortLevel[] = ['low', 'medium', 'high'];
 
 function cycleEffort(current: EffortLevel, direction: 'left' | 'right'): EffortLevel {
   const idx = EFFORT_LEVELS.indexOf(current);
-  if (direction === 'right') {
-    return EFFORT_LEVELS[(idx + 1) % EFFORT_LEVELS.length]!;
-  }
+  if (direction === 'right') return EFFORT_LEVELS[(idx + 1) % EFFORT_LEVELS.length]!;
   return EFFORT_LEVELS[(idx - 1 + EFFORT_LEVELS.length) % EFFORT_LEVELS.length]!;
 }
-
-// ── Model Definitions ──────────────────────────────────────────────────────
 
 interface ModelOption {
   value: string;
@@ -37,82 +29,98 @@ interface ModelOption {
 
 interface ModelFamily {
   name: string;
+  description: string;
   models: ModelOption[];
 }
 
 const MODEL_FAMILIES: ModelFamily[] = [
   {
     name: 'Anthropic (Claude)',
+    description: 'API key required',
     models: [
-      { value: 'opus',   label: 'Opus 4.6',    description: '1M · Most capable',     supportsEffort: true,  defaultEffort: 'high' },
-      { value: 'sonnet', label: 'Sonnet 4.6',   description: '200K · Everyday tasks',  supportsEffort: true,  defaultEffort: 'medium' },
-      { value: 'haiku',  label: 'Haiku 4.5',    description: '200K · Fast + cheap',    supportsEffort: true,  defaultEffort: 'low' },
+      { value: 'opus', label: 'Opus 4.6', description: '1M - Most capable', supportsEffort: true, defaultEffort: 'high' },
+      { value: 'sonnet', label: 'Sonnet 4.6', description: '200K - Everyday tasks', supportsEffort: true, defaultEffort: 'medium' },
+      { value: 'haiku', label: 'Haiku 4.5', description: '200K - Fast + cheap', supportsEffort: true, defaultEffort: 'low' },
     ],
   },
   {
     name: 'Google (Gemini)',
+    description: 'API key required',
     models: [
-      { value: 'gemini', label: 'Gemini 2.5 Pro',   description: '1M · Strong reasoning', supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'flash',  label: 'Gemini 2.5 Flash',  description: '1M · Fast',             supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'gemini', label: 'Gemini 2.5 Pro', description: '1M - Strong reasoning', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'flash', label: 'Gemini 2.5 Flash', description: '1M - Fast', supportsEffort: false, defaultEffort: 'medium' },
     ],
   },
   {
     name: 'OpenAI (API key)',
+    description: 'API key required',
     models: [
-      { value: 'gpt5',    label: 'GPT-5',    description: '1M',                supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'gpt4o',   label: 'GPT-4o',   description: '128K',              supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'o4-mini', label: 'o4-mini',   description: '200K · Reasoning',  supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'gpt5', label: 'GPT-5', description: '1M', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'gpt4o', label: 'GPT-4o', description: '128K', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'o4-mini', label: 'o4-mini', description: '200K - Reasoning', supportsEffort: false, defaultEffort: 'medium' },
     ],
   },
   {
     name: 'ChatGPT (subscription)',
+    description: 'Local OAuth subscription',
     models: [
-      { value: 'gpt-5.4',      label: 'gpt-5.4 (default)', description: 'Latest frontier agentic coding model',          supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'gpt-5.4-mini', label: 'gpt-5.4-mini',      description: 'Smaller frontier agentic coding model',         supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'gpt-5.3',      label: 'gpt-5.3-codex',     description: 'Frontier Codex-optimized agentic coding model', supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'gpt-5.2',      label: 'gpt-5.2',           description: 'Optimized for professional work and long-running agents', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'gpt-5.4', label: 'gpt-5.4 (default)', description: 'Latest frontier agentic coding model', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'gpt-5.4-mini', label: 'gpt-5.4-mini', description: 'Smaller frontier agentic coding model', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'gpt-5.3', label: 'gpt-5.3-codex', description: 'Frontier Codex-optimized agentic coding model', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'gpt-5.2', label: 'gpt-5.2', description: 'Optimized for long-running agents', supportsEffort: false, defaultEffort: 'medium' },
     ],
   },
   {
-    name: 'Open Source',
+    name: 'Open Models (direct APIs)',
+    description: 'DashScope, Moonshot, Groq, DeepSeek',
     models: [
-      { value: 'deepseek',    label: 'DeepSeek V3',      description: '128K',              supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'deepseek-r1', label: 'DeepSeek R1',      description: '128K · Reasoning',  supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'qwen3.6',     label: 'Qwen3.6-Plus',     description: '131K · DashScope',  supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'qwen3',       label: 'Qwen3 235B',       description: '131K · DashScope',  supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'kimi',        label: 'Kimi K2',          description: '128K · Moonshot',   supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'llama',       label: 'Llama 3.3 70B',    description: '128K · Groq',       supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'gemma4',      label: 'Gemma 4 26B',      description: '262K · OpenRouter', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'deepseek', label: 'DeepSeek V3', description: '128K', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'deepseek-r1', label: 'DeepSeek R1', description: '128K - Reasoning', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'qwen3.6', label: 'Qwen3.6-Plus', description: '131K - DashScope', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'qwen3', label: 'Qwen3 235B', description: '131K - DashScope', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'kimi', label: 'Kimi K2', description: '128K - Moonshot', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'llama', label: 'Llama 3.3 70B', description: '128K - Groq', supportsEffort: false, defaultEffort: 'medium' },
+    ],
+  },
+  {
+    name: 'OpenRouter (paid)',
+    description: 'One key, routed providers',
+    models: [
+      { value: 'qwen3.6-or', label: 'Qwen3.6-Plus', description: '131K', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'glm5', label: 'GLM 5.1', description: '203K', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'gemma4', label: 'Gemma 4 26B', description: '262K', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'deepseek-v3', label: 'DeepSeek V3.2', description: '131K', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'minimax', label: 'MiniMax M2.7', description: '1M', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'gemini-flash', label: 'Gemini 3 Flash', description: '1M - Preview', supportsEffort: false, defaultEffort: 'medium' },
     ],
   },
   {
     name: 'Local',
+    description: 'llama.cpp / localhost',
     models: [
-      { value: 'devstral',       label: 'Devstral',       description: '131K · llama.cpp',  supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'qwen-coder-7b',  label: 'Qwen Coder 7B',  description: '32K · llama.cpp',   supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'qwen-coder-3b',  label: 'Qwen Coder 3B',  description: '32K · llama.cpp',   supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'local',          label: 'Local (Ollama)',  description: '128K · localhost',   supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'devstral', label: 'Devstral', description: '131K - llama.cpp', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'qwen-coder-7b', label: 'Qwen Coder 7B', description: '32K - llama.cpp', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'qwen-coder-3b', label: 'Qwen Coder 3B', description: '32K - llama.cpp', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'local', label: 'Local (Ollama)', description: '128K - localhost', supportsEffort: false, defaultEffort: 'medium' },
     ],
   },
   {
     name: 'OpenRouter (free)',
+    description: 'Rate-limited free tier',
     models: [
-      { value: 'qwen3.6-free', label: 'Qwen3.6 (free)',     description: '131K · Rate-limited', supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'qwen3-free',   label: 'Qwen3 235B (free)',   description: '131K · Rate-limited', supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'gemma4-free',  label: 'Gemma 4 26B (free)',  description: '262K · Rate-limited', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'qwen3.6-free', label: 'Qwen3.6 (free)', description: '131K - Rate-limited', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'qwen3-free', label: 'Qwen3 235B (free)', description: '131K - Rate-limited', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'gemma4-free', label: 'Gemma 4 26B (free)', description: '262K - Rate-limited', supportsEffort: false, defaultEffort: 'medium' },
     ],
   },
 ];
 
-// Find which family the current model belongs to
 function findCurrentFamily(currentModel: string): number {
   for (let i = 0; i < MODEL_FAMILIES.length; i++) {
     if (MODEL_FAMILIES[i]!.models.some(m => m.value === currentModel)) return i;
   }
   return 0;
 }
-
-// ── Props ──────────────────────────────────────────────────────────────────
 
 export interface ModelPickerProps {
   currentModel: string;
@@ -121,9 +129,6 @@ export interface ModelPickerProps {
   onCancel: () => void;
   experimental?: ExperimentalConfig;
 }
-
-// ── ModelPicker Component ──────────────────────────────────────────────────
-// Two-tier: families → models. Enter drills in, Backspace goes back.
 
 const SUBSCRIPTION_MODELS = new Set(['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3', 'gpt-5.2']);
 
@@ -143,13 +148,11 @@ export function ModelPicker({
 
   const currentFamilyIdx = findCurrentFamily(currentModel);
 
-  // ── Family view ────────────────────────────────────────────────────────
-
   const familyOptions: SelectOption<number>[] = useMemo(
     () => MODEL_FAMILIES.map((f, i) => ({
       value: i,
       label: f.name,
-      description: i === currentFamilyIdx ? '← current' : undefined,
+      description: i === currentFamilyIdx ? `${f.description} - current` : f.description,
     })),
     [currentFamilyIdx],
   );
@@ -157,13 +160,10 @@ export function ModelPicker({
   const handleFamilySelect = useCallback((idx: number) => {
     setSelectedFamily(idx);
     const family = MODEL_FAMILIES[idx]!;
-    // Pre-select current model if in this family, else first model
     const currentInFamily = family.models.find(m => m.value === currentModel);
     setFocusedModel(currentInFamily?.value ?? family.models[0]!.value);
     setPhase('model');
   }, [currentModel]);
-
-  // ── Model view ─────────────────────────────────────────────────────────
 
   const family = MODEL_FAMILIES[selectedFamily]!;
 
@@ -177,11 +177,7 @@ export function ModelPicker({
   );
 
   const handleModelSelect = useCallback((value: string) => {
-    if (SUBSCRIPTION_MODELS.has(value) && !oauthEnabled) {
-      // Don't call onSelect — the render will show the notice instead.
-      // We just ignore the selection silently; the notice is visible above.
-      return;
-    }
+    if (SUBSCRIPTION_MODELS.has(value) && !oauthEnabled) return;
     onSelect(value, effort);
   }, [onSelect, effort, oauthEnabled]);
 
@@ -193,13 +189,11 @@ export function ModelPicker({
     }
   }, [hasToggledEffort, family]);
 
-  // Backspace in model view → back to families
   useInput((_input, key) => {
     if (phase === 'model' && key.backspace) {
       setPhase('family');
       return;
     }
-    // Effort cycling (model view only)
     if (phase === 'model') {
       const focused = family.models.find(m => m.value === focusedModel);
       if (!focused?.supportsEffort) return;
@@ -218,13 +212,12 @@ export function ModelPicker({
   const supportsEffort = focusedConfig?.supportsEffort ?? false;
   const defaultEffort = focusedConfig?.defaultEffort ?? 'medium';
 
-  // ── Render ─────────────────────────────────────────────────────────────
-
   if (phase === 'family') {
     return (
       <Box flexDirection="column" paddingTop={1}>
         <Box marginBottom={1} flexDirection="column">
           <Text color={colors.suggestion} bold>Select provider</Text>
+          <Text dimColor>OpenRouter paid models are in "OpenRouter (paid)".</Text>
           <Text dimColor>Enter to select, Esc to cancel.</Text>
         </Box>
         <Select
@@ -232,7 +225,7 @@ export function ModelPicker({
           defaultValue={currentFamilyIdx}
           onChange={handleFamilySelect}
           onCancel={onCancel}
-          visibleCount={6}
+          visibleCount={Math.min(9, familyOptions.length)}
         />
         <Box marginTop={1}>
           <Text dimColor italic>Enter select | Esc cancel</Text>
@@ -256,7 +249,6 @@ export function ModelPicker({
         visibleCount={Math.min(8, family.models.length)}
       />
 
-      {/* Effort indicator */}
       <Box marginTop={1} marginBottom={1}>
         {supportsEffort ? (
           <Text dimColor>
@@ -264,7 +256,7 @@ export function ModelPicker({
             {' '}{effort.charAt(0).toUpperCase() + effort.slice(1)} effort
             {effort === defaultEffort ? ' (default)' : ''}
             {'  '}
-            <Text color={colors.dim}>← → to adjust</Text>
+            <Text color={colors.dim}>left/right to adjust</Text>
           </Text>
         ) : (
           <Text color={colors.dim}>
@@ -273,11 +265,10 @@ export function ModelPicker({
         )}
       </Box>
 
-      {/* ChatGPT subscription notice */}
       {family.name === 'ChatGPT (subscription)' && !oauthEnabled && (
         <Box marginTop={1}>
           <Text color={colors.warning}>
-            ⚠ Requires experimental.localChatGPTSubscription: true in ~/.aries/config.yaml
+            Requires experimental.localChatGPTSubscription: true in ~/.aries/config.yaml
           </Text>
         </Box>
       )}

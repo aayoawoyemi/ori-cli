@@ -896,6 +896,66 @@ export function App(props: AppProps): React.ReactElement {
       case '/cost':
       case '/usage': {
         const tracker = trackerRef.current;
+
+        if (arg === 'week' || arg === 'history') {
+          // ── Historical view: last 7 days ──
+          const now = new Date();
+          const weekAgo = new Date(now);
+          weekAgo.setDate(weekAgo.getDate() - 6);
+          const fmt = (d: Date) => d.toISOString().slice(0, 10);
+          const range = UsageTracker.aggregateRange(fmt(weekAgo), fmt(now));
+
+          const daysActive = range.days.length;
+          const modelTotals: Record<string, { turns: number; cost: number }> = {};
+          for (const day of range.days) {
+            // Reload per-day records to get model breakdown
+            const records = UsageTracker.loadDay(day.date);
+            for (const r of records) {
+              if (!modelTotals[r.model]) modelTotals[r.model] = { turns: 0, cost: 0 };
+              modelTotals[r.model].turns++;
+              modelTotals[r.model].cost += r.costEstimate;
+            }
+          }
+
+          const modelLines = Object.entries(modelTotals)
+            .sort((a, b) => b[1].cost - a[1].cost)
+            .map(([model, data]) =>
+              `  ${model.slice(0, 22).padEnd(22)} ${String(data.turns).padStart(5)} turns  ${formatCost(data.cost).padStart(9)}`
+            ).join('\n');
+
+          const dailyLines = range.days.map(d => {
+            const label = new Date(d.date + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+            const heaviest = d.cost === Math.max(...range.days.map(x => x.cost)) ? ' ← heaviest' : '';
+            return `  ${label.padEnd(6)} ${String(d.turns).padStart(5)} turns  ${formatCost(d.cost).padStart(9)}${heaviest}`;
+          }).join('\n');
+
+          const text = [
+            `**Usage — Last 7 Days**`,
+            '',
+            '```',
+            `  Days active: ${daysActive}/7`,
+            `  Total turns: ${range.total.turns.toLocaleString()}`,
+            `  Total input:  ${formatTokenCount(range.total.input).padStart(8)} tokens`,
+            `  Total output: ${formatTokenCount(range.total.output).padStart(8)} tokens`,
+            `  Total cost:   ${formatCost(range.total.cost).padStart(8)}`,
+            '```',
+            '',
+            '**By model:**',
+            '```',
+            modelLines || '  (no data)',
+            '```',
+            '',
+            '**Daily:**',
+            '```',
+            dailyLines || '  (no data)',
+            '```',
+          ].join('\n');
+
+          setDisplayMessages(prev => [...prev, { role: 'assistant', text }]);
+          break;
+        }
+
+        // ── Default: current session ──
         const totals = tracker.totals;
         const recent = tracker.lastTurns(10);
 
@@ -929,6 +989,8 @@ export function App(props: AppProps): React.ReactElement {
           totals.turns > 0 ? '```' : '',
           turnLines,
           totals.turns > 0 ? '```' : '',
+          '',
+          `Use \`/cost week\` for 7-day history`,
         ].filter(Boolean).join('\n');
 
         setDisplayMessages(prev => [...prev, { role: 'assistant', text }]);
@@ -974,39 +1036,53 @@ export function App(props: AppProps): React.ReactElement {
         break;
       }
 
-      case '/research': {
-        if (!arg) {
-          setDisplayMessages(prev => [...prev, {
-            role: 'assistant', text: 'Usage: `/research "query" --depth standard`',
-          }]);
+        case '/research': {
+          if (!arg) {
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant', text: 'Usage: `/research "query" [--depth standard] [--builds-on slug]`',
+            }]);
+            break;
+          }
+          setIsLoading(true);
+          let depth: ResearchDepth = 'standard';
+          let query = arg;
+          let buildsOn: string | undefined;
+          const depthMatch = arg.match(/--depth\s+(quick|standard|deep|exhaustive)/);
+          if (depthMatch) {
+            depth = depthMatch[1] as ResearchDepth;
+            query = query.replace(/--depth\s+\w+/, '');
+          }
+          const buildsOnMatch = query.match(/--builds-on\s+([\w-]+)/);
+          if (buildsOnMatch) {
+            buildsOn = buildsOnMatch[1];
+            query = query.replace(/--builds-on\s+[\w-]+/, '');
+          }
+          query = query.trim().replace(/^["']|["']$/g, '');
+          const fetchFn = async (url: string) => {
+            const r = await fetch(`https://r.jina.ai/${url}`, {
+              headers: { Accept: 'text/markdown' },
+              signal: AbortSignal.timeout(15_000),
+            });
+            return r.ok ? await r.text() : '';
+          };
+          const outputDir = vault?.vaultPath
+            ? join(vault.vaultPath, 'research')
+            : join(cwd, 'research');
+          try {
+            const result = await runResearch(query, depth, router, {
+              fetchFn, outputDir, buildsOn,
+            });
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant', text: `${result.report}\n\n---\n*Saved to \`${result.artifactDir}\`*`,
+            }]);
+          } catch (err) {
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant', text: `Research failed: ${(err as Error).message}`,
+            }]);
+          }
+          setIsLoading(false);
           break;
         }
-        setIsLoading(true);
-        let depth: ResearchDepth = 'standard';
-        let query = arg;
-        const depthMatch = arg.match(/--depth\s+(quick|standard|deep|exhaustive)/);
-        if (depthMatch) {
-          depth = depthMatch[1] as ResearchDepth;
-          query = arg.replace(/--depth\s+\w+/, '').trim().replace(/^["']|["']$/g, '');
-        }
-        const fetchFn = async (url: string) => {
-          const r = await fetch(`https://r.jina.ai/${url}`, {
-            headers: { Accept: 'text/markdown' },
-            signal: AbortSignal.timeout(15_000),
-          });
-          return r.ok ? await r.text() : '';
-        };
-        try {
-          const report = await runResearch(query, depth, router, vault, fetchFn);
-          setDisplayMessages(prev => [...prev, { role: 'assistant', text: report }]);
-        } catch (err) {
-          setDisplayMessages(prev => [...prev, {
-            role: 'assistant', text: `Research failed: ${(err as Error).message}`,
-          }]);
-        }
-        setIsLoading(false);
-        break;
-      }
 
       case '/config': {
         const slots = router.slots;

@@ -56,9 +56,18 @@ const COST_PER_M: Record<string, CostTier> = {
   // Qwen (DashScope)
   'qwen3.6-plus':                 { input: 0.8, output: 2,   cacheRead: 0.2, cacheWrite: 0.8 },
   'qwen3-235b-a22b':              { input: 0.8, output: 2,   cacheRead: 0.2, cacheWrite: 0.8 },
+  // Qwen (OpenRouter IDs)
+  'qwen/qwen3.6-plus':            { input: 0.325, output: 1.95, cacheRead: 0.325, cacheWrite: 0.325 },
+  'qwen/qwen3.6-plus:free':       { input: 0,   output: 0,   cacheRead: 0,   cacheWrite: 0 },
+  'qwen/qwen3-235b-a22b':         { input: 0.8, output: 2,   cacheRead: 0.2, cacheWrite: 0.8 },
+  'qwen/qwen3-235b-a22b:free':    { input: 0,   output: 0,   cacheRead: 0,   cacheWrite: 0 },
   // Gemma 4 (via OpenRouter)
   'google/gemma-4-26b-a4b-it':      { input: 0.12, output: 0.40, cacheRead: 0.12, cacheWrite: 0.12 },
   'google/gemma-4-26b-a4b-it:free': { input: 0,    output: 0,    cacheRead: 0,    cacheWrite: 0 },
+  // GLM 5 (via OpenRouter)
+  'z-ai/glm-5.1':                 { input: 0.95, output: 3.15, cacheRead: 0.95, cacheWrite: 0.95 },
+  // Legacy GLM alias kept for historical log compatibility
+  'zai-org/glm-5':                { input: 0.95, output: 3.15, cacheRead: 0.95, cacheWrite: 0.95 },
   // Groq (free tier for now)
   'llama-3.3-70b-versatile':      { input: 0.59, output: 0.79, cacheRead: 0, cacheWrite: 0 },
 };

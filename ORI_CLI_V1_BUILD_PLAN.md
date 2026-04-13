@@ -479,6 +479,44 @@ The user experiences REPL via explicit `/repl` command. The model doesn't yet wr
 - Add reflection → identity feedback loop
 - New Ori primitives: vitalityTop, lastReflection, userModel, sessionArc
 
+### Phase 10.5 — Agentic Learning Architecture (week 6-7)
+
+Research backing: Advisor Models (arXiv:2510.02453) — small models learn to steer frontier models via RL on task outcomes. Sleep mode biological memory consolidation analogy. Experience from Aries CLI showing compaction-gated learning is dead code when sessions end before compaction.
+
+**10.5A. Detailed session logging** — `src/session/learningLog.ts` (NEW)
+```
+.aries/logs/{timestamp}.jsonl
+```
+Events: retrieval (query + notes + signal sources), tool_call (name, success, duration), user_correction (pattern), plan_decision (accept/reject), echo/fizzle per note. Wire into loop.ts alongside existing session storage. This is the data layer for everything downstream.
+
+**10.5B. Re-enable echo/fizzle for REPL mode** — `src/memory/echoFizzle.ts`
+Currently disabled because preflight is off in REPL mode. Adapt: track all vault notes returned by any `vault.query_*` call during a turn (via REPL bridge intercept or vault proxy logging). Run echo detection against those notes, not just preflight-injected notes. Critical: this is the only signal feeding Ori's Q-value system and it's been off since REPL became default.
+
+**10.5C. Decouple experience log from compaction** — `src/memory/experienceLog.ts`
+Currently `appendExperience()` only fires from `compact.ts extractAndSave()`. Users start new sessions instead of compacting, so the log never writes. Add triggers: session-end reflection, user correction detection, task outcome (edit pass/fail, plan accept/reject), sleep mode synthesis. Redesign format: categorized sections with utility weights, contradiction resolution (new replaces old, not append alongside).
+
+**10.5D. Sleep mode** — `src/session/sleepMode.ts` (NEW), `aries sleep` CLI command
+Dedicated processing time for retroactive learning:
+1. Load session logs since last sleep
+2. Compute tool success rates, retrieval hit rates, correction frequency
+3. Analyze which RRF signal source produced echoed vs fizzled notes
+4. Process user corrections into behavioral patterns
+5. Vault maintenance — find contradictions, update stale notes, strengthen connections
+6. Update agent-config.yaml with learned parameters
+7. Write synthesized experience entries
+
+Uses cheap model calls. The agent is its own best teacher — it knows what it needed and didn't have, what it had and didn't use.
+
+**10.5E. Agent config as learning medium** — `.aries/agent-config.yaml` (NEW)
+Harness-readable, agent-writable. Encodes procedural knowledge: retrieval weights (RRF coefficients), communication preferences, tool strategies, known failure modes. Read at session start, updated during sleep mode. This is procedural memory — changes behavior, not just knowledge.
+
+**10.5F. Cheap model advisory pass** — `src/memory/advisory.ts` (NEW)
+Move the cheap model from postflight (cleanup) to preflight (steering). Before each expensive model call, cheap model receives query + retrieved notes + codebase context and generates:
+- Which retrieved notes matter most for this specific query and why
+- Suggested strategy (refactor? bug hunt? architecture?)
+- Warnings (contradictions, known failure patterns)
+Injected as `<advisory>` block. `shouldAdvise()` gate avoids latency on simple queries. Research validation: Advisor Models paper shows 7B model advising GPT-5 produces 71% improvement on specialized tasks.
+
 ### Phase 11 — Cognitive Anywhere (v1.1, post-v1.0)
 - `src/cognition/` module
 - Logprobs parsing in providers
@@ -520,6 +558,14 @@ src/signature/
 ├── codebase.ts            # compile codebase graph → 1K signature
 ├── vault.ts               # load vault compilation → 1-1.5K signature
 └── delta.ts               # delta update mechanism
+
+src/session/
+├── learningLog.ts           # structured JSONL session logging (Phase 10.5)
+└── sleepMode.ts             # retroactive session analysis + learning (Phase 10.5)
+
+src/memory/
+├── advisory.ts              # cheap model upstream advisory pass (Phase 10.5)
+└── (experienceLog.ts)       # existing — redesign for categorized + utility-weighted (Phase 10.5)
 
 src/cognition/              # (v1.1, Phase 11)
 ├── entropyMonitor.ts
@@ -713,5 +759,6 @@ Everything downstream of that answer.
   - Benchmark runner upgraded to multi-task + multi-run matrix with isolated temp workspaces (`read`, `write`, `refactor`, N runs per variant) and summary stats (mean/median/min/max) for tokens, wall time, turns, and success rate.
   - Architecture result retained: additive harness (REPL + legacy) can be slower due mixed-affordance zigzag; mandatory harness is the constraint that unlocks the token/time win.
 - **Phase 8** (Judgment tools) — pending
+- **Phase 10.5** (Agentic Learning Architecture) — planned. Research complete (Advisor Models paper 2510.02453). Design spec in V1-ROADMAP.md Phase 4. Covers: session logging, echo/fizzle re-enable, experience log decouple, sleep mode, agent-config, cheap model advisory.
 
 **Total test coverage:** 125+ tests passing across all shipped phases.

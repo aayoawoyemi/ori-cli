@@ -75,7 +75,8 @@ const MODEL_SHORTCUTS: Record<string, ModelShortcut> = {
   'minimax':       { provider: 'openrouter', model: 'minimax/minimax-m2.7',         contextWindow: 1_000_000 },
   'deepseek-v3':   { provider: 'openrouter', model: 'deepseek/deepseek-v3.2',       contextWindow: 131_072 },
   'gemini-flash':  { provider: 'openrouter', model: 'google/gemini-3-flash-preview', contextWindow: 1_000_000 },
-  'glm5':          { provider: 'openrouter', model: 'zai-org/glm-5',               contextWindow: 128_000 },
+  'glm5':          { provider: 'openrouter', model: 'z-ai/glm-5.1',                 contextWindow: 202_752 },
+  'glm5.1':        { provider: 'openrouter', model: 'z-ai/glm-5.1',                 contextWindow: 202_752 },
   'gemma4':        { provider: 'openrouter', model: 'google/gemma-4-26b-a4b-it',    contextWindow: 262_144 },
 
   // â”€â”€ Local (llama.cpp via openai-compatible API on port 8080) â”€â”€â”€â”€â”€â”€
@@ -239,7 +240,7 @@ export class ModelRouter {
         model: shortcut.model,
         contextWindow: shortcut.contextWindow,
         maxTokens: Math.min(EFFORT_CONFIG[this._effort].maxTokens, shortcut.maxOutputTokens ?? Infinity),
-        auth: shortcut.auth ?? this.primaryConfig.auth,
+        auth: shortcut.auth ?? 'api_key',
         apiKey: resolvedApiKey,
         baseUrl: shortcut.baseUrl,
       };
@@ -336,5 +337,4 @@ export class ModelRouter {
     return Object.keys(MODEL_SHORTCUTS).filter(k => !k.includes('-'));
   }
 }
-
 

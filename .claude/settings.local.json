@@ -10,7 +10,24 @@
       "Bash(node --experimental-strip-types --experimental-vm-modules test/anthropicProviderRateLimit.test.ts)",
       "Bash(echo \"build: $?\")",
       "Bash(node test/anthropicProviderRateLimit.test.ts)",
-      "Bash(npx tsx:*)"
+      "Bash(npx tsx:*)",
+      "Bash(dir /b /s /ad C:\\\\Users\\\\aayoa\\\\Desktop)",
+      "Bash(findstr /i \"court coin\")",
+      "Bash(findstr /i /c:\"court\" /c:\"coin\")",
+      "Bash(dir:*)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); o=d.get\\('claudeAiOauth',{}\\); print\\('expiresAt:', o.get\\('expiresAt'\\)\\); print\\('has refresh:', bool\\(o.get\\('refreshToken'\\)\\)\\); print\\('sub:', o.get\\('subscriptionType'\\)\\)\")",
+      "Bash(python3:*)",
+      "Bash(node:*)",
+      "Bash(npm list:*)",
+      "Bash(where claude:*)",
+      "Bash(grep:*)",
+      "WebSearch",
+      "Bash(xargs wc:*)",
+      "Bash(git add:*)",
+      "Bash(git push:*)",
+      "Bash(printenv)",
+      "Bash(cmd.exe:*)",
+      "Bash(curl:*)"
     ]
   }
 }

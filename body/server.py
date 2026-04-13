@@ -122,6 +122,8 @@ def _build_namespace() -> dict:
         "id": id,
         "isinstance": isinstance,
         "issubclass": issubclass,
+        "hasattr": hasattr,
+        "type": type,
         "iter": iter,
         "next": next,
         "callable": callable,
@@ -155,6 +157,7 @@ def _build_namespace() -> dict:
     # Always available: fs.read() for arbitrary file access
     import types as _types
     import pathlib as _pathlib
+    import json as _json
 
     def _fs_read(path: str, offset: int = 0, limit: int | None = None) -> str:
         p = _pathlib.Path(path).expanduser().resolve()
@@ -189,6 +192,7 @@ def _build_namespace() -> dict:
         return sorted(results)
 
     ns["fs"] = _types.SimpleNamespace(read=_fs_read, listdir=_fs_listdir, glob=_fs_glob)
+    ns["json"] = _json
     # Always available: reindex to point the body at a different project
     ns["reindex"] = _reindex
     # Phase 2: expose codebase object if indexed
