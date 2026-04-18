@@ -6,14 +6,9 @@ export const DEFAULT_CONFIG: AriesConfig = {
   },
   timezone: 'America/Chicago',
   displayMode: 'normal',
-  models: {
-    primary: {
-      provider: 'anthropic',
-      model: 'claude-sonnet-4-6',
-      contextWindow: 200_000,
-      maxTokens: 16_384,
-    },
-  },
+  // No hardcoded model. Users configure slots in ~/.aries/config.yaml.
+  // The router throws a readable error at first call if primary is unset.
+  models: {} as AriesConfig['models'],
   vault: {
     preflight: true,
     postflight: true,
@@ -55,7 +50,7 @@ export const DEFAULT_CONFIG: AriesConfig = {
   },
   hooks: {},
   repl: {
-    enabled: false,
+    enabled: 'auto',
     timeoutMs: 30_000,
     maxIterations: 1000,
     maxRlmCalls: 10,

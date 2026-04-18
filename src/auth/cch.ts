@@ -1,11 +1,23 @@
 import { createHash } from 'node:crypto';
+import { execSync } from 'node:child_process';
 
 // ── Constants (from reverse-engineered Claude Code binary) ───────────────────
-// These change with Claude Code releases. Update VERSION when Claude Code updates.
-// Salt verified unchanged in 2.1.92 (same as 2.1.37).
+// Salt verified unchanged across multiple releases.
+// VERSION is detected at startup from `claude --version` so it stays in sync.
 
-const VERSION = '2.1.92';
 const SALT = '59cf53e54c78';
+
+function detectClaudeVersion(fallback: string): string {
+  try {
+    const out = execSync('claude --version', { timeout: 3000, encoding: 'utf8' }).trim();
+    const m = out.match(/^(\d+\.\d+\.\d+)/);
+    return m ? m[1] : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+const VERSION = detectClaudeVersion('2.1.112');
 
 // ── Version Suffix ──────────────────────────────────────────────────────────
 

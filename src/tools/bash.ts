@@ -54,6 +54,25 @@ const WEB_BLOCKED = [
   /^curl\s/, /^wget\s/, /^http\s/,
 ];
 
+// Win32-blocked — these Unix commands don't exist or behave wrong on Windows.
+// Forces the model to use native tools (Read, Glob, Grep) instead of wasting
+// turns on commands that will fail. Applied regardless of REPL mode.
+const WIN32_BLOCKED = [
+  /^ls\s/,    // no ls on win32 — use Glob or dir
+  /^cat\s/,   // unreliable on win32 — use Read tool
+  /^head\s/,  // same
+  /^tail\s/,  // same
+  /^less\s/,  // same
+  /^more\s/,  // same (Windows more.com behaves differently)
+  /^bat\s/,   // same
+  /^grep\s/,  // no grep on win32 — use Grep tool
+  /^rg\s/,    // may not be on PATH — use Grep tool
+  /^find\s/,  // Windows find.exe is NOT Unix find — use Glob tool
+  /^fd\s/,    // may not be on PATH — use Glob tool
+  /^ag\s/,    // same
+  /^ack\s/,   // same
+];
+
 
 function isCommandAllowed(command: string, replEnabled: boolean): { allowed: boolean; reason?: string } {
   const trimmed = command.trim();
@@ -91,6 +110,25 @@ function isCommandAllowed(command: string, replEnabled: boolean): { allowed: boo
     }
   }
 
+  // Win32 blocks — Unix commands that fail or misbehave on Windows
+  if (platform() === 'win32') {
+    for (const pattern of WIN32_BLOCKED) {
+      if (pattern.test(trimmed)) {
+        const cmd = trimmed.split(' ')[0];
+        const nativeTool = {
+          ls: 'Glob', cat: 'Read', head: 'Read', tail: 'Read',
+          less: 'Read', more: 'Read', bat: 'Read',
+          grep: 'Grep', rg: 'Grep', find: 'Glob', fd: 'Glob',
+          ag: 'Grep', ack: 'Grep',
+        }[cmd!] ?? 'Read/Glob/Grep';
+        return {
+          allowed: false,
+          reason: `Blocked on Windows: "${cmd}" is not available. Use the ${nativeTool} tool instead.`,
+        };
+      }
+    }
+  }
+
   // Check if first token is whitelisted
   const firstToken = trimmed.split(/\s/)[0]!.toLowerCase();
   // Handle paths (e.g., ./node_modules/.bin/tsc)
@@ -100,16 +138,25 @@ function isCommandAllowed(command: string, replEnabled: boolean): { allowed: boo
     return { allowed: true };
   }
 
-  // Allow piped commands if the first command is allowed
+  // Pipes and chains: validate EVERY command in the chain, not just the first.
+  // Previously only the first command was checked, letting blocked commands
+  // like "head" or "grep" sneak through via piping (e.g. "npx tsc | head -5").
   if (trimmed.includes('|')) {
-    const firstCmd = trimmed.split('|')[0]!.trim();
-    return isCommandAllowed(firstCmd, replEnabled);
+    const segments = trimmed.split('|').map(s => s.trim()).filter(Boolean);
+    for (const seg of segments) {
+      const result = isCommandAllowed(seg, replEnabled);
+      if (!result.allowed) return result;
+    }
+    return { allowed: true };
   }
 
-  // Allow && / || chained commands if first is allowed
   if (trimmed.includes('&&') || trimmed.includes('||')) {
-    const firstCmd = trimmed.split(/&&|\|\|/)[0]!.trim();
-    return isCommandAllowed(firstCmd, replEnabled);
+    const segments = trimmed.split(/&&|\|\|/).map(s => s.trim()).filter(Boolean);
+    for (const seg of segments) {
+      const result = isCommandAllowed(seg, replEnabled);
+      if (!result.allowed) return result;
+    }
+    return { allowed: true };
   }
 
   return {

@@ -2,17 +2,20 @@ import type { DiscoveredSource } from '../types.js';
 
 const OA_API = 'https://api.openalex.org';
 
-/** Search OpenAlex for scholarly works. Free, no API key needed. */
-export async function searchOpenAlex(query: string, limit = 20): Promise<DiscoveredSource[]> {
+/** Search OpenAlex for scholarly works. Free, no API key needed. `page` supports pagination. */
+export async function searchOpenAlex(query: string, limit = 20, page = 1, onError?: (msg: string) => void): Promise<DiscoveredSource[]> {
   const encoded = encodeURIComponent(query);
-  const url = `${OA_API}/works?search=${encoded}&per_page=${limit}&sort=relevance_score:desc&select=id,title,authorships,publication_year,cited_by_count,doi,primary_location`;
+  const url = `${OA_API}/works?search=${encoded}&per_page=${limit}&page=${page}&sort=relevance_score:desc&select=id,title,authorships,publication_year,cited_by_count,doi,primary_location`;
 
   try {
     const response = await fetch(url, {
       headers: { 'User-Agent': 'Aries-CLI/0.1.0 (mailto:aries@ori-memory.dev)' },
       signal: AbortSignal.timeout(15_000),
     });
-    if (!response.ok) return [];
+    if (!response.ok) {
+      onError?.(`OpenAlex search returned ${response.status} for query "${query}"`);
+      return [];
+    }
 
     const data = await response.json() as {
       results?: Array<{
@@ -38,7 +41,8 @@ export async function searchOpenAlex(query: string, limit = 20): Promise<Discove
         citationCount: w.cited_by_count ?? 0,
         type: 'paper' as const,
       }));
-  } catch {
+  } catch (e) {
+    onError?.(`OpenAlex search failed: ${e instanceof Error ? e.message : String(e)}`);
     return [];
   }
 }

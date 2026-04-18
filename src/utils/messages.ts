@@ -74,7 +74,13 @@ export function healOrphanedToolUses(messages: Message[]): number {
 
     const next = messages[i + 1];
     const existingResultIds = new Set<string>();
-    if (next && next.role === 'user' && Array.isArray(next.content)) {
+    const nextIsToolResultOnly =
+      next &&
+      next.role === 'user' &&
+      Array.isArray(next.content) &&
+      (next.content as ContentBlock[]).every(b => b.type === 'tool_result');
+
+    if (nextIsToolResultOnly) {
       for (const block of next.content as ContentBlock[]) {
         if (block.type === 'tool_result') existingResultIds.add(block.tool_use_id);
       }
@@ -90,9 +96,13 @@ export function healOrphanedToolUses(messages: Message[]): number {
       is_error: true,
     }));
 
-    if (next && next.role === 'user' && Array.isArray(next.content)) {
+    if (nextIsToolResultOnly) {
+      // Safe to append — the next message is already a pure tool_result carrier.
       (next.content as ContentBlock[]).push(...syntheticResults);
     } else {
+      // The next message is absent, text/image-bearing, or otherwise mixed.
+      // Tool_result blocks cannot be mixed with text/image in the same user
+      // message, so insert a dedicated tool_result message before it.
       messages.splice(i + 1, 0, { role: 'user', content: syntheticResults });
     }
     healed += missing.length;

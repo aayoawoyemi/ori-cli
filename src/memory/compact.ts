@@ -5,6 +5,7 @@ import type { ProjectBrain } from './projectBrain.js';
 import { estimateTokens } from '../utils/tokens.js';
 import { getMessageText } from '../utils/messages.js';
 import { getWarmContextForCompaction } from './warmContext.js';
+import { stripSyntheticFromMessages } from './syntheticMarkers.js';
 import { appendExperience } from './experienceLog.js';
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -206,6 +207,11 @@ export async function runCompaction(
   const freedTokens = pruneToolOutputs(messages);
   const currentTokens = estimateTokens(messages);
 
+  // Strip synthetic injections (preflight, proprio) from a copy before summarizing.
+  // Prevents stale injected context from being baked into the compaction summary.
+  const cleanMessages = messages.map(m => ({ ...m, content: typeof m.content === 'string' ? m.content : [...m.content as ContentBlock[]] }));
+  stripSyntheticFromMessages(cleanMessages);
+
   // If pruning alone got us below threshold, we're done. No LLM call needed.
   if (freedTokens >= PRUNE_MINIMUM_TOKENS && currentTokens < contextThreshold) {
     return {
@@ -217,10 +223,10 @@ export async function runCompaction(
   }
 
   // ── Phase 1+2: Extract and save insights ────────────────────────────
-  const saved = await extractAndSave(messages, router, projectBrain, vault, projectDir);
+  const saved = await extractAndSave(cleanMessages, router, projectBrain, vault, projectDir);
 
   // ── Phase 3: Structured summary ─────────────────────────────────────
-  const summary = await generateStructuredSummary(messages, saved, router);
+  const summary = await generateStructuredSummary(cleanMessages, saved, router);
 
   // ── Phase 4: Replace ────────────────────────────────────────────────
   const savedInfo = saved.length > 0

@@ -26,9 +26,10 @@ import type { Message } from '../router/types.js';
 import { syncSession } from '../session/sync.js';
 import { runHooks } from '../hooks/runner.js';
 import type { HooksConfig, DisplayMode, ExperimentalConfig } from '../config/types.js';
+import type { ReplHandle } from '../repl/setup.js';
 import { runResearch } from '../research/index.js';
 import type { ResearchDepth } from '../research/types.js';
-import type { ReplHandle } from '../repl/setup.js';
+import { ResearchJournal, type ResearchJournalHandle } from './researchJournal.js';
 
 interface AppProps {
   agentName: string;
@@ -68,11 +69,20 @@ export function App(props: AppProps): React.ReactElement {
   const [activeTool, setActiveTool] = useState<string | undefined>();
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(initialPermissionMode ?? 'default');
+  // Ref mirror of permissionMode — read by handleSubmit's agentLoop call so
+  // changes are visible synchronously within the same event handler (React
+  // state updates don't flush until after the handler returns).
+  const permissionModeRef = useRef<PermissionMode>(initialPermissionMode ?? 'default');
   const [taskMode, setTaskMode] = useState<'normal' | 'explore'>('normal');
   const [showPlanApproval, setShowPlanApproval] = useState(false);
   const [planApprovalData, setPlanApprovalData] = useState<{ path: string; content: string } | null>(null);
   const planFilePathRef = useRef<string | null>(null);
   const prePlanModeRef = useRef<PermissionMode>('default');
+  const preResearchModeRef = useRef<PermissionMode>('default');
+  // Research run state — when true, the journal is rendered and Ctrl+C aborts.
+  const [researchRunning, setResearchRunning] = useState(false);
+  const researchJournalRef = useRef<ResearchJournalHandle | null>(null);
+  const researchAbortRef = useRef<AbortController | null>(null);
   const planApprovalResolveRef = useRef<((r: PlanApprovalResult) => void) | null>(null);
   const [exitWarningAt, setExitWarningAt] = useState<number | null>(null);
   const [displayMode, setDisplayMode] = useState<DisplayMode>('normal');
@@ -154,6 +164,11 @@ export function App(props: AppProps): React.ReactElement {
   useInput((input, key) => {
     // Ctrl+C → exit
     if (key.ctrl && input === 'c') {
+      // If a research run is live, Ctrl+C aborts it first.
+      if (researchRunning && researchAbortRef.current) {
+        researchAbortRef.current.abort();
+        return;
+      }
       // If loading, first Ctrl+C interrupts; second exits
       if (isLoading && abortRef.current) {
         abortRef.current.abort();
@@ -175,10 +190,14 @@ export function App(props: AppProps): React.ReactElement {
       return;
     }
 
-    // Esc → interrupt streaming / close model picker
+    // Esc → interrupt streaming / close model picker / abort research
     if (key.escape) {
       if (showModelPicker) {
         setShowModelPicker(false);
+        return;
+      }
+      if (researchRunning && researchAbortRef.current) {
+        researchAbortRef.current.abort();
         return;
       }
       if (isLoading && abortRef.current) {
@@ -226,7 +245,15 @@ export function App(props: AppProps): React.ReactElement {
     if ((key.meta && input === 'm') || (key.shift && key.tab)) {
       if (!isLoading) {
         setPermissionMode(prev => {
-          const modes: PermissionMode[] = ['default', 'accept', 'plan', 'research', 'yolo'];
+          // Research mode is NOT in the cycle — enterable only via /research.
+          // If we're currently in research mode, Alt+M exits to pre-research mode.
+          if (prev === 'research') {
+            const next = preResearchModeRef.current;
+            replHandle?.bridge.setResearchBudget(null);
+            setDisplayMessages(p => [...p, { role: 'system', text: `${figures.researchMode} Exited research mode → ${next}.`, subtype: 'info' }]);
+            return next;
+          }
+          const modes: PermissionMode[] = ['default', 'accept', 'plan', 'yolo'];
           const idx = modes.indexOf(prev);
           const next = modes[(idx + 1) % modes.length]!;
 
@@ -244,13 +271,6 @@ export function App(props: AppProps): React.ReactElement {
             messagesRef.current.push({ role: 'user', content: 'You are now in plan mode. Call EnterPlanMode to begin.' });
           }
 
-          // Entering research mode → inject research directive
-          if (next === 'research') {
-            const directive = '[RESEARCH MODE] You are in research mode. Explore broadly, follow dependencies, surface patterns, build a mental model. Do not write or modify files. Report findings concisely.';
-            setDisplayMessages(p => [...p, { role: 'system', text: `${figures.researchMode} Research mode — reads only. Alt+M to cycle.`, subtype: 'info' }]);
-            messagesRef.current.push({ role: 'user', content: directive });
-          }
-
           return next;
         });
       }
@@ -264,6 +284,23 @@ export function App(props: AppProps): React.ReactElement {
     return () => clearTimeout(timer);
   }, [exitWarningAt]);
 
+  // Keep permissionModeRef in sync with state for any updates that happen
+  // through React channels (Alt+M, /mode). Sync sites in the same event
+  // handler must also update the ref directly before calling handleSubmit.
+  useEffect(() => {
+    permissionModeRef.current = permissionMode;
+  }, [permissionMode]);
+
+  // Subscribe the usage tracker to router.cheapCall so research, compaction,
+  // postflight, and session-title spend all show up in /usage.
+  useEffect(() => {
+    const unsub = router.onCheapCallUsage(({ provider, model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens }) => {
+      trackerRef.current.markTurnStart();
+      trackerRef.current.recordTurn(model, provider, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens);
+    });
+    return unsub;
+  }, [router]);
+
   // Run sessionStart hooks + initial prompt
   useEffect(() => {
     (async () => {
@@ -273,6 +310,29 @@ export function App(props: AppProps): React.ReactElement {
       }
     })();
   }, []);
+
+  // Auto-exit research mode when research.save() completes in the bridge.
+  useEffect(() => {
+    if (!replHandle) return;
+    replHandle.bridge.setOnResearchSaved((dir: string) => {
+      // Only act if we're still in research mode (user may have Alt+M'd out already).
+      setPermissionMode(prev => {
+        if (prev !== 'research') return prev;
+        const next = preResearchModeRef.current;
+        setDisplayMessages(p => [...p, {
+          role: 'system',
+          text: `${figures.researchMode} Research saved → ${dir}. Mode: ${next}.`,
+          subtype: 'info',
+        }]);
+        return next;
+      });
+      // Clear the session budget so the next /research starts fresh.
+      replHandle.bridge.setResearchBudget(null);
+    });
+    return () => {
+      replHandle.bridge.setOnResearchSaved(null);
+    };
+  }, [replHandle]);
 
   // ── Model picker handlers ──────────────────────────────────────────
   const handleModelSelect = useCallback((model: string, effort: EffortLevel) => {
@@ -302,6 +362,25 @@ export function App(props: AppProps): React.ReactElement {
     planApprovalResolveRef.current?.(result);
     planApprovalResolveRef.current = null;
 
+    // Always save approved plan to .aries/plans/ before clearing temp file.
+    // Prevents data loss if model re-enters plan mode or tempdir is cleaned.
+    if (planFilePathRef.current) {
+      try {
+        const plansDir = join(cwd, '.aries', 'plans');
+        mkdirSync(plansDir, { recursive: true });
+        const dest = join(plansDir, basename(planFilePathRef.current));
+        copyFileSync(planFilePathRef.current, dest);
+        // Only show "saved" message if mode wasn't already 'save_plan' (which shows its own)
+        if (mode !== 'save_plan') {
+          setDisplayMessages(prev => [...prev, {
+            role: 'system',
+            text: `${figures.planMode} Plan archived to ${dest}`,
+            subtype: 'info',
+          }]);
+        }
+      } catch { /* copy error — temp file still exists */ }
+    }
+
     if (mode === 'clear_context' && planFilePathRef.current) {
       try {
         const plan = readFileSync(planFilePathRef.current, 'utf-8');
@@ -311,20 +390,19 @@ export function App(props: AppProps): React.ReactElement {
     }
 
     if (mode === 'save_plan' && planFilePathRef.current) {
+      // save_plan already archived above — just show explicit "saved" message
       try {
-        const plansDir = join(cwd, '.aries', 'plans');
-        mkdirSync(plansDir, { recursive: true });
-        const dest = join(plansDir, basename(planFilePathRef.current));
-        copyFileSync(planFilePathRef.current, dest);
+        const dest = join(cwd, '.aries', 'plans', basename(planFilePathRef.current));
         setDisplayMessages(prev => [...prev, {
           role: 'system',
           text: `${figures.planMode} Plan saved to ${dest}`,
           subtype: 'info',
         }]);
-      } catch { /* copy error — temp file still exists */ }
+      } catch { /* ignore */ }
     }
 
     const nextMode = mode === 'accept_edits' ? 'accept' as PermissionMode : prePlanModeRef.current;
+    permissionModeRef.current = nextMode; // sync ref immediately so running loop reads new mode
     setPermissionMode(nextMode);
     planFilePathRef.current = null;
     setDisplayMessages(prev => [...prev, {
@@ -454,7 +532,10 @@ export function App(props: AppProps): React.ReactElement {
         session,
         hooks,
         signal: abort.signal,
-        permissionMode,
+        // Read from the ref, not the closure — captures mode flips that
+        // happened in the same synchronous event handler (e.g. /research).
+        permissionMode: permissionModeRef.current,
+        permissionModeRef, // live ref — loop re-reads each turn for mid-loop mode changes (ExitPlanMode)
         alwaysAllowTools: alwaysAllowRef.current,
         identityContext: identityCtx,
         maxSubagents: 5,
@@ -804,12 +885,13 @@ export function App(props: AppProps): React.ReactElement {
         break;
 
       case '/mode': {
-        const MODES: PermissionMode[] = ['default', 'accept', 'plan', 'research', 'yolo'];
+        // Research mode is intentionally omitted — enter via /research <query> only.
+        const MODES: PermissionMode[] = ['default', 'accept', 'plan', 'yolo'];
         const MODE_DESC: Record<PermissionMode, string> = {
           default: 'Prompt for write tools',
           accept: 'Auto-approve edits, prompt for Bash',
           plan: 'Read-only planning with spec pass',
-          research: 'Read-only exploration mode',
+          research: 'Research mode — enter via /research <query>',
           yolo: 'Auto-approve everything',
         };
         if (arg && MODES.includes(arg as PermissionMode)) {
@@ -874,6 +956,90 @@ export function App(props: AppProps): React.ReactElement {
           }]);
         }
         break;
+
+      case '/research': {
+        // The only entry point to research mode. Dispatches runResearch
+        // directly (no LLM-in-the-loop orchestration) and renders a journal.
+        if (researchRunning) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'system',
+            text: 'A research run is already in progress. Press Ctrl+C to abort it first.',
+            subtype: 'info',
+          }]);
+          break;
+        }
+        if (!arg || !arg.trim()) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: '**Usage:** `/research <query> [--depth quick|standard|deep|exhaustive]`\n\nLaunches the curated research engine across arxiv, semantic scholar, openalex, github, wikipedia, reddit, and exa. Default depth is standard. No --depth needed. WebSearch/WebFetch are stripped for the duration; the pipeline runs on your behalf and the model summarizes the artifact at the end.',
+          }]);
+          break;
+        }
+        let depth: ResearchDepth = 'standard';
+        let query = arg.trim();
+        const depthMatch = query.match(/\s--depth\s+(quick|standard|deep|exhaustive)\b/);
+        if (depthMatch) {
+          depth = depthMatch[1] as ResearchDepth;
+          query = query.replace(depthMatch[0], '').trim();
+        }
+        if ((query.startsWith('"') && query.endsWith('"')) || (query.startsWith("'") && query.endsWith("'"))) {
+          query = query.slice(1, -1);
+        }
+
+        // Flip permission mode — model follow-ups after the run stay restricted.
+        preResearchModeRef.current = permissionMode;
+        permissionModeRef.current = 'research';
+        setPermissionMode('research');
+
+        // Set up the run
+        const outputDir = vault?.vaultPath
+          ? join(vault.vaultPath, 'research')
+          : join(cwd, 'research');
+        const fetchFn = async (url: string): Promise<string> => {
+          try {
+            const r = await fetch(`https://r.jina.ai/${url}`, {
+              headers: { Accept: 'text/markdown' },
+              signal: AbortSignal.timeout(25_000),
+            });
+            return r.ok ? await r.text() : '';
+          } catch {
+            return '';
+          }
+        };
+        const abortCtrl = new AbortController();
+        researchAbortRef.current = abortCtrl;
+        setResearchRunning(true);
+
+        // Fire-and-forget — the journal component handles live rendering via
+        // the event callback. When done, we push a directive and kick a model
+        // turn to summarize the artifact.
+        runResearch(query, depth, router, {
+          fetchFn,
+          outputDir,
+          onEvent: (event) => {
+            researchJournalRef.current?.push(event);
+          },
+          signal: abortCtrl.signal,
+        }).then(result => {
+          setResearchRunning(false);
+          researchAbortRef.current = null;
+          // Give the journal a beat to render the final save_done event.
+          setTimeout(() => {
+            const directive = `The research run finished. Artifact: ${result.artifactDir}\n\nRead \`${result.artifactDir}/report.md\` and give me a conversational summary — the key patterns, contradictions, and gaps you found. Quote findings with their source titles when you do. After the summary, ask if I want to go deeper on any thread or if we're done.`;
+            handleSubmit(directive);
+          }, 1200);
+        }).catch(err => {
+          setResearchRunning(false);
+          researchAbortRef.current = null;
+          const msg = (err as Error)?.message ?? String(err);
+          setDisplayMessages(prev => [...prev, {
+            role: 'system',
+            text: `Research run failed: ${msg}`,
+            subtype: 'error',
+          }]);
+        });
+        break;
+      }
 
       case '/vault':
         setDisplayMessages(prev => [...prev, {
@@ -1035,54 +1201,6 @@ export function App(props: AppProps): React.ReactElement {
         }]);
         break;
       }
-
-        case '/research': {
-          if (!arg) {
-            setDisplayMessages(prev => [...prev, {
-              role: 'assistant', text: 'Usage: `/research "query" [--depth standard] [--builds-on slug]`',
-            }]);
-            break;
-          }
-          setIsLoading(true);
-          let depth: ResearchDepth = 'standard';
-          let query = arg;
-          let buildsOn: string | undefined;
-          const depthMatch = arg.match(/--depth\s+(quick|standard|deep|exhaustive)/);
-          if (depthMatch) {
-            depth = depthMatch[1] as ResearchDepth;
-            query = query.replace(/--depth\s+\w+/, '');
-          }
-          const buildsOnMatch = query.match(/--builds-on\s+([\w-]+)/);
-          if (buildsOnMatch) {
-            buildsOn = buildsOnMatch[1];
-            query = query.replace(/--builds-on\s+[\w-]+/, '');
-          }
-          query = query.trim().replace(/^["']|["']$/g, '');
-          const fetchFn = async (url: string) => {
-            const r = await fetch(`https://r.jina.ai/${url}`, {
-              headers: { Accept: 'text/markdown' },
-              signal: AbortSignal.timeout(15_000),
-            });
-            return r.ok ? await r.text() : '';
-          };
-          const outputDir = vault?.vaultPath
-            ? join(vault.vaultPath, 'research')
-            : join(cwd, 'research');
-          try {
-            const result = await runResearch(query, depth, router, {
-              fetchFn, outputDir, buildsOn,
-            });
-            setDisplayMessages(prev => [...prev, {
-              role: 'assistant', text: `${result.report}\n\n---\n*Saved to \`${result.artifactDir}\`*`,
-            }]);
-          } catch (err) {
-            setDisplayMessages(prev => [...prev, {
-              role: 'assistant', text: `Research failed: ${(err as Error).message}`,
-            }]);
-          }
-          setIsLoading(false);
-          break;
-        }
 
       case '/config': {
         const slots = router.slots;
@@ -1516,6 +1634,9 @@ export function App(props: AppProps): React.ReactElement {
 
       {/* Live stream area — only the current turn, redraws during streaming */}
       <Box flexDirection="column">
+        {/* Research journal — visible only during a /research run */}
+        {researchRunning && <ResearchJournal handleRef={researchJournalRef} />}
+
         <Messages
           messages={[]}
           streamSegments={streamSegments}
@@ -1523,7 +1644,7 @@ export function App(props: AppProps): React.ReactElement {
         />
 
         {/* Spinner */}
-        <Spinner isLoading={isLoading} activeTool={activeTool} hasStreamingText={streamSegments.some(s => s.type === 'text')} />
+        <Spinner isLoading={isLoading || researchRunning} activeTool={researchRunning ? 'research' : activeTool} hasStreamingText={streamSegments.some(s => s.type === 'text')} />
       </Box>
 
       {/* Pinned bottom: model picker OR input + status */}
@@ -1558,19 +1679,23 @@ export function App(props: AppProps): React.ReactElement {
         ) : showModelPicker ? (
           <ModelPicker
             currentModel={
-              router.info.model.includes('opus') ? 'opus'
-              : router.info.model.includes('sonnet') ? 'sonnet'
-              : router.info.model.includes('haiku') ? 'haiku'
-              : router.info.model.includes('gemini-2.5-pro') ? 'gemini'
-              : router.info.model.includes('flash') ? 'flash'
-              : router.info.model === 'gpt-5.4' ? 'gpt-5.4'
-              : router.info.model === 'gpt-5.4-mini' ? 'gpt-5.4-mini'
-              : router.info.model === 'gpt-5.3-codex' ? 'gpt-5.3'
-              : router.info.model === 'gpt-5.2' ? 'gpt-5.2'
-              : router.info.model === 'gpt-5' ? 'gpt5'
-              : router.info.model === 'gpt-4o' ? 'gpt4o'
-              : router.info.model === 'o4-mini' ? 'o4-mini'
-              : 'sonnet'
+              // Prefer the active shortcut name (e.g. "opus-sub") so the picker
+              // opens to the correct family. Fall back to model-id heuristics
+              // for the initial state before any explicit switch.
+              router.info.shortcut
+              ?? (router.info.model.includes('opus') ? 'opus'
+                : router.info.model.includes('sonnet') ? 'sonnet'
+                : router.info.model.includes('haiku') ? 'haiku'
+                : router.info.model.includes('gemini-2.5-pro') ? 'gemini'
+                : router.info.model.includes('flash') ? 'flash'
+                : router.info.model === 'gpt-5.4' ? 'gpt-5.4'
+                : router.info.model === 'gpt-5.4-mini' ? 'gpt-5.4-mini'
+                : router.info.model === 'gpt-5.3-codex' ? 'gpt-5.3'
+                : router.info.model === 'gpt-5.2' ? 'gpt-5.2'
+                : router.info.model === 'gpt-5' ? 'gpt5'
+                : router.info.model === 'gpt-4o' ? 'gpt4o'
+                : router.info.model === 'o4-mini' ? 'o4-mini'
+                : 'sonnet')
             }
             currentEffort={router.effort}
             onSelect={handleModelSelect}

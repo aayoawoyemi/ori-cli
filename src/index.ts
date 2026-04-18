@@ -7,7 +7,7 @@ import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
 import chalk from 'chalk';
 import { loadConfig } from './config/load.js';
-import { ModelRouter } from './router/index.js';
+import { ModelRouter, isReplCapableModel } from './router/index.js';
 import type { EffortLevel } from './router/index.js';
 import { createCoreRegistry, registerMemoryTools } from './tools/registry.js';
 import { buildSystemPrompt } from './prompt.js';
@@ -257,10 +257,10 @@ if (config.projectBrain.enabled) {
 }
 
 const session = new SessionStorage(cwd);
-session.createMeta(config.models.primary.model, sessionName);
+session.createMeta(config.models.primary?.model ?? 'unset', sessionName);
 session.log({
   type: 'meta',
-  model: config.models.primary.model,
+  model: config.models.primary?.model ?? 'unset',
   vault: vaultPath ?? null,
   cwd,
   agentName: config.agent.name,
@@ -302,10 +302,16 @@ if (continueSession) {
 
 const router = new ModelRouter(config.models, config.experimental);
 let replHandleRef: ReplHandle | null = null;
-const registry = createCoreRegistry({ replEnabled: config.repl.enabled, webSearch: config.webSearch, getHandle: () => replHandleRef });
+
+// Resolve 'auto': enable REPL only if the active model is capable
+const replEnabled = config.repl.enabled === 'auto'
+  ? isReplCapableModel(router.info.model)
+  : config.repl.enabled;
+
+const registry = createCoreRegistry({ replEnabled, webSearch: config.webSearch, getHandle: () => replHandleRef });
 registerMemoryTools(registry, vault, projectBrain);
 
-if (config.repl.enabled) {
+if (replEnabled) {
   registerReplTool(registry, () => replHandleRef);
 }
 
@@ -333,15 +339,16 @@ if (isSubagent) {
   let subVaultSignatureMd: string | undefined;
   const isProject = isProjectDirectory(cwd);
 
-  if (config.signature.includeInSubagents && config.repl.enabled) {
+  if (config.signature.includeInSubagents && replEnabled) {
     let subRepl: ReplHandle | null = null;
     try {
       subRepl = await setupReplBridge({
         config: config.repl,
         cwd,
         vaultPath: vaultPath ?? undefined,
-        anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-        rlmModel: config.models.primary.model,
+        rlmApiKey: process.env.OPENROUTER_API_KEY ?? process.env.ANTHROPIC_API_KEY,
+        rlmBaseUrl: process.env.OPENROUTER_API_KEY ? 'https://openrouter.ai/api/v1' : undefined,
+        rlmModel: config.repl.rlmModel ?? (process.env.OPENROUTER_API_KEY ? 'qwen/qwen3-14b' : (config.models.primary?.model ?? 'unset')),
         vault,
         shouldIndex: isProject,
       });
@@ -391,7 +398,7 @@ if (isSubagent) {
     hooks: config.hooks,
     permissionMode: readOnlyMode ? ('plan' as const) : ('accept' as const),
     maxTurns,
-    preflightEnabled: resolvePreflightEnabled(config.preflight, config.repl.enabled),
+    preflightEnabled: resolvePreflightEnabled(config.preflight, replEnabled),
   })) {
     if (event.type === 'text') finalText += event.content;
     if (event.type === 'error') {
@@ -407,7 +414,7 @@ if (isSubagent) {
 
 async function main(): Promise<void> {
   const modelInfo = router.info;
-  const authMode = config.models.primary.auth === 'oauth'
+  const authMode = config.models.primary?.auth === 'oauth'
     ? (config.experimental.localClaudeSubscription ? 'OAuth (local subscription)' : 'OAuth (disabled)')
     : 'API key';
 
@@ -498,7 +505,7 @@ async function main(): Promise<void> {
     warmContext,
     codebaseSignature: undefined,
     vaultSignature: undefined,
-    replEnabled: config.repl.enabled, // declare intent — REPL tool is registered even before bridge is ready
+    replEnabled, // declare intent — REPL tool is registered even before bridge is ready
     experienceLog: readExperienceLog(cwd),
   });
 
@@ -520,7 +527,7 @@ async function main(): Promise<void> {
         : config.permissions.mode === 'manual' ? 'default' as const
           : 'default' as const,
       replHandle: null, // will be set async
-      preflightEnabled: resolvePreflightEnabled(config.preflight, config.repl.enabled),
+      preflightEnabled: resolvePreflightEnabled(config.preflight, replEnabled),
       resumedMessages,
       initialResumePicker: resumeArg === '',
       experimental: config.experimental,
@@ -529,17 +536,18 @@ async function main(): Promise<void> {
   );
 
   // ── REPL bridge setup (background — doesn't block input) ──────────
-  if (config.repl.enabled) {
+  if (replEnabled) {
     (async () => {
       try {
-        const anthropicKey = process.env.ANTHROPIC_API_KEY;
         const handle = await setupReplBridge({
           config: config.repl,
           cwd,
           vaultPath: vaultPath ?? undefined,
-          anthropicApiKey: anthropicKey,
-          rlmModel: config.models.primary.model,
+          rlmApiKey: process.env.OPENROUTER_API_KEY ?? process.env.ANTHROPIC_API_KEY,
+          rlmBaseUrl: process.env.OPENROUTER_API_KEY ? 'https://openrouter.ai/api/v1' : undefined,
+          rlmModel: config.repl.rlmModel ?? (process.env.OPENROUTER_API_KEY ? 'qwen/qwen3-14b' : (config.models.primary?.model ?? 'unset')),
           vault,
+          router,
           shouldIndex: isProjectDirectory(cwd),
           onEvent: (e) => {
             if (e.type === 'bridge_restart') {
@@ -554,7 +562,7 @@ async function main(): Promise<void> {
         if (handle) {
           const parts: string[] = [config.repl.sandbox];
           if (vaultPath) parts.push('vault');
-          if (anthropicKey) parts.push('rlm');
+          if (process.env.OPENROUTER_API_KEY ?? process.env.ANTHROPIC_API_KEY) parts.push('rlm');
           console.log(chalk.dim(`  repl: body ready (${parts.join(' + ')})`));
 
           // Compile signatures in background — they'll be available for future turns

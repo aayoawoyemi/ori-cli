@@ -1,14 +1,25 @@
-import type { DiscoveredSource, CitationGraph, CitationNode, CitationEdge } from './types.js';
-import { getCitations, getReferences } from './apis/semanticScholar.js';
+import type { DiscoveredSource, CitationGraph, CitationNode, CitationEdge, ResearchEvent } from './types.js';
+import type { Budget } from './budget.js';
+import { getReferences } from './apis/semanticScholar.js';
+
+/** Estimated token cost per S2 API call for budget tracking. */
+const S2_CALL_COST = 1000;
 
 /**
- * Phase 4: Citation graph traversal.
- * Follow references and citations to find convergent sources —
+ * Phase 4: Citation graph traversal with multi-hop depth.
+ * Follow references recursively to find convergent sources —
  * papers cited by 2+ of our sources are high signal.
+ *
+ * `depth` controls how many hops to chase:
+ *   depth 1: references of top sources
+ *   depth 2: references of references
+ *   depth 3: three hops out
  */
 export async function chaseCitations(
   sources: DiscoveredSource[],
   depth: number,
+  budget?: Budget,
+  emit?: (e: ResearchEvent) => void,
 ): Promise<{ graph: CitationGraph; sharedCitations: DiscoveredSource[] }> {
   const graph: CitationGraph = {
     nodes: new Map(),
@@ -27,8 +38,11 @@ export async function chaseCitations(
     .sort((a, b) => (b.citationCount ?? 0) - (a.citationCount ?? 0))
     .slice(0, 5);
 
+  // Seed the frontier with our top sources at depth 0
+  const frontier: Array<{ id: string; depth: number }> = topSources.map(s => ({ id: s.id, depth: 0 }));
+
+  // Add our top sources to the graph
   for (const source of topSources) {
-    // Add source to graph
     graph.nodes.set(source.id, {
       id: source.id,
       title: source.title,
@@ -36,17 +50,42 @@ export async function chaseCitations(
       inDegree: 0,
       depth: 0,
     });
+  }
 
-    // Get references (what this paper cites)
-    const refs = await getReferences(source.id, 30);
+  // Multi-hop BFS: chase references up to `depth` hops
+  const visited = new Set<string>();
+
+  while (frontier.length > 0) {
+    const current = frontier.shift()!;
+    if (current.depth >= depth) continue;
+    if (visited.has(current.id)) continue;
+    visited.add(current.id);
+
+    // Budget check before each S2 call
+    if (budget && !budget.hasRemaining(S2_CALL_COST)) {
+      emit?.({ type: 'error', phase: 'chase', message: `Budget exhausted during citation chase at depth ${current.depth}` });
+      break;
+    }
+
+    let refs: Array<{ id: string; title: string; citationCount: number }>;
+    try {
+      refs = await getReferences(current.id, 30);
+      budget?.deduct(S2_CALL_COST);
+    } catch (e) {
+      emit?.({ type: 'error', phase: 'chase', message: `getReferences failed for ${current.id}: ${e instanceof Error ? e.message : String(e)}` });
+      continue;
+    }
 
     for (const ref of refs) {
       // Track edge
-      graph.edges.push({ from: source.id, to: ref.id });
+      graph.edges.push({ from: current.id, to: ref.id });
 
       // Track who cites this
       if (!citedBy.has(ref.id)) citedBy.set(ref.id, new Set());
-      citedBy.get(ref.id)!.add(source.id);
+      // Only count in-degree from our original top sources (depth 0)
+      if (current.depth === 0) {
+        citedBy.get(ref.id)!.add(current.id);
+      }
 
       // Add to graph
       if (!graph.nodes.has(ref.id)) {
@@ -55,16 +94,24 @@ export async function chaseCitations(
           title: ref.title,
           citationCount: ref.citationCount,
           inDegree: 1,
-          depth: 1,
+          depth: current.depth + 1,
         });
+        // Add to frontier for next hop
+        frontier.push({ id: ref.id, depth: current.depth + 1 });
       } else {
         const node = graph.nodes.get(ref.id)!;
-        node.inDegree++;
+        if (current.depth === 0) {
+          node.inDegree++;
+        }
+        // Update depth if we reached this node via a shorter path
+        if (current.depth + 1 < node.depth) {
+          node.depth = current.depth + 1;
+        }
       }
     }
 
-    // Small delay to respect rate limits
-    await new Promise(r => setTimeout(r, 200));
+    // Minimum 1s delay between S2 API calls
+    await new Promise(r => setTimeout(r, 1000));
   }
 
   // Find shared citations — cited by 2+ of our sources = convergent evidence

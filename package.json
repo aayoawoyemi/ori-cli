@@ -1,6 +1,6 @@
 {
   "name": "@orimnemos/cli",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Memory-native coding agent CLI. Built on Ori Mnemos.",
   "type": "module",
   "bin": {
@@ -21,14 +21,15 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0",
-    "ori-memory": "^0.5.5",
     "@google/genai": "^1.0.0",
     "chalk": "^5.4.0",
+    "fast-xml-parser": "^5.7.0",
     "glob": "^11.0.0",
     "ink": "^6.8.0",
     "ink-text-input": "^6.0.0",
     "marked": "^15.0.0",
     "marked-terminal": "^7.3.0",
+    "ori-memory": "^0.5.5",
     "react": "^19.2.4",
     "xxhash-wasm": "^1.1.0",
     "yaml": "^2.7.0"

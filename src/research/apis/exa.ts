@@ -15,7 +15,7 @@ function headers(): Record<string, string> {
  * GitHub, Reddit threads, and anything else on the open web.
  * Uses type "auto" which balances keyword and neural matching.
  */
-export async function searchExa(query: string, limit = 15): Promise<DiscoveredSource[]> {
+export async function searchExa(query: string, limit = 15, onError?: (msg: string) => void): Promise<DiscoveredSource[]> {
   if (!EXA_KEY) return [];
 
   try {
@@ -33,7 +33,10 @@ export async function searchExa(query: string, limit = 15): Promise<DiscoveredSo
       signal: AbortSignal.timeout(20_000),
     });
 
-    if (!response.ok) return [];
+    if (!response.ok) {
+      onError?.(`Exa search returned ${response.status} for query "${query}"`);
+      return [];
+    }
 
     const data = await response.json() as {
       results?: Array<{
@@ -61,7 +64,8 @@ export async function searchExa(query: string, limit = 15): Promise<DiscoveredSo
         type: classifyExaUrl(r.url),
         _exaScore: r.score ?? 0,
       }));
-  } catch {
+  } catch (e) {
+    onError?.(`Exa search failed: ${e instanceof Error ? e.message : String(e)}`);
     return [];
   }
 }
@@ -70,7 +74,7 @@ export async function searchExa(query: string, limit = 15): Promise<DiscoveredSo
  * Fetch full content for a known URL via Exa's /contents endpoint.
  * More reliable than Jina for JS-heavy pages — Exa handles rendering.
  */
-export async function fetchExaContent(url: string): Promise<string | null> {
+export async function fetchExaContent(url: string, onError?: (msg: string) => void): Promise<string | null> {
   if (!EXA_KEY) return null;
 
   try {
@@ -84,14 +88,18 @@ export async function fetchExaContent(url: string): Promise<string | null> {
       signal: AbortSignal.timeout(20_000),
     });
 
-    if (!response.ok) return null;
+    if (!response.ok) {
+      onError?.(`Exa content returned ${response.status} for URL ${url}`);
+      return null;
+    }
 
     const data = await response.json() as {
       results?: Array<{ text?: string }>;
     };
 
     return data.results?.[0]?.text ?? null;
-  } catch {
+  } catch (e) {
+    onError?.(`Exa content fetch failed for ${url}: ${e instanceof Error ? e.message : String(e)}`);
     return null;
   }
 }

@@ -215,9 +215,32 @@ export class AnthropicLocalOAuthSource {
     const current = creds ?? this.loadCredentials();
     if (!this.isExpired(current)) return current;
 
-    const refreshed = await this.refreshToken(current);
-    this.persistCredentials(refreshed);
-    return refreshed;
+    // Before hitting the network, check if the Claude app already refreshed
+    // and wrote fresh creds to disk (common when running alongside Claude Code).
+    if (creds) {
+      const diskCreds = this.loadCredentials();
+      if (diskCreds.accessToken !== creds.accessToken && !this.isExpired(diskCreds)) {
+        return diskCreds;
+      }
+    }
+
+    try {
+      const refreshed = await this.refreshToken(current);
+      this.persistCredentials(refreshed);
+      return refreshed;
+    } catch (err) {
+      // Claude Code app may have already consumed the refresh token and written
+      // fresh creds to disk. Reload before propagating the error.
+      if (
+        err instanceof AnthropicLocalOAuthError &&
+        err.stage === 'refresh' &&
+        /invalid_grant/i.test(err.message)
+      ) {
+        const reloaded = this.loadCredentials();
+        if (!this.isExpired(reloaded)) return reloaded;
+      }
+      throw err;
+    }
   }
 
   private getCredentialPaths(): string[] {

@@ -11,8 +11,7 @@ import { executeTools, resetDoomLoop } from './tools/execution.js';
 import { PhaseTracker, getToolsForPhase, type TaskPhase } from './tools/toolSets.js';
 import { buildAssistantMessage, buildToolResultMessage, getMessageText, healOrphanedToolUses } from './utils/messages.js';
 import { estimateTokens } from './utils/tokens.js';
-// Preflight disabled pre-ship — import kept for when it comes back
-// import { runPreflight, type PreflightContext } from './memory/preflight.js';
+import { runPreflight, type PreflightContext } from './memory/preflight.js';
 // current-state injection removed — model calls ori_orient directly
 import { stripSyntheticFromMessages, injectTurnSynthetics } from './memory/syntheticMarkers.js';
 import { runPostflight } from './memory/postflight.js';
@@ -85,6 +84,8 @@ export interface LoopParams {
   dynamicTools?: boolean;
   /** Ref to the plan file path (set when EnterPlanMode runs). Using a ref so loop reads live value. */
   planFilePathRef?: { current: string | null };
+  /** Ref to permission mode — live-read each turn so ExitPlanMode approval takes effect immediately. */
+  permissionModeRef?: { current: PermissionMode };
   /** Task mode: 'explore' restricts to Repl + VaultAdd + ProjectSave only. */
   taskMode?: 'normal' | 'explore';
 }
@@ -135,7 +136,6 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     maxResultChars = 10_000,
     compactThreshold = 0.6,
     signal,
-    permissionMode = 'default',
     onPermissionRequest,
     alwaysAllowTools,
     identityContext,
@@ -144,6 +144,7 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     onFileMutated,
     dynamicTools = false,
     planFilePathRef,
+    permissionModeRef,
     taskMode = 'normal',
   } = params;
 
@@ -154,14 +155,17 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
   const compactTokenThreshold = Math.floor(contextLimit * compactThreshold);
   let turnCount = 0;
   let importanceAccumulator = 0;
-  // Preflight disabled pre-ship — variable kept for when it comes back
-  // let lastPreflight: PreflightContext | null = null;
+  let lastPreflight: PreflightContext | null = null;
 
   // Reset doom loop tracking on new user input
   resetDoomLoop();
 
   while (turnCount < maxTurns) {
     turnCount++;
+
+    // Live-read permissionMode from ref each turn so ExitPlanMode approval
+    // takes effect immediately (not stale from agentLoop call-site).
+    const permissionMode: PermissionMode = permissionModeRef?.current ?? params.permissionMode ?? 'default';
 
     // ── IDEMPOTENCE: strip any prior-turn synthetic injections ──────
     // Without this, each turn's preflight/current-state/proprio STACKS on
@@ -180,13 +184,16 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     // Reset per-turn nudge counters (sequential read tracking, etc.)
     resetNudgeCounters();
 
-    // ── PREFLIGHT: Disabled pre-ship. Needs deep learning research to
-    // justify the ~320 tokens/turn cost. Echo/fizzle data showed most
-    // preflight notes go unused. Bring back when retrieval quality earns
-    // the context budget. Warm context + experience log cover ambient needs.
-
-    // current-state lane removed (2026-04-07). The model now calls
-    // ori_orient directly at session start — one source of truth.
+    // ── PREFLIGHT: Re-enabled 2026-04-17. 5-note limit, ~150 tokens/turn.
+    // Agent cannot retrieve what it doesn't know to look for —
+    // preflight bridges user intent to vault knowledge.
+    if (preflightEnabled && vault?.connected) {
+      lastPreflight = await runPreflight(messages, projectBrain, vault, identityContext);
+      if (lastPreflight) {
+        session?.log({ type: 'preflight', projectNotes: lastPreflight.projectNotes.map(n => n.title), vaultNotes: lastPreflight.vaultNotes.map(n => n.title), timestamp: Date.now() });
+        yield { type: 'preflight', projectCount: lastPreflight.projectNotes.length, vaultCount: lastPreflight.vaultNotes.length };
+      }
+    }
 
     // ── CONTEXT PROPRIOCEPTION ─────────────────────────────────────
     const tokenEst = estimateTokens(messages);
@@ -198,8 +205,10 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       `</context-status>`,
     ].join('\n');
 
-    // ── INJECTION: proprio only (preflight disabled pre-ship) ─────
+    // ── INJECTION: preflight + proprioception ─────────────────────
     injectTurnSynthetics(messages, {
+      preflightBefore: lastPreflight?.beforeUserBlock,
+      preflightAfter: lastPreflight?.afterUserBlock,
       proprio: proprioceptionBlock,
     });
 
@@ -228,11 +237,36 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
         return false;
       });
     } else if (permissionMode === 'research') {
-      activeTools = allTools.filter(t => registry.isReadOnly(t.name));
+      // Research mode: structural tool stripping — explicit allowlist.
+      // WebSearch/WebFetch are REMOVED (even though they're readOnly) because they
+      // let the model bypass the curated research pipeline. For targeted URL
+      // drill-down, the model uses `research.fetch(url)` in the Repl namespace.
+      const RESEARCH_ALLOWED = new Set([
+        'Repl', 'Read', 'Grep', 'Glob', 'ProjectSave',
+        'VaultSearch', 'VaultRead', 'VaultExplore', 'VaultWarmth', 'ProjectSearch',
+      ]);
+      activeTools = allTools.filter(t => RESEARCH_ALLOWED.has(t.name));
     } else if (phaseTracker) {
       activeTools = getToolsForPhase(registry, phaseTracker.phase, replEnabled);
     } else {
       activeTools = allTools;
+    }
+
+    // ── Research mode reminder ────────────────────────────────────────
+    if (permissionMode === 'research') {
+      let lastUserIdx = -1;
+      for (let i = budgetedMessages.length - 1; i >= 0; i--) {
+        if (budgetedMessages[i]!.role === 'user') { lastUserIdx = i; break; }
+      }
+      if (lastUserIdx >= 0 && typeof budgetedMessages[lastUserIdx]!.content === 'string') {
+        const content = budgetedMessages[lastUserIdx]!.content as string;
+        if (!content.includes('RESEARCH mode')) {
+          budgetedMessages[lastUserIdx] = {
+            ...budgetedMessages[lastUserIdx]!,
+            content: `<system-reminder>You are in RESEARCH mode. WebSearch, WebFetch, Write, Edit, Bash, and Agent are NOT available — they have been structurally removed from your tool schema. Research happens through the \`research\` namespace in the Repl tool:\n\n- \`research.discover(query, limit=25)\` → multi-API search (arxiv, semantic scholar, openalex, github, exa, reddit, wikipedia)\n- \`research.ingest(sources[:8])\` → deep-fetch content, returns handles\n- \`research.fetch(url, focus="...")\` → targeted drill-down on a specific URL (replaces WebFetch)\n- \`research.extract(handle, focus="...")\` → pull findings from one source\n- \`research.synthesize(findings, query)\` → cross-source analysis\n- \`research.save(session)\` → persist with a slug (REQUIRED to exit research mode)\n- \`research.list_sessions()\` / \`research.session(slug)\` → prior sessions\n\nThe pipeline is curated and recursive: discover → ingest → extract → reflect → synthesize. Let it run. Steer with focus questions. Pick 5-10 promising sources, not all 25. Show your work — the user can interject. You MUST call \`research.save()\` before ending the turn; that produces the durable artifact and exits research mode.</system-reminder>\n\n${content}`,
+          };
+        }
+      }
     }
 
     // ── Explore mode reminder ─────────────────────────────────────────
@@ -359,6 +393,26 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
           continue;
         }
 
+        // Research mode: deny any tool not in the research allowlist.
+        // Belt-and-suspenders — schema filtering should already block these,
+        // but this catches edge cases (subagents, tool schema leaks).
+        if (permissionMode === 'research') {
+          const RESEARCH_ALLOWED = new Set([
+            'Repl', 'Read', 'Grep', 'Glob', 'ProjectSave',
+            'VaultSearch', 'VaultRead', 'VaultExplore', 'VaultWarmth', 'ProjectSearch',
+          ]);
+          if (RESEARCH_ALLOWED.has(tc.name)) {
+            approvedCalls.push(tc);
+          } else {
+            deniedResults.push({
+              id: tc.id, name: tc.name,
+              output: `Tool ${tc.name} is not available in research mode. Use the research.* namespace in the Repl instead (research.discover, research.ingest, research.extract, research.synthesize, research.fetch, research.save). Alt+M to exit research mode.`,
+              isError: true,
+            });
+          }
+          continue;
+        }
+
         const isRead = registry.isReadOnly(tc.name);
 
         if (isRead || permissionMode === 'yolo') {
@@ -459,6 +513,42 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       continue;
     }
 
+    // ── Research mode Gate 2: force continuation if research started but not saved ──
+    if (permissionMode === 'research') {
+      // Detect "research in progress" by scanning prior Repl tool calls for research.* usage.
+      let researchStarted = false;
+      let researchSaved = false;
+      for (const m of messages) {
+        if (m.role !== 'assistant' || typeof m.content === 'string' || !Array.isArray(m.content)) continue;
+        for (const block of m.content) {
+          if ((block as { type?: string }).type !== 'tool_use') continue;
+          const tu = block as { name?: string; input?: { code?: string } };
+          if (tu.name !== 'Repl' || !tu.input?.code) continue;
+          const code = tu.input.code;
+          if (/\bresearch\.(discover|ingest|extract|synthesize|fetch|reflect)\b/.test(code)) {
+            researchStarted = true;
+          }
+          if (/\bresearch\.save\b/.test(code)) {
+            researchSaved = true;
+          }
+        }
+      }
+      if (researchStarted && !researchSaved) {
+        const forcedKey = '__researchForcedContinuations';
+        const forced = ((params as unknown as Record<string, unknown>)[forcedKey] as number) ?? 0;
+        if (forced < 2) {
+          (params as unknown as Record<string, unknown>)[forcedKey] = forced + 1;
+          messages.push({ role: 'assistant', content: assistantText });
+          messages.push({
+            role: 'user',
+            content: `<system-reminder>You started research but haven't saved it yet. Call \`research.save(session)\` in the Repl to persist the artifact and exit research mode, or continue with research.discover/ingest/extract/synthesize if you're not done. Do not end the turn with text only — research mode requires an artifact.</system-reminder>`,
+          });
+          turnCount++;
+          continue;
+        }
+      }
+    }
+
     // ── Plan mode Gate 2: force continuation if model dumps text without ExitPlanMode ──
     if (permissionMode === 'plan' && planFilePath) {
       // Model responded with text only — it must call ExitPlanMode or AskUserQuestion to end.
@@ -481,8 +571,14 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     messages.push({ role: 'assistant', content: assistantText });
     session?.log({ type: 'assistant', content: assistantText, timestamp: Date.now() });
 
-    // ── ECHO/FIZZLE: disabled with preflight ──────────────────────
-    // Bring back when preflight returns.
+    // ── ECHO/FIZZLE: re-enabled with preflight (2026-04-17) ────────
+    if (lastPreflight) {
+      const ef = detectEchoFizzle(assistantText, lastPreflight);
+      if (ef.echoed.length > 0 || ef.fizzled.length > 0) {
+        yield { type: 'echo_fizzle', echoed: ef.echoed, fizzled: ef.fizzled };
+        await sendEchoSignals(ef, vault);
+      }
+    }
 
     // ── POSTFLIGHT ───────────────────────────────────────────────────
     importanceAccumulator = await runPostflight(

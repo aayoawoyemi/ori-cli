@@ -56,9 +56,12 @@ export class ExitPlanModeTool implements Tool {
     const result = await this.onExit(this.planContext.filePath, content);
 
     if (result.action === 'accepted') {
+      // Clear plan context so a fresh plan can be started later
+      const approvedPath = this.planContext.filePath;
+      this.planContext.filePath = null;
       return {
         id: '', name: this.name,
-        output: `User has approved your plan. You can now start coding.\n\nYour plan has been saved to: ${this.planContext.filePath}\nYou can refer back to it if needed during implementation.\n\n## Approved Plan:\n${content}`,
+        output: `User has approved your plan. You can now start coding.\n\nYour plan has been saved to: ${approvedPath}\nYou can refer back to it if needed during implementation.\n\n## Approved Plan:\n${content}`,
         isError: false,
       };
     } else {

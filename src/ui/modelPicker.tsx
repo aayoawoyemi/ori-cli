@@ -38,9 +38,10 @@ const MODEL_FAMILIES: ModelFamily[] = [
     name: 'Anthropic (Claude)',
     description: 'API key required',
     models: [
-      { value: 'opus', label: 'Opus 4.6', description: '1M - Most capable', supportsEffort: true, defaultEffort: 'high' },
-      { value: 'sonnet', label: 'Sonnet 4.6', description: '200K - Everyday tasks', supportsEffort: true, defaultEffort: 'medium' },
-      { value: 'haiku', label: 'Haiku 4.5', description: '200K - Fast + cheap', supportsEffort: true, defaultEffort: 'low' },
+      { value: 'opus',      label: 'Opus 4.6 (1M)',   description: '1M - Most capable (beta context)', supportsEffort: true, defaultEffort: 'high' },
+      { value: 'opus-200k', label: 'Opus 4.6 (200K)', description: '200K - Most capable',             supportsEffort: true, defaultEffort: 'high' },
+      { value: 'sonnet',    label: 'Sonnet 4.6',      description: '200K - Everyday tasks',           supportsEffort: true, defaultEffort: 'medium' },
+      { value: 'haiku',     label: 'Haiku 4.5',       description: '200K - Fast + cheap',             supportsEffort: true, defaultEffort: 'low' },
     ],
   },
   {
@@ -58,6 +59,15 @@ const MODEL_FAMILIES: ModelFamily[] = [
       { value: 'gpt5', label: 'GPT-5', description: '1M', supportsEffort: false, defaultEffort: 'medium' },
       { value: 'gpt4o', label: 'GPT-4o', description: '128K', supportsEffort: false, defaultEffort: 'medium' },
       { value: 'o4-mini', label: 'o4-mini', description: '200K - Reasoning', supportsEffort: false, defaultEffort: 'medium' },
+    ],
+  },
+  {
+    name: 'Claude (subscription)',
+    description: 'Local OAuth — claude.ai Max plan',
+    models: [
+      { value: 'opus-sub',   label: 'Opus 4.6 (1M)',   description: '1M - Most capable (beta context)', supportsEffort: true, defaultEffort: 'high' },
+      { value: 'sonnet-sub', label: 'Sonnet 4.6 (1M)', description: '1M - Everyday tasks (beta context)', supportsEffort: true, defaultEffort: 'medium' },
+      { value: 'haiku-sub',  label: 'Haiku 4.5',       description: '200K - Fast + cheap',              supportsEffort: true, defaultEffort: 'low' },
     ],
   },
   {
@@ -131,6 +141,7 @@ export interface ModelPickerProps {
 }
 
 const SUBSCRIPTION_MODELS = new Set(['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3', 'gpt-5.2']);
+const CLAUDE_SUBSCRIPTION_MODELS = new Set(['opus-sub', 'sonnet-sub', 'haiku-sub']);
 
 export function ModelPicker({
   currentModel,
@@ -140,6 +151,7 @@ export function ModelPicker({
   experimental,
 }: ModelPickerProps): React.ReactElement {
   const oauthEnabled = experimental?.localChatGPTSubscription ?? false;
+  const claudeOauthEnabled = experimental?.localClaudeSubscription ?? false;
   const [phase, setPhase] = useState<'family' | 'model'>('family');
   const [selectedFamily, setSelectedFamily] = useState(findCurrentFamily(currentModel));
   const [effort, setEffort] = useState<EffortLevel>(currentEffort);
@@ -178,8 +190,9 @@ export function ModelPicker({
 
   const handleModelSelect = useCallback((value: string) => {
     if (SUBSCRIPTION_MODELS.has(value) && !oauthEnabled) return;
+    if (CLAUDE_SUBSCRIPTION_MODELS.has(value) && !claudeOauthEnabled) return;
     onSelect(value, effort);
-  }, [onSelect, effort, oauthEnabled]);
+  }, [onSelect, effort, oauthEnabled, claudeOauthEnabled]);
 
   const handleModelFocus = useCallback((value: string) => {
     setFocusedModel(value);
@@ -269,6 +282,13 @@ export function ModelPicker({
         <Box marginTop={1}>
           <Text color={colors.warning}>
             Requires experimental.localChatGPTSubscription: true in ~/.aries/config.yaml
+          </Text>
+        </Box>
+      )}
+      {family.name === 'Claude (subscription)' && !claudeOauthEnabled && (
+        <Box marginTop={1}>
+          <Text color={colors.warning}>
+            Requires experimental.localClaudeSubscription: true in ~/.aries/config.yaml
           </Text>
         </Box>
       )}

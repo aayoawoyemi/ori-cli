@@ -9,17 +9,20 @@ function headers(): Record<string, string> {
   return h;
 }
 
-/** Search Semantic Scholar for papers. */
-export async function searchSemanticScholar(query: string, limit = 20): Promise<DiscoveredSource[]> {
+/** Search Semantic Scholar for papers. `offset` supports pagination past the first page. */
+export async function searchSemanticScholar(query: string, limit = 20, offset = 0, onError?: (msg: string) => void): Promise<DiscoveredSource[]> {
   const encoded = encodeURIComponent(query);
-  const url = `${S2_API}/paper/search?query=${encoded}&limit=${limit}&fields=title,authors,year,citationCount,externalIds,abstract,url`;
+  const url = `${S2_API}/paper/search?query=${encoded}&limit=${limit}&offset=${offset}&fields=title,authors,year,citationCount,externalIds,abstract,url`;
 
   try {
     const response = await fetch(url, {
       headers: headers(),
       signal: AbortSignal.timeout(15_000),
     });
-    if (!response.ok) return [];
+    if (!response.ok) {
+      onError?.(`S2 search returned ${response.status} for query "${query}"`);
+      return [];
+    }
 
     const data = await response.json() as {
       data?: Array<{
@@ -47,13 +50,14 @@ export async function searchSemanticScholar(query: string, limit = 20): Promise<
       abstract: p.abstract ?? undefined,
       type: 'paper' as const,
     }));
-  } catch {
+  } catch (e) {
+    onError?.(`S2 search failed: ${e instanceof Error ? e.message : String(e)}`);
     return [];
   }
 }
 
 /** Get papers that cite a given paper (citations). */
-export async function getCitations(paperId: string, limit = 50): Promise<Array<{ id: string; title: string; citationCount: number }>> {
+export async function getCitations(paperId: string, limit = 50, onError?: (msg: string) => void): Promise<Array<{ id: string; title: string; citationCount: number }>> {
   const cleanId = paperId.replace(/^(arxiv:|doi:|s2:)/, '');
   const url = `${S2_API}/paper/${cleanId}/citations?fields=title,citationCount&limit=${limit}`;
 
@@ -62,7 +66,10 @@ export async function getCitations(paperId: string, limit = 50): Promise<Array<{
       headers: headers(),
       signal: AbortSignal.timeout(15_000),
     });
-    if (!response.ok) return [];
+    if (!response.ok) {
+      onError?.(`S2 citations returned ${response.status} for paper ${paperId}`);
+      return [];
+    }
 
     const data = await response.json() as {
       data?: Array<{
@@ -75,13 +82,14 @@ export async function getCitations(paperId: string, limit = 50): Promise<Array<{
       title: d.citingPaper.title,
       citationCount: d.citingPaper.citationCount ?? 0,
     }));
-  } catch {
+  } catch (e) {
+    onError?.(`S2 citations failed for ${paperId}: ${e instanceof Error ? e.message : String(e)}`);
     return [];
   }
 }
 
 /** Get papers referenced by a given paper (references). */
-export async function getReferences(paperId: string, limit = 50): Promise<Array<{ id: string; title: string; citationCount: number }>> {
+export async function getReferences(paperId: string, limit = 50, onError?: (msg: string) => void): Promise<Array<{ id: string; title: string; citationCount: number }>> {
   const cleanId = paperId.replace(/^(arxiv:|doi:|s2:)/, '');
   const url = `${S2_API}/paper/${cleanId}/references?fields=title,citationCount&limit=${limit}`;
 
@@ -90,7 +98,10 @@ export async function getReferences(paperId: string, limit = 50): Promise<Array<
       headers: headers(),
       signal: AbortSignal.timeout(15_000),
     });
-    if (!response.ok) return [];
+    if (!response.ok) {
+      onError?.(`S2 references returned ${response.status} for paper ${paperId}`);
+      return [];
+    }
 
     const data = await response.json() as {
       data?: Array<{
@@ -103,7 +114,8 @@ export async function getReferences(paperId: string, limit = 50): Promise<Array<
       title: d.citedPaper.title,
       citationCount: d.citedPaper.citationCount ?? 0,
     }));
-  } catch {
+  } catch (e) {
+    onError?.(`S2 references failed for ${paperId}: ${e instanceof Error ? e.message : String(e)}`);
     return [];
   }
 }

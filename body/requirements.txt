@@ -7,5 +7,5 @@ networkx>=3.0
 
 # Phase 3: reuses existing Ori Mnemos MCP interface — no new Python deps.
 
-# Phase 4: rlm_call recursive self-invocation.
-anthropic>=0.40
+# Phase 4: rlm_call recursive self-invocation (OpenAI-compatible — works with OpenRouter, Qwen, DeepSeek, Ollama, etc.)
+openai>=1.0

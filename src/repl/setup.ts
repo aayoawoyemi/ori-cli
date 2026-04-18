@@ -6,9 +6,11 @@
  */
 import { ReplBridge } from './bridge.js';
 import { TrajectoryLogger, defaultTrajectoryPath } from './trajectory.js';
+import { join } from 'node:path';
 import type { ReplConfig } from '../config/types.js';
 import type { CodeExecution, ReplResult, ReplEvent } from './types.js';
 import type { OriVault } from '../memory/vault.js';
+import type { ModelRouter } from '../router/index.js';
 
 export interface ReplHandle {
   bridge: ReplBridge;
@@ -26,8 +28,10 @@ export interface SetupOptions {
   /** If provided, auto-connects the vault at startup. */
   vaultPath?: string;
   /** If provided, auto-configures rlm_call with this API key. */
-  anthropicApiKey?: string;
-  /** Model to use for rlm_call. Defaults to claude-sonnet-4-5. */
+  rlmApiKey?: string;
+  /** Base URL for rlm_call provider (e.g. https://openrouter.ai/api/v1). */
+  rlmBaseUrl?: string;
+  /** Model to use for rlm_call. Defaults to qwen/qwen3-14b via OpenRouter. */
   rlmModel?: string;
   /** Event callback (restart notifications, errors). */
   onEvent?: (e: ReplEvent) => void;
@@ -35,6 +39,10 @@ export interface SetupOptions {
   vault?: OriVault | null;
   /** Whether to auto-index the codebase. Set false when cwd is not a project dir. */
   shouldIndex?: boolean;
+  /** Model router — wired to the bridge so research.extract/synthesize can call cheapCall. */
+  router?: ModelRouter | null;
+  /** Whether to auto-connect the research proxy at startup. Defaults true. */
+  connectResearch?: boolean;
 }
 
 /**
@@ -79,10 +87,11 @@ export async function setupReplBridge(
           });
         }
       }
-      if (opts.anthropicApiKey) {
+      if (opts.rlmApiKey) {
         try {
           await bridge.configureRlm({
-            apiKey: opts.anthropicApiKey,
+            apiKey: opts.rlmApiKey,
+            baseUrl: opts.rlmBaseUrl,
             model: opts.rlmModel,
             maxCalls: opts.config.maxRlmCalls,
           });
@@ -90,6 +99,16 @@ export async function setupReplBridge(
           opts.onEvent?.({
             type: 'bridge_error',
             error: `post-restart rlm config failed: ${(err as Error).message}`,
+          });
+        }
+      }
+      if (opts.connectResearch !== false) {
+        try {
+          await bridge.connectResearch();
+        } catch (err) {
+          opts.onEvent?.({
+            type: 'bridge_error',
+            error: `post-restart research reconnect failed: ${(err as Error).message}`,
           });
         }
       }
@@ -102,6 +121,17 @@ export async function setupReplBridge(
   if (opts.vault) {
     bridge.setVault(opts.vault);
   }
+
+  // Give bridge the router so research.extract/synthesize can call cheapCall
+  if (opts.router) {
+    bridge.setRouter(opts.router);
+  }
+
+  // Set research output dir: vault/research if vault exists, else cwd/research
+  const researchOutputDir = opts.vaultPath
+    ? join(opts.vaultPath, 'research')
+    : join(opts.cwd, 'research');
+  bridge.setResearchOutputDir(researchOutputDir);
 
   // Optional: auto-connect vault at startup
   if (opts.vaultPath) {
@@ -123,10 +153,11 @@ export async function setupReplBridge(
   }
 
   // Optional: auto-configure rlm_call
-  if (opts.anthropicApiKey) {
+  if (opts.rlmApiKey) {
     try {
       const r = await bridge.configureRlm({
-        apiKey: opts.anthropicApiKey,
+        apiKey: opts.rlmApiKey,
+        baseUrl: opts.rlmBaseUrl,
         model: opts.rlmModel,
         maxCalls: opts.config.maxRlmCalls,
       });
@@ -140,6 +171,24 @@ export async function setupReplBridge(
       opts.onEvent?.({
         type: 'bridge_error',
         error: `rlm_call config exception: ${(err as Error).message}`,
+      });
+    }
+  }
+
+  // Auto-connect research proxy (always on — research is always available)
+  if (opts.connectResearch !== false) {
+    try {
+      const r = await bridge.connectResearch();
+      if (!r.ok) {
+        opts.onEvent?.({
+          type: 'bridge_error',
+          error: `research connect failed: ${r.error ?? 'unknown'}`,
+        });
+      }
+    } catch (err) {
+      opts.onEvent?.({
+        type: 'bridge_error',
+        error: `research connect exception: ${(err as Error).message}`,
       });
     }
   }

@@ -91,6 +91,30 @@ function splitSystemPromptByCacheBoundary(systemPrompt: string): {
   };
 }
 
+function estimateRequestTokens(
+  systemArray: Anthropic.TextBlockParam[],
+  messages: Anthropic.MessageParam[],
+  tools: Anthropic.Tool[],
+): number {
+  let chars = 0;
+  for (const block of systemArray) chars += block.text.length;
+  for (const msg of messages) {
+    if (typeof msg.content === 'string') {
+      chars += msg.content.length;
+    } else {
+      for (const block of msg.content) {
+        if (block.type === 'text') chars += block.text.length;
+        else if (block.type === 'tool_use') chars += JSON.stringify(block.input).length + block.name.length;
+        else if (block.type === 'tool_result') chars += JSON.stringify(block.content ?? '').length;
+      }
+    }
+  }
+  for (const tool of tools) {
+    chars += tool.name.length + (tool.description?.length ?? 0) + JSON.stringify(tool.input_schema).length;
+  }
+  return Math.ceil(chars / 3.5);
+}
+
 interface AnthropicProviderOptions {
   allowExperimentalLocalOAuth?: boolean;
   oauthSource?: AnthropicLocalOAuthSource;
@@ -150,11 +174,9 @@ export class AnthropicProvider implements ModelProvider {
 
   private createOAuthClient(accessToken: string): Anthropic {
     return new Anthropic({
-      apiKey: null,          // Suppress env ANTHROPIC_API_KEY fallback
+      apiKey: null as unknown as string, // suppress ANTHROPIC_API_KEY env fallback
       authToken: accessToken,
       ...(this.baseUrl && { baseURL: this.baseUrl }),
-      // OAuth requires the oauth-2025-04-20 beta flag, otherwise Anthropic
-      // rejects with "OAuth authentication is currently not supported."
       defaultHeaders: {
         'anthropic-beta': 'oauth-2025-04-20',
       },
@@ -352,9 +374,25 @@ export class AnthropicProvider implements ModelProvider {
     if (signal) streamOptions.signal = signal;
 
     if (this.useOAuth) {
-      // OAuth mode: static beta list already includes adaptive-thinking-2026-01-28
+      // OAuth mode: static beta list already includes adaptive-thinking-2026-01-28.
+      // context-1m is only added when the actual payload approaches the 200k
+      // window. Adding it unconditionally for 1M-model shortcuts triggers
+      // Anthropic's "Extra usage is required for long context requests" 429
+      // on Max plans, even on short messages (anthropics/claude-code#39841).
+      const betas = [
+        'claude-code-20250219',
+        'oauth-2025-04-20',
+        'adaptive-thinking-2026-01-28',
+        'research-preview-2026-02-01',
+      ];
+      if (this.contextWindow > 200_000) {
+        const estimatedTokens = estimateRequestTokens(systemArray, anthropicMessages, anthropicTools);
+        if (estimatedTokens > 180_000) {
+          betas.push('context-1m-2025-08-07');
+        }
+      }
       streamOptions.headers = {
-        'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,adaptive-thinking-2026-01-28,research-preview-2026-02-01',
+        'anthropic-beta': betas.join(','),
         'user-agent': 'aries-cli/0.1.0 (external, cli)',
         'x-app': 'cli',
       };

@@ -30,12 +30,13 @@ import asyncio
 from typing import Optional, Any
 
 # Lazy-imported on first call to avoid import cost when rlm_call is unused
-_AsyncAnthropic = None
+_AsyncOpenAI = None
 _client: Any = None
 
 # Configuration (set via configure_rlm op)
 _api_key: Optional[str] = None
-_model: str = "claude-sonnet-4-5-20250929"
+_base_url: Optional[str] = None
+_model: str = "qwen/qwen3-14b"
 _max_calls_per_exec: int = 15
 _max_parallel: int = 5  # concurrent calls in rlm_batch
 
@@ -46,19 +47,23 @@ _total_output_tokens = 0
 _call_log: list[dict] = []
 
 
-def configure(api_key: str, model: Optional[str] = None, max_calls: Optional[int] = None) -> None:
+def configure(api_key: str, base_url: Optional[str] = None, model: Optional[str] = None, max_calls: Optional[int] = None) -> None:
     """Set credentials + defaults. Called via server.py configure_rlm op."""
-    global _api_key, _model, _max_calls_per_exec, _client, _AsyncAnthropic
+    global _api_key, _base_url, _model, _max_calls_per_exec, _client, _AsyncOpenAI
     _api_key = api_key
+    _base_url = base_url
     if model:
         _model = model
     if max_calls:
         _max_calls_per_exec = max_calls
-    # Lazy-import anthropic
-    if _AsyncAnthropic is None:
-        from anthropic import AsyncAnthropic as _A
-        _AsyncAnthropic = _A
-    _client = _AsyncAnthropic(api_key=api_key)
+    # Lazy-import openai (OpenAI-compatible protocol — works with OpenRouter, Qwen, DeepSeek, Ollama, etc.)
+    if _AsyncOpenAI is None:
+        from openai import AsyncOpenAI as _A
+        _AsyncOpenAI = _A
+    kwargs: dict = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    _client = _AsyncOpenAI(**kwargs)
 
 
 def is_configured() -> bool:
@@ -121,7 +126,7 @@ async def _call_single(slice_: Any, sub_question: str, budget: int) -> str:
     prompt = _build_prompt(slice_, sub_question, budget)
 
     try:
-        response = await _client.messages.create(
+        response = await _client.chat.completions.create(
             model=_model,
             max_tokens=budget,
             messages=[{"role": "user", "content": prompt}],
@@ -135,11 +140,11 @@ async def _call_single(slice_: Any, sub_question: str, budget: int) -> str:
         return f"(rlm_call error: {str(e)[:200]})"
 
     answer = ""
-    if response.content and response.content[0].type == "text":
-        answer = response.content[0].text
+    if response.choices and response.choices[0].message.content:
+        answer = response.choices[0].message.content
 
-    in_tok = response.usage.input_tokens
-    out_tok = response.usage.output_tokens
+    in_tok = response.usage.prompt_tokens if response.usage else 0
+    out_tok = response.usage.completion_tokens if response.usage else 0
     _total_input_tokens += in_tok
     _total_output_tokens += out_tok
     _call_log.append({

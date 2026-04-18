@@ -31,9 +31,11 @@ import repl
 _indexer = None
 _codebase_module = None
 _vault_module = None
+_research_module = None
 _rlm_module = None
 CODEBASE = None  # CodebaseGraph instance, exposed via REPL namespace
 VAULT = None  # Vault proxy instance, exposed via REPL namespace
+RESEARCH = None  # Research proxy instance, exposed via REPL namespace
 
 
 def _lazy_load_indexer():
@@ -52,6 +54,14 @@ def _lazy_load_vault():
         import vault as _v_mod
         _vault_module = _v_mod
     return _vault_module
+
+
+def _lazy_load_research():
+    global _research_module
+    if _research_module is None:
+        import research as _r_mod
+        _research_module = _r_mod
+    return _research_module
 
 
 def _lazy_load_rlm():
@@ -201,6 +211,9 @@ def _build_namespace() -> dict:
     # Phase 3: expose vault proxy if connected
     if VAULT is not None:
         ns["vault"] = VAULT
+    # Phase 3b: expose research proxy if connected
+    if RESEARCH is not None:
+        ns["research"] = RESEARCH
     # Phase 4: expose rlm_call / rlm_batch if configured
     if _rlm_module is not None and _rlm_module.is_configured():
         ns["rlm_call"] = _rlm_module.rlm_call
@@ -230,7 +243,7 @@ def _write_response(response: dict) -> None:
 
 def handle_sync(msg: dict):
     """Handle synchronous (non-exec) ops. Returns response dict or None for shutdown."""
-    global NAMESPACE, CODEBASE, VAULT
+    global NAMESPACE, CODEBASE, VAULT, RESEARCH
     op = msg.get("op")
 
     if op == "ping":
@@ -334,6 +347,32 @@ def handle_sync(msg: dict):
             _rebuild_namespace()
         return {"ok": True}
 
+    elif op == "connect_research":
+        try:
+            r_mod = _lazy_load_research()
+            if RESEARCH is not None:
+                try:
+                    RESEARCH.disconnect()
+                except Exception:
+                    pass
+            RESEARCH = r_mod.Research()
+            RESEARCH.connect()
+            _rebuild_namespace()
+            return {"ok": True, "proxy": True}
+        except Exception as e:
+            import traceback
+            return {"error": f"research connect failed: {e}", "traceback": traceback.format_exc()}
+
+    elif op == "disconnect_research":
+        if RESEARCH is not None:
+            try:
+                RESEARCH.disconnect()
+            except Exception:
+                pass
+            RESEARCH = None
+            _rebuild_namespace()
+        return {"ok": True}
+
     elif op == "vault_status":
         # Handled in background thread via _run_vault_op (proxy deadlock prevention)
         if VAULT is None:
@@ -348,6 +387,7 @@ def handle_sync(msg: dict):
             rlm_mod = _lazy_load_rlm()
             rlm_mod.configure(
                 api_key=api_key,
+                base_url=msg.get("base_url"),
                 model=msg.get("model"),
                 max_calls=msg.get("max_calls"),
             )
@@ -418,6 +458,22 @@ def main():
             if VAULT is not None:
                 vr = msg["vault_response"]
                 VAULT.resolve(vr["id"], vr["result"])
+            continue
+
+        # Route research responses — MUST be before exec_thread.join() to avoid
+        # deadlock. Same rule as vault_response: exec thread blocks waiting for
+        # this response, so the main loop must be free to route it.
+        if "research_response" in msg:
+            if RESEARCH is not None:
+                rr = msg["research_response"]
+                RESEARCH.resolve(rr["id"], rr["result"])
+            continue
+
+        # Unblock a timed-out or aborted research call
+        if "cancel_research" in msg:
+            if RESEARCH is not None:
+                cr = msg["cancel_research"]
+                RESEARCH.cancel(cr["id"])
             continue
 
         # If there's a previous exec thread, wait for it before accepting new ops

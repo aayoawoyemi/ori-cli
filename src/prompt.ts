@@ -240,12 +240,14 @@ One Repl call. Composed operations. Fresh sub-reasoners per file. Prefer this ov
 
   sections.push(`## Environment\n${envLines.join('\n')}`);
 
-  // ── CLAUDE.md / project instructions ────────────────────────────────────
-  const claudeMdPaths = [
-    join(ctx.cwd, 'CLAUDE.md'),
-    join(ctx.cwd, '.claude', 'CLAUDE.md'),
+  // ── ORI.md / project instructions ───────────────────────────────────────
+  const projectInstructionPaths = [
+    join(ctx.cwd, 'ORI.md'),
+    join(ctx.cwd, '.ori', 'ORI.md'),
+    join(ctx.cwd, 'CLAUDE.md'),        // legacy fallback
+    join(ctx.cwd, '.claude', 'CLAUDE.md'), // legacy fallback
   ];
-  for (const p of claudeMdPaths) {
+  for (const p of projectInstructionPaths) {
     if (existsSync(p)) {
       try {
         const content = readFileSync(p, 'utf-8');

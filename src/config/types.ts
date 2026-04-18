@@ -21,7 +21,9 @@ export interface ModelConfig {
 }
 
 export interface RouterConfig {
-  primary: ModelConfig;
+  // All slots are optional at the type level so first-run users don't crash.
+  // The router throws a readable error at the first call site when primary is unset.
+  primary?: ModelConfig;
   reasoning?: ModelConfig;
   cheap?: ModelConfig;
   bulk?: ModelConfig;
@@ -126,14 +128,16 @@ export interface PreflightConfig {
 }
 
 export interface ReplConfig {
-  /** Whether to spawn the Python body subprocess at session start. */
-  enabled: boolean;
+  /** Whether to spawn the Python body subprocess at session start. 'auto' = enable only for REPL-capable models. */
+  enabled: boolean | 'auto';
   /** Default timeout per exec call, in ms. */
   timeoutMs: number;
   /** Max loop iterations before kill (Phase 2+, currently advisory). */
   maxIterations: number;
   /** Max rlm_call invocations per top-level exec (Phase 4+). */
   maxRlmCalls: number;
+  /** Model for rlm_call. Overrides the env-based default (qwen/qwen3-14b via OpenRouter). */
+  rlmModel?: string;
   /** Sandbox strategy. Phase 1 supports only same_process. */
   sandbox: 'same_process' | 'docker' | 'firecracker';
   /** Path to python executable. Auto-detected if omitted. */

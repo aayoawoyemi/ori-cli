@@ -1,5 +1,6 @@
-import type { Finding, SynthesisReport, Convergence, Contradiction, Gap, ResearchDepth } from './types.js';
+import type { Finding, SynthesisReport, Convergence, Contradiction, Gap, ResearchDepth, ResearchEvent } from './types.js';
 import type { ModelRouter } from '../router/index.js';
+import type { Budget } from './budget.js';
 
 /**
  * Phase 6: Cross-source synthesis.
@@ -14,13 +15,15 @@ export async function synthesize(
   sourcesIngested: number,
   chasedDepth: number,
   router: ModelRouter,
+  budget?: Budget,
+  emit?: (e: ResearchEvent) => void,
 ): Promise<SynthesisReport> {
   // Algorithmic synthesis (no LLM needed for basic patterns)
   const convergent = findConvergent(findings);
   const contradictions = findContradictions(findings);
 
   // LLM synthesis for gaps and deeper patterns
-  const gaps = await findGaps(query, findings, router);
+  const gaps = await findGaps(query, findings, router, budget, emit);
 
   // Frontier: sources referenced in findings but not ingested
   const ingestedIds = new Set(findings.map(f => f.provenance.sourceId));
@@ -124,8 +127,11 @@ async function findGaps(
   query: string,
   findings: Finding[],
   router: ModelRouter,
+  budget?: Budget,
+  emit?: (e: ResearchEvent) => void,
 ): Promise<Gap[]> {
   if (findings.length < 5) return [];
+  if (budget && !budget.hasRemaining(2000)) return [];
 
   const summary = findings
     .slice(0, 20)
@@ -144,10 +150,13 @@ Return JSON array: [{"description": "the gap", "assumedBy": ["source titles that
     const result = await router.cheapCall(prompt, [
       { role: 'user', content: summary },
     ]);
-    const jsonMatch = result.match(/\[[\s\S]*?\]/);
+    budget?.estimateAndDeduct(prompt, summary, result);
+    const stripped = result.replace(/```(?:json)?\s*([\s\S]*?)```/g, '$1').trim();
+    const jsonMatch = stripped.match(/\[[\s\S]*\]/);
     if (!jsonMatch) return [];
     return JSON.parse(jsonMatch[0]) as Gap[];
-  } catch {
+  } catch (e) {
+    emit?.({ type: 'error', phase: 'synthesize', message: `Gap analysis failed: ${e instanceof Error ? e.message : String(e)}` });
     return [];
   }
 }

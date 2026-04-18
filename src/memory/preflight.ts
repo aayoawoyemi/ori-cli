@@ -11,9 +11,12 @@ import type { PreflightConfig } from '../config/types.js';
  */
 export function resolvePreflightEnabled(
   preflight: PreflightConfig,
-  replEnabled: boolean,
+  _replEnabled: boolean,
 ): boolean {
-  if (preflight.enabled === 'auto') return !replEnabled;
+  // Re-enabled 2026-04-17. REPL mode still needs reactive retrieval —
+  // the agent cannot search for what it doesn't know exists.
+  // Preflight bridges user intent to vault knowledge.
+  if (preflight.enabled === 'auto') return true;
   return preflight.enabled;
 }
 
@@ -106,7 +109,7 @@ export async function runPreflight(
 
   // Try single-call preflight (requires ori_preflight in Ori >= 0.5.x)
   const compoundResult = vault?.connected
-    ? await vault.preflight(query, warmthContext, 12)
+    ? await vault.preflight(query, warmthContext, 5)
     : null;
 
   if (compoundResult && compoundResult.notes.length > 0) {

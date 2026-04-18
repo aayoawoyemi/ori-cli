@@ -131,6 +131,7 @@ export interface VaultStatus {
 
 export interface RlmConfigRequest {
   apiKey: string;
+  baseUrl?: string;
   model?: string;
   maxCalls?: number;
 }
@@ -138,5 +139,10 @@ export interface RlmConfigRequest {
 export interface RlmConfigResult {
   ok: boolean;
   model?: string;
+  error?: string;
+}
+
+export interface ResearchConnectResult {
+  ok: boolean;
   error?: string;
 }

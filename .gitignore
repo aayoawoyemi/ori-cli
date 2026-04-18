@@ -33,6 +33,16 @@ OPTIMIZATION_PLAN.md
 ORI_CLI_V1_BUILD_PLAN.md
 UI-PLAN.md
 V1-ROADMAP.md
+PLAN-*.md
+RESEARCH-*.md
+CHANGELOG.md
+
+# Test scratch files
+test-*.mjs
+test/
+
+# Video assets
+video/
 
 # Internal docs (competitive intel, eval data)
 docs/

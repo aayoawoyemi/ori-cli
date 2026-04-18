@@ -41,14 +41,14 @@ export async function assembleWarmContext(
 
   // 1. Identity — who the agent is
   if (identity?.identity) {
-    // Take first ~500 chars of identity (the core, not the full file)
-    const core = identity.identity.slice(0, 500).trim();
+    // Take first ~800 chars of identity (the core, not the full file)
+    const core = identity.identity.slice(0, 800).trim();
     sections.push(`Identity: ${core}`);
   }
 
   // 2. Goals — what's active right now
   if (identity?.goals) {
-    const goals = identity.goals.slice(0, 400).trim();
+    const goals = identity.goals.slice(0, 800).trim();
     sections.push(`Active goals:\n${goals}`);
   }
 

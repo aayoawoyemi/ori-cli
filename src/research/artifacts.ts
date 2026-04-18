@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import type { ResearchSession, SessionMeta, DiscoveredSource, CitationGraph } from './types.js';
+import type { ResearchSession, SessionMeta, DiscoveredSource, CitationGraph, Finding } from './types.js';
 
 /** Derive a slug from a research query. */
 export function slugify(query: string): string {
@@ -115,6 +115,47 @@ function findSessionDir(outputDir: string, slug: string): string | null {
   }
 
   return null;
+}
+
+/**
+ * Load a saved research session from disk.
+ * Returns meta + sources + findings + graph + frontier.
+ * `report` is not included (synthesize separately from findings if needed).
+ * Returns null if the session doesn't exist or is unreadable.
+ */
+export function loadSession(
+  outputDir: string,
+  slug: string,
+): Omit<ResearchSession, 'report' | 'reflectionQueries'> | null {
+  const dir = findSessionDir(outputDir, slug);
+  if (!dir) return null;
+
+  try {
+    const metaPath = join(dir, 'meta.json');
+    if (!existsSync(metaPath)) return null;
+
+    const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as SessionMeta;
+
+    const sources: DiscoveredSource[] = existsSync(join(dir, 'sources.json'))
+      ? JSON.parse(readFileSync(join(dir, 'sources.json'), 'utf8'))
+      : [];
+
+    const findings: Finding[] = existsSync(join(dir, 'findings.json'))
+      ? JSON.parse(readFileSync(join(dir, 'findings.json'), 'utf8'))
+      : [];
+
+    const graph: ResearchSession['graph'] = existsSync(join(dir, 'graph.json'))
+      ? JSON.parse(readFileSync(join(dir, 'graph.json'), 'utf8'))
+      : { nodes: [], edges: [] };
+
+    const frontier: string[] = existsSync(join(dir, 'frontier.json'))
+      ? JSON.parse(readFileSync(join(dir, 'frontier.json'), 'utf8'))
+      : [];
+
+    return { meta, sources, findings, graph, frontier };
+  } catch {
+    return null;
+  }
 }
 
 /** Format the report.md with frontmatter for Ori indexing. */
