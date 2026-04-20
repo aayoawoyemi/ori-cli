@@ -36,7 +36,18 @@ export type ReplEvent =
   | { type: 'exec_end'; result: ReplResult; turn_id?: string }
   | { type: 'bridge_ready' }
   | { type: 'bridge_restart'; reason: string; attempt: number }
-  | { type: 'bridge_error'; error: string };
+  | { type: 'bridge_error'; error: string }
+  // repl_say fires when Python calls say(text) during exec. Fire-and-forget
+  // from the Python side; the UI may register a handler via setOnSay to
+  // append the text to the assistant message stream. No response is sent
+  // back to Python — the text is visible or not, and either way exec
+  // continues. See body/speak.py for the Python-side contract.
+  | { type: 'repl_say'; text: string }
+  // repl_ask fires when Python calls ask(question). The Python side is
+  // blocked on a threading.Event — the UI MUST eventually call
+  // bridge.resolveAsk(id, answer) to unblock, or ask() will time out
+  // after its configured timeout (default 300s in body/speak.py).
+  | { type: 'repl_ask'; id: number; question: string };
 
 export interface ReplOptions {
   /** Path to body/server.py. Defaults to <repo>/body/server.py */

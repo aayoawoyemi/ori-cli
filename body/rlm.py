@@ -34,9 +34,22 @@ _AsyncOpenAI = None
 _client: Any = None
 
 # Configuration (set via configure_rlm op)
+# Default model chosen 2026-04-19: openai/gpt-oss-20b (was qwen/qwen3-14b).
+# Rationale:
+#   - 3x cheaper on input ($0.03/M vs $0.10/M) and 2x cheaper on output
+#     ($0.14/M vs $0.30/M) on OpenRouter as of April 2026.
+#   - Benchmarks above Qwen3 32B on focused tasks (MMLU 85.3, CodeForces 74.3,
+#     GPQA 71.5) — i.e. not just cheaper but better for the rlm workload
+#     (short focused summarization / extraction).
+#   - Does not exhibit the empty-response-at-low-max_tokens quirk we hit
+#     with Qwen 14B. The max_tokens floor in _call_single still applies as
+#     defense-in-depth if a different model gets swapped in later.
+# If you change this, update the comment in src/config/types.ts and the
+# default-model pick in src/index.ts resolveRlmConfig — all three must
+# agree, and config.repl.rlmModel overrides all three when set.
 _api_key: Optional[str] = None
 _base_url: Optional[str] = None
-_model: str = "qwen/qwen3-14b"
+_model: str = "openai/gpt-oss-20b"
 _max_calls_per_exec: int = 15
 _max_parallel: int = 5  # concurrent calls in rlm_batch
 
@@ -125,10 +138,24 @@ async def _call_single(slice_: Any, sub_question: str, budget: int) -> str:
 
     prompt = _build_prompt(slice_, sub_question, budget)
 
+    # Floor max_tokens at 250 — empirically observed that Qwen 14B (our
+    # default sub-reasoner) returns "" when max_tokens <~200 on a large
+    # prompt (~8K chars). The model appears to spend some tokens on
+    # internal reasoning/formatting before emitting, and with ≤150 tokens
+    # available there's nothing left for output. The prompt still tells
+    # the model to answer in `word_limit` words (≈ budget/4), so this
+    # floor only affects the truncation headroom, not the apparent
+    # response length — the model still obeys the word-count instruction.
+    # 250 is the lowest floor that produced consistent non-empty answers
+    # across the caller sites we tested (codebase.rlm_batch summarization
+    # at budget_per=150). If a different sub-reasoner needs a different
+    # floor, thread that in via configure_rlm rather than hard-coding per-model.
+    effective_max_tokens = max(budget, 250)
+
     try:
         response = await _client.chat.completions.create(
             model=_model,
-            max_tokens=budget,
+            max_tokens=effective_max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
     except Exception as e:

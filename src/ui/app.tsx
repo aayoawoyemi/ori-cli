@@ -7,6 +7,7 @@ import { Spinner } from './spinner.js';
 import { ModelPicker } from './modelPicker.js';
 import { agentLoop, type LoopEvent, type PermissionMode, type PermissionDecision } from '../loop.js';
 import { PermissionDialog } from './permissionDialog.js';
+import { AskDialog } from './askDialog.js';
 import { PlanApprovalDialog, type PlanAcceptMode } from './planApprovalDialog.js';
 import { setTitleBusy, setTitleDone, setTitleIdle, flashTaskbar } from './terminal.js';
 import { registerPlanTools } from '../tools/registry.js';
@@ -89,6 +90,15 @@ export function App(props: AppProps): React.ReactElement {
   const [pendingPermission, setPendingPermission] = useState<{
     toolCall: ToolCall;
     resolve: (decision: PermissionDecision) => void;
+  } | null>(null);
+  // Pending ask() modal — set by the bridge's onAsk callback when Python
+  // calls ask(question). Python is blocked on a threading.Event waiting for
+  // resolveAsk(id, answer). id is needed because overlapping ask() calls
+  // (shouldn't happen but are possible if the model misbehaves) still need
+  // to route their response to the right waiter on the Python side.
+  const [pendingAsk, setPendingAsk] = useState<{
+    id: number;
+    question: string;
   } | null>(null);
   const [showResumePicker, setShowResumePicker] = useState(initialResumePicker ?? false);
   const [sessionTitle, setSessionTitle] = useState<string | null>(null);
@@ -331,6 +341,36 @@ export function App(props: AppProps): React.ReactElement {
     });
     return () => {
       replHandle.bridge.setOnResearchSaved(null);
+    };
+  }, [replHandle]);
+
+  // Wire the Python body's say/ask primitives to the UI. Registered whenever
+  // a Repl bridge is present; deregistered on unmount / handle change so a
+  // stale closure can't keep firing setState on a dropped app.
+  //
+  // say(text) → append as assistant voice to the message stream. Python has
+  //   already continued; nothing to ack. If text arrives while the user is
+  //   mid-typing, Ink's render will paint it above the input without
+  //   disturbing cursor position.
+  //
+  // ask(id, question) → pop the AskDialog. The dialog's onSubmit/onCancel
+  //   handlers call bridge.resolveAsk(id, answer) to unblock Python. Empty
+  //   string is the cancel-contract (matches body/speak.py). If a second
+  //   ask fires while one is pending (unlikely but possible under bad model
+  //   behavior), we overwrite — the earlier one will time out on the Python
+  //   side. Queueing would be nicer but adds complexity for a rare case;
+  //   revisit if it actually happens in usage.
+  useEffect(() => {
+    if (!replHandle) return;
+    replHandle.bridge.setOnSay((text: string) => {
+      setDisplayMessages(prev => [...prev, { role: 'assistant', text }]);
+    });
+    replHandle.bridge.setOnAsk((id: number, question: string) => {
+      setPendingAsk({ id, question });
+    });
+    return () => {
+      replHandle.bridge.setOnSay(null);
+      replHandle.bridge.setOnAsk(null);
     };
   }, [replHandle]);
 
@@ -1650,7 +1690,7 @@ export function App(props: AppProps): React.ReactElement {
       {/* Pinned bottom: model picker OR input + status */}
       <Box flexDirection="column" flexShrink={0}>
         {/* Permission dialog takes priority over everything */}
-        {/* Dialogs in priority order: plan exit > permission > model picker > input */}
+        {/* Dialogs in priority order: plan exit > permission > ask > resume > model picker > input */}
         {showPlanApproval && planApprovalData ? (
           <PlanApprovalDialog
             planFilePath={planApprovalData.path}
@@ -1666,6 +1706,25 @@ export function App(props: AppProps): React.ReactElement {
             onAllow={() => { pendingPermission.resolve('allow'); setPendingPermission(null); }}
             onDeny={() => { pendingPermission.resolve('deny'); setPendingPermission(null); }}
             onAlways={() => { pendingPermission.resolve('always'); setPendingPermission(null); }}
+          />
+        ) : pendingAsk && replHandle ? (
+          // ask() from Python is currently blocking inside a Repl exec; the
+          // Python thread is parked on a threading.Event waiting for us to
+          // call resolveAsk. Priority is right under permission because both
+          // are cases of "the agent cannot proceed until the user responds."
+          <AskDialog
+            question={pendingAsk.question}
+            onSubmit={(answer) => {
+              replHandle.bridge.resolveAsk(pendingAsk.id, answer);
+              setPendingAsk(null);
+            }}
+            onCancel={() => {
+              // Cancel contract is empty string, not a sentinel. The model
+              // can branch on `if not answer:` to detect user refusal. See
+              // body/speak.py ask() docstring for the Python-side guarantee.
+              replHandle.bridge.resolveAsk(pendingAsk.id, '');
+              setPendingAsk(null);
+            }}
           />
         ) : showResumePicker ? (
           <ResumePicker

@@ -142,6 +142,17 @@ export class ReplBridge {
   private onResearchSaved: ((dir: string) => void) | null = null;
   // Session budget — persists across dispatchResearchMethod calls within the same /research run.
   private researchBudget: Budget | null = null;
+  // UI-facing handlers for say/ask. Registered directly by app.tsx via
+  // setOnSay/setOnAsk (mirrors setOnResearchSaved). Kept on a separate
+  // channel from general onEvent because:
+  //   1. say/ask are UI concerns, not logging concerns — index.ts's general
+  //      onEvent shouldn't need to know about them.
+  //   2. ask must route to a specific UI modal that can call resolveAsk —
+  //      there's only ever ONE consumer, not many observers.
+  // If no handler is registered, say() is a no-op visually (text is silently
+  // dropped) and ask() will time out on the Python side after its timeout.
+  private onSay: ((text: string) => void) | null = null;
+  private onAsk: ((id: number, question: string) => void) | null = null;
 
   private opts: {
     serverPath: string;
@@ -215,6 +226,29 @@ export class ReplBridge {
           // WebFetchTool / WebSearchTool. Same non-resolving pattern.
           if (msg.web_request) {
             this.handleWebCallback(msg.web_request);
+            return;
+          }
+
+          // Say notification: fire-and-forget from Python. No response is
+          // written back, exec is NOT blocked, and pending is NOT resolved.
+          // We just surface the text to the registered UI handler (if any)
+          // and to the general onEvent stream (so debug loggers see it).
+          // The emit is wrapped in try-catch inside dispatchSay — a flaky
+          // UI handler must never propagate back and kill the bridge.
+          if (msg.say) {
+            this.dispatchSay(msg.say);
+            return;
+          }
+
+          // Ask callback: Python is blocked in Speak._call on a threading.Event
+          // waiting for ask_response. We fire the registered UI handler with
+          // (id, question) and trust the UI to eventually call resolveAsk(id,
+          // answer), which writes ask_response back to Python's stdin. If no
+          // handler is registered, the Python side will time out per its own
+          // timeout (default 300s) — same failure mode as a user who never
+          // clicks the modal. Same non-resolving pattern as vault/fs.
+          if (msg.ask_request) {
+            this.handleAskCallback(msg.ask_request);
             return;
           }
 
@@ -561,6 +595,44 @@ export class ReplBridge {
    */
   setOnResearchSaved(cb: ((dir: string) => void) | null): void {
     this.onResearchSaved = cb;
+  }
+
+  /**
+   * Register the UI handler for say(text) calls from the Python body.
+   * The handler should append text to the user-visible assistant message
+   * stream. If no handler is registered, say() output is silently dropped
+   * — which is the correct behavior for headless benchmark runs that
+   * don't have a UI to render to.
+   */
+  setOnSay(cb: ((text: string) => void) | null): void {
+    this.onSay = cb;
+  }
+
+  /**
+   * Register the UI handler for ask(question) calls from the Python body.
+   * The handler must eventually call bridge.resolveAsk(id, answer) to
+   * unblock the Python side, or ask() will time out per its configured
+   * timeout (default 300s in body/speak.py). If no handler is registered,
+   * every ask() call times out — again correct for headless runs.
+   */
+  setOnAsk(cb: ((id: number, question: string) => void) | null): void {
+    this.onAsk = cb;
+  }
+
+  /**
+   * Unblock a pending ask() call by sending ask_response back to Python.
+   * Called by the UI after the user submits (or cancels — pass '' on cancel)
+   * the modal. Safe to call with a stale id (Python has already timed out
+   * and dropped the pending entry) — SPEAK.resolve is a no-op in that case.
+   *
+   * The response shape matches body/speak.py's expectation:
+   * result.answer (string) is returned to the model; result.error (string)
+   * would raise AskError on the Python side.
+   */
+  resolveAsk(id: number, answer: string): void {
+    this.process?.write(JSON.stringify({
+      ask_response: { id, result: { answer } },
+    }));
   }
 
   /**
@@ -1240,6 +1312,57 @@ export class ReplBridge {
       default:
         throw new Error(`unknown web method: ${method}`);
     }
+  }
+
+  // ── Say / Ask handlers ───────────────────────────────────────────────────
+  // These are the codemode-A6 primitives — the agent's voice inside the Repl.
+  // Unlike fs/shell/web which dispatch to existing TS-side tools, say/ask
+  // route directly to UI callbacks registered by app.tsx via setOnSay/setOnAsk.
+  // The bridge is effectively a passthrough here; the interesting work lives
+  // in app.tsx (appending assistant text, rendering the modal).
+
+  /**
+   * Handle a say notification from Python. Fire-and-forget — Python has
+   * already continued by the time this lands. We surface to the registered
+   * UI handler AND to the general onEvent stream so debug loggers can see
+   * every say() emission. UI handler errors must not propagate (they'd
+   * only reach the onLine catch, which eats them, but a noisy console
+   * stack trace is still bad UX for anyone not looking at the TS host).
+   */
+  private dispatchSay(payload: { text?: string }): void {
+    const text = typeof payload?.text === 'string' ? payload.text : String(payload?.text ?? '');
+    // Specific UI channel — the thing that actually renders.
+    try {
+      this.onSay?.(text);
+    } catch {
+      // never let UI callback errors break the bridge
+    }
+    // General event channel — observable via onEvent for logging/tracing.
+    this.emit({ type: 'repl_say', text });
+  }
+
+  /**
+   * Handle an ask_request from Python. The Python side is blocked on a
+   * threading.Event waiting for ask_response — we fire the UI handler and
+   * trust it to eventually call resolveAsk. If no handler is registered,
+   * Python times out on its own (default 300s in body/speak.py).
+   *
+   * Unlike fs/research/vault handlers, this one does NOT write a response
+   * here — the response is written later by resolveAsk(), after the user
+   * has actually typed something into the modal. That asymmetry is why
+   * ask lives with a UI callback and not inside dispatchAskMethod.
+   */
+  private handleAskCallback(req: { id: number; question: string }): void {
+    const id = req.id;
+    const question = typeof req.question === 'string' ? req.question : String(req.question);
+    try {
+      this.onAsk?.(id, question);
+    } catch {
+      // never let UI callback errors break the bridge
+    }
+    // Also surface through the general event channel — same observability
+    // reasoning as say. Subscribers can log without intercepting the modal.
+    this.emit({ type: 'repl_ask', id, question });
   }
 
   /**

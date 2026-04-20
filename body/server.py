@@ -29,6 +29,7 @@ import repl
 from fs import Fs
 from shell import Shell
 from web import Web
+from speak import Speak
 
 # Lazy imports (heavy deps) — only loaded when ops are used
 _indexer = None
@@ -58,6 +59,17 @@ SHELL = Shell()
 # from AriesConfig.webSearch at dispatch time. The model just calls
 # `web.fetch(url)` / `web.search(q)` without caring about backend config.
 WEB = Web()
+
+# Speak provides the agent's voice inside codemode: say() for fire-and-forget
+# user-visible text, ask() for blocking input prompts. Same lifecycle as
+# FS/SHELL/WEB — module-global, always available, no connect step. Namespace
+# registration below binds ns["say"] = SPEAK.say and ns["ask"] = SPEAK.ask so
+# the model calls them as bare functions (not speak.say / speak.ask), which
+# matches the codemode intent: user-facing I/O should read like builtins, not
+# namespaced API surface. See CODEMODE_ROADMAP.md §A6 for why the turn-break
+# cost of text content blocks makes these primitives the critical path for
+# collapsing N-turn tasks into single Repl calls.
+SPEAK = Speak()
 
 
 def _lazy_load_indexer():
@@ -207,6 +219,15 @@ def _build_namespace() -> dict:
     # Model composes search+fetch in a single Repl call instead of two
     # sequential tool calls.
     ns["web"] = WEB
+    # say / ask are bound as BARE names — not speak.say / speak.ask — because
+    # they are the agent's primary I/O channel to the user and should read as
+    # part of the Python builtin surface. `say("hello")` matches `print("hello")`
+    # in ergonomic weight; forcing `speak.say("hello")` would signal "this is
+    # a subsystem" when in fact it's the default conversational channel once
+    # the top-level text-block path gets stripped in A8. See body/speak.py
+    # header for the full rationale.
+    ns["say"] = SPEAK.say
+    ns["ask"] = SPEAK.ask
     ns["json"] = _json
     # Always available: reindex to point the body at a different project
     ns["reindex"] = _reindex
@@ -497,6 +518,16 @@ def main():
         if "web_response" in msg:
             wr = msg["web_response"]
             WEB.resolve(wr["id"], wr["result"])
+            continue
+
+        # Route ask responses — ask() is the only blocking speak primitive.
+        # say() is fire-and-forget and therefore has no *_response branch.
+        # SPEAK is module-global (same lifecycle as FS/SHELL/WEB) so no
+        # None-check is needed. If ask() timed out on the Python side the
+        # _pending entry is already gone and resolve() is a no-op — safe.
+        if "ask_response" in msg:
+            ar = msg["ask_response"]
+            SPEAK.resolve(ar["id"], ar["result"])
             continue
 
         # Unblock a timed-out or aborted research call

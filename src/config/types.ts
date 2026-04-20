@@ -136,7 +136,11 @@ export interface ReplConfig {
   maxIterations: number;
   /** Max rlm_call invocations per top-level exec (Phase 4+). */
   maxRlmCalls: number;
-  /** Model for rlm_call. Overrides the env-based default (qwen/qwen3-14b via OpenRouter). */
+  /** Model for rlm_call. Overrides the env-based default.
+   * Env-based defaults (picked in src/index.ts resolveRlmConfig):
+   *   - If OPENROUTER_API_KEY set → 'openai/gpt-oss-20b'
+   *   - Else if ANTHROPIC_API_KEY set → 'claude-haiku-4-5-20251001' via Anthropic's OpenAI-compat endpoint
+   *   - Else → 'unset' (rlm disabled) */
   rlmModel?: string;
   /** Sandbox strategy. Phase 1 supports only same_process. */
   sandbox: 'same_process' | 'docker' | 'firecracker';

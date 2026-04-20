@@ -73,6 +73,67 @@ function isProjectDirectory(dir: string): boolean {
   return PROJECT_MARKERS.some(marker => existsSync(join(dir, marker)));
 }
 
+// ── rlm provider resolution ──────────────────────────────────────────────
+// rlm_call / rlm_batch (the Python sub-reasoner inside the Repl body) route
+// through an OpenAI-compatible client. Two providers supported today:
+//   1. OpenRouter (primary) — wide model catalog, cheapest cost tier.
+//   2. Anthropic direct (fallback) — via Anthropic's OpenAI-compat endpoint
+//      at api.anthropic.com/v1/. Used when OPENROUTER_API_KEY is absent but
+//      ANTHROPIC_API_KEY is set (e.g. user on Claude Max with OAuth only).
+//
+// Model defaults picked per-provider so the fallback is cheap and safe:
+//   - OpenRouter path → 'openai/gpt-oss-20b'. ~$0.03/M input, $0.14/M output.
+//     Outperforms Qwen3 32B on focused summarization benchmarks. Chosen
+//     2026-04-19 (see body/rlm.py:39 for the full rationale).
+//   - Anthropic fallback → 'claude-haiku-4-5-20251001'. Explicitly NOT
+//     config.models.primary (which is usually Opus/Sonnet) — using the
+//     primary for N-way fan-out was ~$150/month risk for heavy users.
+//     Haiku at the Anthropic tier is 10-30× cheaper and more than adequate
+//     for rlm sub-calls (short, focused, max ~60 words per answer).
+//
+// user override: config.repl.rlmModel (in aries.config.yaml) takes absolute
+// precedence over the provider-aware default.
+//
+// Distribution note: this function ships with the CLI and runs on every
+// user's machine. It reads ONLY public env vars (OPENROUTER_API_KEY,
+// ANTHROPIC_API_KEY) — no Aayo-specific secrets baked in. Other devs
+// bring their own keys; defaults here just shape the cost profile.
+
+interface ResolvedRlmConfig {
+  rlmApiKey?: string;
+  rlmBaseUrl?: string;
+  rlmModel: string;
+}
+
+function resolveRlmConfig(configRlmModel: string | undefined): ResolvedRlmConfig {
+  const openrouterKey = process.env.OPENROUTER_API_KEY;
+  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+
+  // No key available — rlm is effectively off. Return a sentinel model so
+  // the downstream "rlm disabled" check can surface cleanly.
+  if (!openrouterKey && !anthropicKey) {
+    return { rlmModel: 'unset' };
+  }
+
+  if (openrouterKey) {
+    return {
+      rlmApiKey: openrouterKey,
+      rlmBaseUrl: 'https://openrouter.ai/api/v1',
+      rlmModel: configRlmModel ?? 'openai/gpt-oss-20b',
+    };
+  }
+
+  // Anthropic fallback. Base URL is explicit — without it, AsyncOpenAI
+  // (the Python client we use in rlm.py) defaults to api.openai.com which
+  // would route an Anthropic key to the wrong provider and fail opaquely.
+  // That was a pre-existing bug before this fallback rewrite.
+  return {
+    rlmApiKey: anthropicKey,
+    rlmBaseUrl: 'https://api.anthropic.com/v1/',
+    rlmModel: configRlmModel ?? 'claude-haiku-4-5-20251001',
+  };
+}
+
 async function compileAmbientSignatures(
   replHandle: ReplHandle,
   options: {
@@ -342,13 +403,14 @@ if (isSubagent) {
   if (config.signature.includeInSubagents && replEnabled) {
     let subRepl: ReplHandle | null = null;
     try {
+      const rlm = resolveRlmConfig(config.repl.rlmModel);
       subRepl = await setupReplBridge({
         config: config.repl,
         cwd,
         vaultPath: vaultPath ?? undefined,
-        rlmApiKey: process.env.OPENROUTER_API_KEY ?? process.env.ANTHROPIC_API_KEY,
-        rlmBaseUrl: process.env.OPENROUTER_API_KEY ? 'https://openrouter.ai/api/v1' : undefined,
-        rlmModel: config.repl.rlmModel ?? (process.env.OPENROUTER_API_KEY ? 'qwen/qwen3-14b' : (config.models.primary?.model ?? 'unset')),
+        rlmApiKey: rlm.rlmApiKey,
+        rlmBaseUrl: rlm.rlmBaseUrl,
+        rlmModel: rlm.rlmModel,
         vault,
         shouldIndex: isProject,
       });
@@ -539,13 +601,21 @@ async function main(): Promise<void> {
   if (replEnabled) {
     (async () => {
       try {
+        const rlm = resolveRlmConfig(config.repl.rlmModel);
+        // Log the resolved path once at startup so users see which provider
+        // is feeding rlm and can correct misconfiguration before spending
+        // a billing cycle on the wrong model. Only emit when rlm is live.
+        if (rlm.rlmApiKey) {
+          const provider = rlm.rlmBaseUrl?.includes('openrouter') ? 'OpenRouter' : 'Anthropic';
+          console.log(chalk.dim(`  rlm: ${provider} · ${rlm.rlmModel}`));
+        }
         const handle = await setupReplBridge({
           config: config.repl,
           cwd,
           vaultPath: vaultPath ?? undefined,
-          rlmApiKey: process.env.OPENROUTER_API_KEY ?? process.env.ANTHROPIC_API_KEY,
-          rlmBaseUrl: process.env.OPENROUTER_API_KEY ? 'https://openrouter.ai/api/v1' : undefined,
-          rlmModel: config.repl.rlmModel ?? (process.env.OPENROUTER_API_KEY ? 'qwen/qwen3-14b' : (config.models.primary?.model ?? 'unset')),
+          rlmApiKey: rlm.rlmApiKey,
+          rlmBaseUrl: rlm.rlmBaseUrl,
+          rlmModel: rlm.rlmModel,
           vault,
           router,
           shouldIndex: isProjectDirectory(cwd),
