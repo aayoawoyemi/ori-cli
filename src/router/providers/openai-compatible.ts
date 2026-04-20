@@ -244,6 +244,14 @@ export class OpenAICompatibleProvider implements ModelProvider {
 
     if (oaiTools.length > 0) {
       body.tools = oaiTools;
+      // parallel_tool_calls: false is OpenAI's equivalent of Anthropic's
+      // disable_parallel_tool_use — forces the model to emit exactly ONE
+      // tool_use per response. Cross-provider support: OpenAI, OpenRouter,
+      // Anthropic's OpenAI-compat endpoint, gpt-oss, Qwen, DeepSeek all
+      // respect this flag. See anthropic.ts for the thesis-alignment
+      // rationale — codemode needs one composed Repl call per response,
+      // not N fragmented calls.
+      body.parallel_tool_calls = false;
     }
 
     const headers: Record<string, string> = {

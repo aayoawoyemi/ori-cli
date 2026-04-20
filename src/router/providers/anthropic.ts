@@ -365,12 +365,26 @@ export class AnthropicProvider implements ModelProvider {
     }
 
     // Build request params
+    //
+    // disable_parallel_tool_use is the structural lever for codemode's thesis:
+    // the model emits exactly ONE tool_use block per response. With Repl as
+    // the only action verb (A8) and composition examples packed into its
+    // description (A9), the model's natural path becomes a single composed
+    // Repl call doing N actions via Python control flow — not N separate
+    // Repl tool_uses fragmented across the response. Pair with the OpenAI
+    // provider's parallel_tool_calls: false for cross-provider coverage.
+    //
+    // Only set when tools are present — no effect on plain conversational
+    // turns and avoids API validation errors on tool-less requests.
     const requestParams = {
       model: this.model,
       max_tokens: this.maxTokens,
       system: systemArray,
       messages: anthropicMessages,
-      ...(anthropicTools.length > 0 && { tools: anthropicTools }),
+      ...(anthropicTools.length > 0 && {
+        tools: anthropicTools,
+        tool_choice: { type: 'auto' as const, disable_parallel_tool_use: true },
+      }),
       // Extended thinking: inject budget when > 0. budget_tokens counts toward max_tokens.
       ...(this._thinkingBudget > 0 && {
         thinking: { type: 'enabled' as const, budget_tokens: this._thinkingBudget },
