@@ -114,13 +114,25 @@ export function registerReplTool(
 }
 
 /**
- * Strip legacy file-navigation tools (Read/Grep/Glob/VaultSearch/VaultRead/
- * VaultExplore/VaultWarmth/ProjectSearch) to force the model through the
- * Repl tool for code + memory navigation. Leaves Bash, Write, Edit, Web*,
- * Agent, VaultAdd — ops that don't benefit from composition.
+ * Destructive strip — removes every tool that codemode replaces with a
+ * namespace primitive inside the Repl body. Used by bench only (bench/
+ * quick.ts, bench/compare.ts) so the HARNESS-MANDATORY variant tests the
+ * same architecture that ships by default. The main CLI path does NOT
+ * call this — it uses runtime filtering at src/loop.ts:266 instead, so
+ * research/plan/explore modes can keep their own tool allowlists from a
+ * shared registry.
  *
- * Mirrors the mandatory-REPL thesis: removing meta-decisions by subtracting
- * escape hatches.
+ * Why codemode removes every one of these: each has a Repl-namespace
+ * replacement. Bash → shell.run, Edit/Write → fs.edit/fs.write, Read/
+ * Grep/Glob → fs.read/codebase.search/fs.glob, WebFetch/WebSearch →
+ * web.fetch/web.search, Vault* → vault.* methods, Project* → project
+ * primitives (or vault for insights). The model composes these inside
+ * Python; no top-level escape hatches.
+ *
+ * History: originally only stripped Read/Grep/Glob/VaultSearch/VaultRead/
+ * VaultExplore/VaultWarmth/ProjectSearch (the "navigation" subset).
+ * Extended 2026-04-19 (A8) to match the full codemode strip set, so
+ * bench and default-mode filter are in sync.
  */
 /** Register EnterPlanMode + ExitPlanMode tools. Returns the shared plan context. */
 export function registerPlanTools(
@@ -138,12 +150,20 @@ export function registerPlanTools(
 }
 
 export function stripNavigationTools(registry: ToolRegistry): void {
-  const legacyNav = [
-    'Read', 'Grep', 'Glob',
-    'VaultSearch', 'VaultRead', 'VaultExplore', 'VaultWarmth',
-    'ProjectSearch',
+  // Full codemode strip — every tool with a Repl-namespace replacement.
+  // Kept in sync with CODEMODE_DEFAULT in src/loop.ts:266 (runtime filter
+  // for the main CLI path). If either list changes, change both.
+  const stripped = [
+    // Shell + filesystem — replaced by shell.run / fs.* inside Repl
+    'Bash', 'Edit', 'Write', 'Read', 'Grep', 'Glob',
+    // Web — replaced by web.fetch / web.search inside Repl
+    'WebFetch', 'WebSearch',
+    // Vault — replaced by vault.* method suite (query_ranked/explore/add/read)
+    'VaultSearch', 'VaultRead', 'VaultExplore', 'VaultWarmth', 'VaultAdd',
+    // Project brain — replaced by project primitives / vault.add
+    'ProjectSearch', 'ProjectSave',
   ];
-  for (const name of legacyNav) {
+  for (const name of stripped) {
     (registry as any).tools.delete(name);
   }
 }

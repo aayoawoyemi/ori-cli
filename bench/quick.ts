@@ -338,10 +338,13 @@ async function runVariant(
       if (!replHandle) throw new Error('REPL bridge failed');
       registerReplTool(registry, () => replHandle);
       if (variant.stripLegacyNav) {
+        // stripNavigationTools now strips the FULL codemode set (Bash,
+        // Edit, Write, Read, Grep, Glob, Web*, Vault*, Project*) as of
+        // 2026-04-19 A8. The standalone Bash delete that lived here
+        // previously was a pre-A8 workaround — now redundant. Leaving
+        // the branch intact so the variant's stripLegacyNav flag still
+        // controls whether codemode-strip happens for this bench run.
         stripNavigationTools(registry);
-        // STRICT: also remove Bash â€” the escape hatch Qwen was using.
-        // Edit/Write remain (model needs them; Repl can't write files).
-        (registry as any).tools.delete('Bash');
       }
 
       if (variant.includeSignatures) {

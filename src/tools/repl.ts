@@ -9,10 +9,57 @@ import type { Tool, ToolContext } from './types.js';
 import type { ToolDefinition, ToolResult } from '../router/types.js';
 import type { ReplHandle } from '../repl/setup.js';
 
+// ── Repl tool description — the structural teaching channel ──────────────
+// Why this description is long and example-heavy: the `description` field
+// is part of the tool schema, which every provider (Anthropic, OpenAI-
+// compat, OpenRouter) sends to the model on every request BEFORE the
+// model emits any tool_use. It lives in the cached prefix, so it costs
+// nothing per turn after cache warms. A prompt paragraph describing the
+// same thing is soft (ignorable, not provider-uniform, not cache-aligned);
+// a packed tool description is structural (part of the contract, seen
+// first-turn, cross-model, cached).
+//
+// The examples matter more than the prose. Models in-context-learn from
+// patterns. Three compositions + one anti-pattern teach what "compose
+// multiple operations per call" actually looks like in Python.
+//
+// Keep in sync with the namespace registered in body/server.py's
+// _build_namespace and with the first-turn banner in _format_first_turn_banner.
+
+const REPL_DESCRIPTION = `Run Python in your persistent namespace. State (variables, imports, computations) survives across Repl calls in the same session.
+
+Pre-loaded in the namespace: codebase, vault, fs, shell, web, rlm_call, rlm_batch, say, ask, json, reindex. The first Repl call in a session returns a tool_result whose header lists exactly what's loaded for your session (some primitives depend on config).
+
+Compose multiple operations per call. A single composed call is how you win — it is faster, cheaper, and produces tighter reasoning than N fragmented calls.
+
+# Example: search → read top 3 → parallel summarize
+hits = codebase.search("auth middleware", limit=20)
+top = hits[:3]
+pairs = [(fs.read(h['file']), "what does this file do?") for h in top]
+summaries = rlm_batch(pairs)
+for h, s in zip(top, summaries):
+    say(f"{h['file']}: {s}")
+
+# Example: verify-then-edit
+content = fs.read("src/auth.ts")
+assert "oldPattern" in content, "target not present"
+fs.edit("src/auth.ts", "oldPattern", "newPattern")
+say("Edited src/auth.ts — 1 replacement.")
+
+# Example: branch on repo state
+if fs.glob("package.json"):
+    result = shell.run("npm test")
+    say(f"Tests: exit {result['code']}")
+else:
+    say("No package.json — skipping test run.")
+
+Anti-pattern: calling Repl once to read, once to search, once to write. Compose them. Variables persist across calls, but composition inside ONE call is always cheaper and produces tighter reasoning.
+
+Restrictions: no imports (namespace is pre-loaded), no eval/exec/open, no dunder attribute access.`;
+
 export class ReplTool implements Tool {
   readonly name = 'Repl';
-  readonly description =
-    'Primary tool for all code exploration, file reading, memory retrieval, and compositional reasoning. Use this first — before Bash, before anything else. Available: codebase.search/get_context/find_symbol/list_files, fs.read(path), vault.query_ranked/explore, rlm_call/rlm_batch. Composes multiple operations in one call. Far more efficient than shell commands for reading or searching.';
+  readonly description = REPL_DESCRIPTION;
   readonly readOnly = false;
 
   constructor(private getHandle: () => ReplHandle | null) {}
@@ -26,8 +73,10 @@ export class ReplTool implements Tool {
         properties: {
           code: {
             type: 'string',
+            // One-line pointer — full namespace + composition examples live
+            // in the tool description above. Don't duplicate them here.
             description:
-              'Python code to execute. Use print() to return output. Available: fs.read(path, offset?, limit?) — read any file by absolute or relative path; codebase.search/top_files/get_context/show_dependents/find_symbol/hits/communities, vault.query_ranked/query_important/query_warmth/explore/status, rlm_call(slice, question, budget), rlm_batch([(slice, q), ...], budget_per). Imports are forbidden; the namespace is pre-loaded.',
+              'Python code to execute. See tool description for pre-loaded namespace + composition patterns. Use print() or say() for output.',
           },
         },
         required: ['code'],

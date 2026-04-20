@@ -141,110 +141,25 @@ You have persistent memory — a knowledge graph with wiki-links, semantic embed
     sections.push(`## Ambient Context\n${ambientParts.join('\n\n')}`);
   }
   // ── Tool Usage ──────────────────────────────────────────────────────────
+  // A9 (2026-04-19): the Repl-prose block that previously lived here has
+  // been deleted. Teaching how to use the environment moved to two
+  // structural surfaces, both of which cross every model provider:
+  //   1. The Repl tool's `description` field (src/tools/repl.ts) carries
+  //      composition examples every API request sends with the schema.
+  //      The model reads it before choosing a tool. Not prose prompt —
+  //      tool contract.
+  //   2. The first-turn namespace banner (body/server.py, A7) prepends
+  //      live namespace + help() pointer to the first Repl tool_result.
+  //      The environment self-documents.
+  //
+  // This section now carries only a ~30-word orientation. Everything
+  // else about "which methods to prefer, what compositions look like,
+  // how to think about the Repl" lives in the places above where the
+  // model actually reads them in the right temporal order.
   if (ctx.replEnabled) {
-    sections.push(`## Your Body — the Repl Tool
+    sections.push(`## Your environment
 
-Repl is your primary action verb. Reasoning, code navigation, memory retrieval, composition — all happen as Python in one Repl call, not as prose text. Reaching for prose-as-thinking burns tokens; reaching for Repl produces results.
-
-The REPL namespace is pre-loaded with four objects: \`codebase\`, \`vault\`, \`fs\`, plus \`rlm_call\` / \`rlm_batch\` for sub-reasoners.
-
-### \`codebase\` — structural code understanding (tree-sitter + PageRank + HITS + Louvain)
-
-Lead with these — they are the difference between "knows the codebase" and "greps the codebase":
-
-- \`codebase.find_symbol(name)\` → where a symbol is defined (definition + references)
-- \`codebase.show_dependents(file)\` / \`show_dependencies(file)\` → import/call graph edges
-- \`codebase.communities()\` → module clusters (which files belong together)
-- \`codebase.find_convention(topic, limit=5)\` → recurring patterns ("error handling" | "logging" | "imports" | "async" | ...)
-- \`codebase.suggest_location(description)\` → ranked clusters where new code fits, with rationale
-- \`codebase.is_consistent_with(snippet, reference)\` → {deviation_score, findings[]} for naming/structure/imports
-- \`codebase.detect_duplication(snippet)\` → check BEFORE writing new functions
-
-Then the basics:
-
-- \`codebase.search(query, limit)\` → \`[{file, line, snippet}]\`
-- \`codebase.get_context(file, line_numbers, window)\` → focused slice
-- \`codebase.top_files(limit)\` / \`hits(limit)\` → ranked files
-- \`codebase.cluster_by_file(matches)\` / \`list_files()\` / \`stats()\`
-
-### \`vault\` — persistent memory across sessions
-
-- \`vault.explore(query, depth, limit)\` → **default verb**. Graph-aware PPR traversal across wiki-links. Use this first.
-- \`vault.query_warmth(context, limit)\` → recently-active notes
-- \`vault.query_important(limit)\` → PageRank authorities
-- \`vault.query_ranked(query, limit)\` → flat RRF-fused (escape hatch)
-- \`vault.query_fading(limit)\` → notes losing vitality
-- \`vault.add(title, content, type)\` → write to inbox
-- \`vault.status()\` / \`vault.orient(brief=False)\`
-
-### \`fs\` — filesystem (works on any path)
-
-- \`fs.read(path, offset=0, limit=None)\` / \`fs.listdir(path)\` / \`fs.glob(pattern, path)\`
-
-### \`rlm_call\` / \`rlm_batch\` — fresh sub-reasoners on focused slices
-
-\`rlm_call(slice, question, budget=1000)\` → one focused LLM call.
-\`rlm_batch([(slice, q), ...], budget_per=1000)\` → parallel fan-out.
-
-### \`reindex(path)\` — switch the active codebase
-
-### Composition is the point — prefer one Repl call over many sequential tools
-
-\`\`\`python
-matches = codebase.search("permission", limit=30)
-clusters = codebase.cluster_by_file(matches)
-summaries = rlm_batch([
-    (codebase.get_context(f, [m["line"] for m in ms], window=4),
-     f"Role of permission in {f}? One sentence.")
-    for f, ms in clusters.items()
-])
-print(rlm_call("\\n".join(summaries), "Unified explanation."))
-\`\`\`
-
-One call. Fresh sub-reasoners. Composed operations. ALWAYS prefer this over 10+ sequential tool calls.
-
-### Worked routing examples
-
-User asks: "where is \`runCompaction\` defined and what calls it?"
-→ Single Repl call:
-\`\`\`python
-defs = codebase.find_symbol("runCompaction")
-callers = codebase.show_dependents("src/memory/compact.ts")
-print("definition:", defs)
-print("callers:", callers)
-\`\`\`
-Not: Bash grep across the tree.
-
-User asks: "did we already figure out how to handle this OAuth refresh issue?"
-→ Single Repl call:
-\`\`\`python
-hits = vault.explore("OAuth refresh token expiry")
-for h in hits[:3]:
-    print(h["title"], "—", h.get("snippet", "")[:200])
-\`\`\`
-Then respond with a Recall: prefix if a prior note applies. E.g. "Recall: the 2026-04-11 note on Anthropic local OAuth flagged this exact 401 pattern — we need to force credential reload on refresh."
-
-User asks: "how does permission work across the loop?"
-→ Compose with rlm_batch, don't dump files:
-\`\`\`python
-matches = codebase.search("permission", limit=30)
-clusters = codebase.cluster_by_file(matches)
-summaries = rlm_batch([
-    (codebase.get_context(f, [m["line"] for m in ms], window=4),
-     f"Role of permission in {f}? One sentence.")
-    for f, ms in clusters.items()
-])
-print(rlm_call("\\n".join(summaries), "Unified explanation."))
-\`\`\`
-Not: Read each file sequentially into the main model's context.
-
-Restrictions: no imports, no \`eval\`/\`exec\`/\`open\`, no dunder attribute access.
-
-## Other tools (narrow purposes)
-- \`Edit\` / \`Write\` — file mutations (Repl cannot write files)
-- \`Bash\` — build/test/git/install/file-management ONLY. Reaching for Bash on a navigation task wastes a turn — use Repl.
-- \`WebFetch\` / \`WebSearch\` — external info
-- \`VaultAdd\` — one-shot note capture when not in Repl flow`);
+You operate inside a persistent Python REPL. On your first Repl call, your tool_result will list the live namespace. help(name) introspects any primitive. Compose multiple operations per call — that is the shape of good work here. Text content is for speech to the user; everything else happens inside Repl.`);
   } else {
     sections.push(`## Tool Usage
 - Use Read instead of cat/head/tail via Bash.

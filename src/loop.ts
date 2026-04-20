@@ -263,7 +263,30 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       ]);
       activeTools = allTools.filter(t => RESEARCH_ALLOWED.has(t.name));
     } else {
-      activeTools = allTools;
+      // Default mode = codemode (A8). The model sees Repl + plan-mode
+      // switchers + subagent delegation only. Every file-nav / edit /
+      // shell / web / vault / project tool lives INSIDE the Repl
+      // namespace — the model reaches them via fs.*, shell.run, web.*,
+      // vault.*, codebase.*, research.*, rlm_call, rlm_batch, say, ask.
+      //
+      // Why runtime-filter and not destructive registry strip: research,
+      // plan, and explore modes share the same registry. Stripping tools
+      // at registration time would break their mode-specific allowlists.
+      // By filtering per-turn at this layer (mirroring the existing
+      // research/plan/explore branches above), each mode's tool set is
+      // independent and research/plan/explore keep working unchanged.
+      //
+      // Why keep Agent in the allowlist: subagent delegation is its own
+      // architectural capability (spawns a fresh context), not a file-nav
+      // escape hatch. Repl composition and Agent delegation are
+      // complementary, not alternatives.
+      //
+      // See CODEMODE_ROADMAP.md §A8 and the all-righty-okay-so-lexical-
+      // island plan for the full rationale.
+      const CODEMODE_DEFAULT = new Set([
+        'Repl', 'EnterPlanMode', 'ExitPlanMode', 'Agent',
+      ]);
+      activeTools = allTools.filter(t => CODEMODE_DEFAULT.has(t.name));
     }
 
     // ── Research mode reminder ────────────────────────────────────────
