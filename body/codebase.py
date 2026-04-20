@@ -77,6 +77,38 @@ def _get_cached_parser(language: str):
 
 
 class CodebaseGraph:
+    """
+    The `codebase` primitive exposed in the Repl namespace. Wraps the indexer
+    output as a directed reference graph + rankings (PageRank/HITS/Louvain) so
+    the agent can orient itself structurally before reading files.
+
+    Composed usage (the shape that wins):
+
+        # Orient: find the most-important files, pick a focus
+        top = codebase.pagerank(limit=10)
+        for path, score in top[:5]:
+            print(f"{score:.3f}  {path}")
+
+        # Inspect a specific file's dependency web
+        deps = codebase.show_dependencies("src/loop.ts")
+        dependents = codebase.show_dependents("src/loop.ts")
+
+        # Follow a symbol
+        hits = codebase.find_symbol("handleSubmit")
+        for h in hits:
+            ctx = codebase.get_context(h['file'], [h['line']], window=8)
+            print(ctx)
+
+        # Structural clustering — what subsystems exist?
+        for cid, paths in codebase.communities().items():
+            if len(paths) > 3:
+                print(f"Cluster {cid}: {paths[:5]}...")
+
+    Call `help(codebase.<method>)` for per-method details. Every method
+    returns plain Python (dicts, lists, tuples) so you can post-process
+    with normal comprehensions instead of chaining via a custom API.
+    """
+
     def __init__(self, index_result: dict):
         self.root: str = index_result["root"]
         self.files: dict = index_result["files"]  # path -> FileRecord
@@ -231,7 +263,26 @@ class CodebaseGraph:
                 yield endpoints, self._graph.get_edge_data_by_index(edge_idx)
 
     def pagerank(self, limit: Optional[int] = None, personalization: Optional[dict[str, float]] = None) -> list[tuple[str, float]]:
-        """Return files ranked by PageRank (desc). Optional personalization seed."""
+        """
+        Return files ranked by PageRank (desc) — the structural importance
+        of each file in the reference graph. High-PageRank files are ones
+        that many others depend on. Use this to orient at the start of a
+        task: the top 10 are usually the architectural core.
+
+        Args:
+            limit: max results. None returns all files.
+            personalization: {file_path: weight} to bias the walk toward
+              specific files — useful for "what's close to THIS file?"
+              semantic search.
+
+        Returns list of (file_path, score) tuples, score descending.
+
+        Example (find top 5 then read them in parallel):
+            top = codebase.pagerank(limit=5)
+            pairs = [(fs.read(p), "one-line summary of this file") for p, _ in top]
+            for (p, _), summary in zip(top, rlm_batch(pairs)):
+                say(f"{p}: {summary}")
+        """
         scores = self._ensure_pagerank(personalization)
         items = sorted(scores.items(), key=lambda x: -x[1])
         return items[:limit] if limit else items
@@ -258,9 +309,22 @@ class CodebaseGraph:
 
     def search(self, query: str, limit: int = 50) -> list[dict]:
         """
-        Search for a term across file contents. Returns list of:
-          {file, line, snippet}
-        Case-insensitive substring match.
+        Case-insensitive substring search across every indexed file. Cheap
+        first-pass lookup — if you want structural matches (definitions,
+        imports) use `find_symbol` instead.
+
+        Args:
+            query: substring to match (case-insensitive)
+            limit: stop after this many matches (default 50)
+
+        Returns list of {file, line, snippet} dicts.
+
+        Example (find usage sites, group by file, read context):
+            hits = codebase.search("handleSubmit", limit=30)
+            by_file = codebase.cluster_by_file(hits)
+            for path, matches in list(by_file.items())[:3]:
+                lines = [m['line'] for m in matches]
+                print(codebase.get_context(path, lines, window=4))
         """
         q = query.lower()
         results = []
@@ -277,7 +341,26 @@ class CodebaseGraph:
         return results
 
     def find_symbol(self, name: str) -> list[dict]:
-        """Find where a symbol is defined. Returns list of {file, line, kind}."""
+        """
+        Find DEFINITION sites for a named symbol. Uses the indexer's
+        symbol table — exact-name matches only, not substrings. Unlike
+        `search` which scans raw text, this returns only declarations
+        (functions, classes, methods, types).
+
+        Args:
+            name: exact symbol name (case-sensitive)
+
+        Returns list of {file, line, kind} dicts. Empty list if undefined.
+
+        Example (jump to a function's definition, then its callers):
+            defs = codebase.find_symbol("resolveRlmConfig")
+            if defs:
+                path = defs[0]['file']
+                print(codebase.get_context(path, [defs[0]['line']], window=10))
+                # Who calls it?
+                for caller, weight in codebase.show_dependents(path)[:5]:
+                    print(f"  referenced from {caller} ({weight}x)")
+        """
         out = []
         for path in self._symbol_to_files.get(name, set()):
             rec = self.files[path]
@@ -289,7 +372,20 @@ class CodebaseGraph:
     # -------- Graph navigation --------
 
     def show_dependents(self, file_path: str) -> list[tuple[str, int]]:
-        """Files that reference symbols defined in file_path. Returns [(path, weight)]."""
+        """
+        Files that REFERENCE symbols defined in `file_path`. Answers "who
+        uses this?" — the blast radius of changes to the file.
+
+        Returns list of (file_path, reference_count) tuples, descending
+        by count. Empty list if file not in the graph.
+
+        Example (impact analysis before an edit):
+            deps = codebase.show_dependents("src/loop.ts")
+            if len(deps) > 10:
+                say(f"loop.ts has {len(deps)} dependents — high blast radius")
+                for path, refs in deps[:5]:
+                    say(f"  {path} ({refs} refs)")
+        """
         if file_path not in self._node_ids:
             return []
         nid = self._node_ids[file_path]
@@ -300,7 +396,16 @@ class CodebaseGraph:
         return sorted(out, key=lambda x: -x[1])
 
     def show_dependencies(self, file_path: str) -> list[tuple[str, int]]:
-        """Files whose symbols file_path references. Returns [(path, weight)]."""
+        """
+        Files whose symbols `file_path` REFERENCES. Answers "what does this
+        depend on?" — the mirror of show_dependents.
+
+        Returns list of (file_path, reference_count) tuples, descending.
+
+        Example (audit what a file imports heavily):
+            for path, refs in codebase.show_dependencies("src/loop.ts")[:5]:
+                print(f"{path}: {refs} refs from loop.ts")
+        """
         if file_path not in self._node_ids:
             return []
         nid = self._node_ids[file_path]
@@ -342,7 +447,28 @@ class CodebaseGraph:
         window: int = 5,
     ) -> str:
         """
-        Return context window around specific lines, or file preview.
+        Return a pre-formatted context window around specific lines, or a
+        file preview if line_numbers is None.
+
+        With line_numbers: for each line, slices `window` lines before/after
+        and merges overlapping windows so adjacent hits don't duplicate
+        content. Lines are prefixed with their line number for reference.
+
+        Without line_numbers: returns the first 40 lines of the file as a
+        preview header.
+
+        Args:
+            file_path: indexed file path (see codebase.list_files())
+            line_numbers: line numbers to center context windows on
+            window: radius of each context window (default 5 lines)
+
+        Returns a formatted string ready for print() or for packing into
+        an rlm_call slice.
+
+        Example (show all search hits with surrounding context):
+            hits = codebase.search("TODO(slop)", limit=20)
+            for path, matches in codebase.cluster_by_file(hits).items():
+                print(codebase.get_context(path, [m['line'] for m in matches]))
         """
         if file_path not in self.files:
             return f"(file not found: {file_path})"

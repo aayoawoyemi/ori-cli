@@ -24,12 +24,42 @@ class ResearchError(Exception):
 
 class Research:
     """
-    Research proxy that routes all calls through the TS bridge.
+    The `research` primitive exposed in the Repl namespace. Multi-stage
+    research pipeline: discover → ingest → extract → synthesize → save.
 
-    Sends research_request messages to stdout and blocks until research_response
-    arrives on stdin (routed by server.py's main loop). The key invariant:
-    server.py must route research_response BEFORE exec_thread.join() — same
-    rule as vault_response — or this will deadlock.
+    Backed by a TS-side engine that calls Arxiv/Semantic Scholar/OpenAlex/
+    GitHub/Exa/Reddit for discovery and pulls full content via Jina Reader.
+    The proxy here routes research_request/research_response messages over
+    the bridge — deadlock rule: server.py must route research_response
+    BEFORE exec_thread.join(), same as vault_response.
+
+    The full pipeline, composed:
+
+        # 1. Discover candidate sources
+        sources = research.discover("memory-augmented agents 2026", limit=30)
+
+        # 2. Pick 5-10 highest-signal ones, ingest full content
+        picks = sources[:8]
+        handles = research.ingest(picks)
+
+        # 3. Extract structured findings from each (parallel-friendly)
+        findings = []
+        for h in handles:
+            findings.extend(research.extract(h['handle'], focus="retrieval architecture"))
+
+        # 4. Cross-source synthesis — convergence, contradictions, gaps
+        report = research.synthesize(findings, query="memory-augmented agents")
+        say(f"{len(report['convergent'])} convergent findings, {len(report['gaps'])} gaps")
+
+        # 5. Persist the session for future recall
+        session = research.session("memory-augmented-agents-2026")
+        session.update({'sources': picks, 'findings': findings, 'graph': {'nodes': [], 'edges': []}, 'frontier': []})
+        result = research.save(session)
+
+    Anti-pattern: `ingest` all 30 discovered sources. You waste budget on
+    noise. Curate to ~5-10 before ingesting.
+
+    Call `help(research.<method>)` for per-method details.
     """
 
     def __init__(self) -> None:

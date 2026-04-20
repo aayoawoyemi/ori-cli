@@ -187,18 +187,69 @@ async def _call_single(slice_: Any, sub_question: str, budget: int) -> str:
 
 def rlm_call(slice_: Any, sub_question: str, budget: int = 1000) -> str:
     """
-    Spawn a fresh LLM instance with a focused slice + sub-question.
-    Returns the sub-model's answer as a string.
-    Synchronous interface; internally runs one async call.
+    Spawn a fresh sub-model (default gpt-oss-20b via OpenRouter) with a
+    focused context slice + one question. Returns the answer as a string.
+
+    This is the single-shot fan-OUT primitive. The sub-model sees ONLY
+    the slice you pass — not your full conversation history, not your
+    tools. That's the point: cheap focused reasoning on a bounded slice,
+    returning a string you can treat as data.
+
+    Args:
+        slice_: the context the sub-model needs (str or any value — will
+          be stringified if not already). Truncated to 20KB to keep per-call
+          cost bounded; package the relevant bits yourself.
+        sub_question: the specific question. Be direct: "Summarize what this
+          file does in one paragraph" beats "Tell me about this file."
+        budget: max_tokens cap for the sub-model's response (floored at 250
+          internally to prevent empty-response on reasoning-heavy models).
+          Word-limit instruction in the prompt is roughly budget/4 words.
+
+    Returns the sub-model's answer string.
+
+    Example (summarize ONE file):
+        content = fs.read("src/loop.ts")
+        summary = rlm_call(content, "What is the main responsibility of this file?", budget=200)
+        say(f"loop.ts: {summary}")
+
+    For parallel fan-out over many inputs, use `rlm_batch`.
     """
     return asyncio.run(_call_single(slice_, sub_question, budget))
 
 
 def rlm_batch(pairs: list, budget_per: int = 1000) -> list[str]:
     """
-    Run rlm_call on a list of (slice, question) pairs IN PARALLEL.
-    Returns list of answers in same order as input pairs.
-    Bounded by _max_parallel semaphore to avoid rate limits.
+    Parallel fan-out — run rlm_call on a list of (slice, question) pairs
+    concurrently, bounded by an internal semaphore to avoid rate limits.
+    Answers are returned in input order so you can zip them back with
+    the original items.
+
+    This is the primary tool for "summarize 20 files in parallel" or
+    "extract findings from 10 sources in one call" patterns. Sequential
+    rlm_calls are the biggest latency trap; use `rlm_batch` whenever
+    you have ≥2 independent sub-questions.
+
+    Args:
+        pairs: list of (slice, sub_question) tuples
+        budget_per: max_tokens per sub-call (same flooring as rlm_call)
+
+    Returns list of strings in the same order as `pairs`.
+
+    Example (fan-out file summaries, then zip with originals):
+        top_files = codebase.pagerank(limit=10)
+        pairs = [(fs.read(p), "one-paragraph summary") for p, _ in top_files]
+        summaries = rlm_batch(pairs, budget_per=200)
+        for (path, score), summary in zip(top_files, summaries):
+            say(f"{path} ({score:.3f}): {summary}")
+
+    Example (extract findings from research sources):
+        handles = research.ingest(discovered[:8])
+        pairs = [
+            (research.load(h['handle'], 'fullText'),
+             "Extract the key claim + supporting evidence in 2 sentences.")
+            for h in handles
+        ]
+        nuggets = rlm_batch(pairs, budget_per=300)
     """
     if not pairs:
         return []

@@ -89,11 +89,45 @@ def _unwrap_data(result: Any) -> Any:
 
 class Vault:
     """
-    Vault proxy that routes all calls through the TS bridge.
+    The `vault` primitive exposed in the Repl namespace. Ori Mnemos memory
+    substrate — markdown-native persistent notes with wiki-links, warmth
+    signals, and Q-value reranked retrieval.
 
-    Same API as the old Vault class, but instead of owning an MCP subprocess,
-    sends vault_request messages to stdout and blocks until vault_response
-    arrives on stdin (routed by server.py's main loop).
+    Proxy that routes all calls through the TS bridge: sends vault_request
+    messages to stdout, blocks until vault_response arrives on stdin
+    (routed by server.py's main loop).
+
+    Recall contract (load-bearing):
+        When you pull something relevant from the vault, surface it to
+        the user with a `Recall:` prefix in your speech. Example:
+            Recall: you noted in `codemode-paradigm` that the 10x turn
+            reduction was validated in phase-0.
+        Silent recall is invisible smartness — the user has no way to see
+        what memory is shaping the answer. The `Recall:` prefix makes
+        compounded memory legible. This is a voice-level rule, not just
+        a retrieval rule.
+
+    Composed usage:
+
+        # Orient before a task — what did past-me already decide?
+        hits = vault.query_ranked("codemode routing enforcement", limit=5)
+        for h in hits['results'][:3]:
+            say(f"Recall: {h['title']} (score {h['score']:.2f})")
+
+        # Go deeper — spreading activation across wiki-links
+        deep = vault.explore("ambient agent UI", depth=2, limit=10)
+        for h in deep['results']:
+            if 'presence' in h['title'].lower():
+                print(vault.read(h['path']))
+
+        # Capture a durable insight for future sessions
+        vault.add(
+            title="A8 default-mode filter proved cleaner than registry strip",
+            content="Runtime filter at loop.ts:267 preserves research/plan/explore modes without registry mutation.",
+            type="learning",
+        )
+
+    Call `help(vault.<method>)` for per-method details.
     """
 
     def __init__(self, vault_path: str):
@@ -168,6 +202,29 @@ class Vault:
     # -------- Retrieval --------
 
     def query_ranked(self, query: str, limit: int = 10, include_archived: bool = False) -> dict:
+        """
+        Primary retrieval verb — full Q-value reranked search over the vault.
+        Fuses 4 base signals (composite, keyword, graph, warmth) via RRF,
+        then Phase B Q-value reranking. This is the default first move when
+        you want relevant prior notes on a topic.
+
+        Args:
+            query: natural-language search string
+            limit: max results (default 10)
+            include_archived: set True to surface retired notes
+
+        Returns {"results": [...], "warmth": {...}, ...}. Each result has
+        `title`, `score`, `path`, `signals`. Use `vault.read(path)` to load
+        the full note content if needed.
+
+        Example (retrieve + surface + optionally read):
+            hits = vault.query_ranked("permission gate codemode", limit=5)
+            top = hits['results'][:3]
+            for h in top:
+                say(f"Recall: {h['title']}")
+            if top:
+                print(vault.read(top[0]['path']))
+        """
         return _unwrap_data(self._call("ori_query_ranked", {
             "query": query, "limit": limit, "include_archived": include_archived,
         }))
@@ -194,6 +251,29 @@ class Vault:
 
     def explore(self, query: str, depth: int = 2, limit: int = 15,
                 recursive: bool = True, include_content: bool = True) -> dict:
+        """
+        Deep retrieval with spreading activation across wiki-links. Starts
+        from the query-matched notes and walks the link graph `depth` levels
+        out — surfaces related notes that wouldn't rank on text alone but
+        are structurally adjacent.
+
+        Heavier than query_ranked (up to 60s timeout). Use when you need
+        breadth (the full topical neighborhood) not just top hits.
+
+        Args:
+            query: natural-language search string
+            depth: wiki-link walk depth (default 2, max ~4 useful)
+            limit: max results to return
+            recursive: walk link graph multi-step vs single-step
+            include_content: attach note body to each result
+
+        Example (map a topical region):
+            hits = vault.explore("codemode paradigm", depth=2, limit=20)
+            for h in hits['results']:
+                print(f"  {h['title']}")
+            # Useful for surfacing convergence — seeing multiple angles
+            # on the same theme from different past sessions.
+        """
         return _unwrap_data(self._call("ori_explore", {
             "query": query, "depth": depth, "limit": limit,
             "recursive": recursive, "include_content": include_content,
@@ -210,6 +290,29 @@ class Vault:
     # -------- Writes --------
 
     def add(self, title: str, content: Optional[str] = None, type: str = "insight") -> dict:
+        """
+        Write a new note to the vault inbox. The ONLY path for durable
+        memory writes — no silent keyword-heuristic path. Title becomes
+        the filename (slugified). Content is the markdown body.
+
+        Args:
+            title: one-line note title (becomes slug + filename)
+            content: markdown body; if None, creates a stub note
+            type: "insight" | "learning" | "decision" | "moc" | others —
+              controls vault routing (some types go to self/ vs notes/)
+
+        Example:
+            vault.add(
+                title="rlm_batch empty response quirk traces to max_tokens floor",
+                content=(
+                    "Qwen 14B (and similar small reasoning models) return"
+                    " empty string when max_tokens < ~200 because reasoning"
+                    " overhead eats the output budget. Floor at 250 in"
+                    " _call_single. See body/rlm.py:140."
+                ),
+                type="learning",
+            )
+        """
         args: dict = {"title": title, "type": type}
         if content is not None:
             args["content"] = content
@@ -218,7 +321,18 @@ class Vault:
     # -------- File Reading (bounded to vault) --------
 
     def read(self, path: str) -> str:
-        """Read a file from the vault by relative path. Bounded to vault directory."""
+        """
+        Read a file from the vault by relative path. Bounded to vault dir —
+        attempts to escape via .. or absolute paths raise VaultError.
+
+        Args:
+            path: relative path from vault root (e.g. "notes/codemode.md")
+
+        Use after query_ranked/explore when you want the full note body:
+            hits = vault.query_ranked("rlm fallback", limit=3)
+            if hits['results']:
+                print(vault.read(hits['results'][0]['path']))
+        """
         import os
         full = os.path.normpath(os.path.join(self._path, path))
         if not full.startswith(os.path.normpath(self._path)):
@@ -229,7 +343,21 @@ class Vault:
             return f.read()
 
     def get_note(self, title: str) -> str:
-        """Read a note by title (searches notes/, ops/, self/, inbox/)."""
+        """
+        Read a note by title — convenience wrapper that slugifies and
+        searches the standard vault directories (notes/, ops/, self/,
+        inbox/). Use when you know the title but not the exact path.
+
+        Args:
+            title: human-readable title (will be slugified to find file)
+
+        Raises VaultError if the note isn't found in any standard dir.
+
+        Example:
+            text = vault.get_note("codemode paradigm")
+            if "stack frame" in text:
+                say("Recall: codemode paradigm frames work as stack frames")
+        """
         import os
         slug = title.lower().replace(" ", "-")
         if not slug.endswith(".md"):

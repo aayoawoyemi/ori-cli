@@ -256,6 +256,15 @@ def _rebuild_namespace():
 NAMESPACE = _build_namespace()
 DEFAULT_TIMEOUT_MS = 30000
 
+# Session exec counter — bumped on every _run_exec entry. The first-turn
+# banner is prepended to stdout only when this hits 1. Reset to 0 by the
+# reset op so /reset re-arms the banner for a fresh session. Not thread-safe
+# by itself, but only touched by _run_exec (which runs single-threaded per
+# exec because main() joins the prior exec_thread before accepting another
+# op — see main() ~line 510) and the reset op handler (which runs on the
+# main loop, not the exec worker), so the ordering is safe.
+_exec_count = 0
+
 # Lock for stdout writes — both main thread and exec worker may write
 _stdout_lock = threading.Lock()
 
@@ -267,6 +276,46 @@ def _write_response(response: dict) -> None:
         sys.__stdout__.flush()
 
 
+# ── First-turn banner ────────────────────────────────────────────────────
+# The model's prompt doesn't describe the namespace anymore — A9 deletes
+# that prose. Instead, the environment self-documents via the first Repl
+# tool_result. When _run_exec fires the first exec of the session, this
+# banner gets prepended to stdout so the model sees what's loaded before
+# any of its own output. Structural discoverability beats prose teaching.
+#
+# Keep PRIMITIVES in sync with _build_namespace: if a new namespace
+# primitive is registered there, add it here too or the model won't know
+# it's available on first glance. The `available` filter drops primitives
+# that aren't actually loaded in this session (codebase without an index,
+# vault without a connection, etc.) — don't advertise capabilities the
+# model can't use.
+
+_BANNER_PRIMITIVES = [
+    "codebase", "vault", "research",
+    "fs", "shell", "web",
+    "rlm_call", "rlm_batch",
+    "say", "ask", "json", "reindex",
+]
+
+
+def _format_first_turn_banner() -> str:
+    """Return the '=== Aries body ready ===' banner text for the first exec.
+
+    Prepended verbatim to the first exec's stdout. Trailing newline so the
+    model's own print() output lands on a clean line under the banner.
+    """
+    available = [p for p in _BANNER_PRIMITIVES if p in NAMESPACE]
+    lines = [
+        "=== Aries body ready ===",
+        f"Namespace: {', '.join(available)}",
+        "State: empty — variables you define here persist across Repl calls in this session",
+        "Discovery: help(name) shows the API for any primitive; help(fs.read) works on methods too",
+        "Idiom: compose multiple operations in one call — reads, searches, summaries, edits, says — using Python control flow. One composed call is the shape that wins.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def handle_sync(msg: dict):
     """Handle synchronous (non-exec) ops. Returns response dict or None for shutdown."""
     global NAMESPACE, CODEBASE, VAULT, RESEARCH
@@ -276,7 +325,12 @@ def handle_sync(msg: dict):
         return {"pong": True, "version": "0.2.0-single-mcp"}
 
     elif op == "reset":
+        global _exec_count
         NAMESPACE = _build_namespace()
+        # Re-arm the first-turn banner so the next exec shows it again.
+        # /reset is effectively "new session" from the model's perspective;
+        # the environment reintroduces itself.
+        _exec_count = 0
         return {"ok": True}
 
     elif op == "index":
@@ -431,12 +485,33 @@ def handle_sync(msg: dict):
 
 
 def _run_exec(msg: dict) -> None:
-    """Run exec in a thread, write result to stdout when done."""
+    """Run exec in a thread, write result to stdout when done.
+
+    First-exec side effect: on the FIRST exec of each session, the namespace
+    banner is prepended to the result's stdout. The model sees the banner
+    before any output its own code produced. This is how the environment
+    self-documents (A7) after the prompt stops describing it (A9). Banner
+    stays silent on subsequent execs — the model only needs it once to
+    orient. /reset zeros _exec_count so a fresh session re-arms the banner.
+    """
+    global _exec_count
     code = msg.get("code", "")
     timeout_ms = msg.get("timeout_ms", DEFAULT_TIMEOUT_MS)
     if _rlm_module is not None:
         _rlm_module.reset_stats()
+
+    _exec_count += 1
+    is_first_exec = (_exec_count == 1)
+
     result = repl.execute(code, NAMESPACE, timeout_ms)
+
+    if is_first_exec:
+        # Prepend rather than replace — the model's own print() output
+        # still needs to land in stdout. Banner then code-stdout, separated
+        # by the banner's trailing blank line.
+        banner = _format_first_turn_banner()
+        result["stdout"] = banner + result.get("stdout", "")
+
     if _rlm_module is not None and _rlm_module.is_configured():
         stats = _rlm_module.get_stats()
         if stats["call_count"] > 0:
