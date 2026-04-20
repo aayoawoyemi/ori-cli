@@ -58,8 +58,8 @@ export const DEFAULT_CONFIG: AriesConfig = {
     maxRestarts: 3,
   },
   signature: {
-    codebase: { level: 'standard', maxTokens: 1500 },
-    vault: { level: 'standard', maxTokens: 1500 },
+    codebase: { level: 'standard', maxTokens: 600 },
+    vault: { level: 'standard', maxTokens: 600 },
     cachePrefix: true,
     includeInSubagents: false,
   },

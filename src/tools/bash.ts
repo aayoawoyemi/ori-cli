@@ -139,11 +139,19 @@ function isCommandAllowed(command: string, replEnabled: boolean): { allowed: boo
   }
 
   // Pipes and chains: validate EVERY command in the chain, not just the first.
-  // Previously only the first command was checked, letting blocked commands
-  // like "head" or "grep" sneak through via piping (e.g. "npx tsc | head -5").
+  // EXCEPT: allow trailing slicers (head -N, tail -N, wc -l) as the final pipe
+  // segment — they're output shapers, not navigation tools, and blocking them
+  // on legitimate commands like `git log | head -20` creates friction without
+  // any real safety benefit (they don't read arbitrary files or the filesystem).
   if (trimmed.includes('|')) {
     const segments = trimmed.split('|').map(s => s.trim()).filter(Boolean);
-    for (const seg of segments) {
+    const TRAILING_SLICERS = [/^head\s+-\d+$/, /^tail\s+-\d+$/, /^wc\s+-[lcw]$/];
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i]!;
+      // Trailing slicer exemption
+      if (i > 0 && i === segments.length - 1 && TRAILING_SLICERS.some(re => re.test(seg))) {
+        continue;
+      }
       const result = isCommandAllowed(seg, replEnabled);
       if (!result.allowed) return result;
     }
@@ -173,19 +181,30 @@ interface ReplRewrite {
 }
 
 function tryRewriteAsRepl(command: string, cwd: string): ReplRewrite | null {
-  const cmd = command.trim();
+  void cwd;
+  let cmd = command.trim();
 
-  // cat <path> [| head -N]
+  // Strip redundant `cd <path> && ...` prefix. The tool context already sets
+  // the working directory; the model prepending `cd C:\...` on Windows causes
+  // bash path-parsing failures (backslash escape chars). Just run the remainder.
+  const cdPrefix = cmd.match(/^cd\s+["']?([^\s"'&]+|"[^"]*")["']?\s*&&\s*(.+)$/);
+  if (cdPrefix) {
+    cmd = cdPrefix[2]!.trim();
+  }
+
+  // cat <path> | head -N
   const catHead = cmd.match(/^cat\s+["']?([^\s|"']+)["']?\s*\|\s*head\s+-(\d+)$/);
   if (catHead) {
     const [, path, n] = catHead;
     return { code: `print(fs.read(${JSON.stringify(path)}, offset=0, limit=${n}))`, label: `fs.read("${path}", limit=${n})` };
   }
+  // cat <path> | tail -N
   const catTail = cmd.match(/^cat\s+["']?([^\s|"']+)["']?\s*\|\s*tail\s+-(\d+)$/);
   if (catTail) {
     const [, path, n] = catTail;
     return { code: `content = fs.read(${JSON.stringify(path)})\nlines = content.split('\\n')\nprint('\\n'.join(lines[-${n}:]))`, label: `fs.read("${path}") tail ${n}` };
   }
+  // cat <path>
   const catSimple = cmd.match(/^cat\s+["']?([^\s"']+)["']?$/);
   if (catSimple) {
     const [, path] = catSimple;
@@ -197,6 +216,25 @@ function tryRewriteAsRepl(command: string, cwd: string): ReplRewrite | null {
   if (headFile) {
     const [, n, path] = headFile;
     return { code: `print(fs.read(${JSON.stringify(path)}, offset=0, limit=${n}))`, label: `fs.read("${path}", limit=${n})` };
+  }
+  // head <path>  (no -N flag — defaults to 10 lines like real head)
+  const headBare = cmd.match(/^head\s+["']?([^\s-"'][^\s"']*)["']?$/);
+  if (headBare) {
+    const [, path] = headBare;
+    return { code: `print(fs.read(${JSON.stringify(path)}, offset=0, limit=10))`, label: `fs.read("${path}", limit=10)` };
+  }
+
+  // tail -N <path>
+  const tailFile = cmd.match(/^tail\s+-(\d+)\s+["']?([^\s"']+)["']?$/);
+  if (tailFile) {
+    const [, n, path] = tailFile;
+    return { code: `content = fs.read(${JSON.stringify(path)})\nlines = content.split('\\n')\nprint('\\n'.join(lines[-${n}:]))`, label: `tail -${n} "${path}"` };
+  }
+  // tail <path>  (defaults to 10 lines)
+  const tailBare = cmd.match(/^tail\s+["']?([^\s-"'][^\s"']*)["']?$/);
+  if (tailBare) {
+    const [, path] = tailBare;
+    return { code: `content = fs.read(${JSON.stringify(path)})\nlines = content.split('\\n')\nprint('\\n'.join(lines[-10:]))`, label: `tail -10 "${path}"` };
   }
 
   // grep [-flags] "pattern" [path]  — no pipes to write commands
@@ -223,12 +261,25 @@ function tryRewriteAsRepl(command: string, cwd: string): ReplRewrite | null {
     return { code: `print('\\n'.join(fs.glob(${JSON.stringify(globPattern)}, ${JSON.stringify(findPath)})))`, label: `fs.glob("${globPattern}", "${findPath}")` };
   }
 
-  // ls / dir — rewrite bare commands to fs.listdir (works on any directory)
-  if (/^ls\s*$/.test(cmd)) {
+  // bare find <path>  → fs.glob('**/*', path)
+  const findBare = cmd.match(/^find\s+["']?([^\s"']+)["']?\s*$/);
+  if (findBare) {
+    const [, path] = findBare;
+    return { code: `print('\\n'.join(fs.glob('**/*', ${JSON.stringify(path)})))`, label: `fs.glob("**/*", "${path}")` };
+  }
+
+  // ls / dir — bare or with path arg or common flags
+  if (/^ls(\s+-[la]+)?\s*$/.test(cmd)) {
     return { code: `print('\\n'.join(fs.listdir('.')))`, label: 'fs.listdir(".")' };
   }
   if (/^dir\s*$/.test(cmd)) {
     return { code: `print('\\n'.join(fs.listdir('.')))`, label: 'fs.listdir(".")' };
+  }
+  // ls <path>  (with optional flags)
+  const lsPath = cmd.match(/^ls\s+(?:-[la]+\s+)?["']?([^\s"'-][^\s"']*)["']?$/);
+  if (lsPath) {
+    const [, path] = lsPath;
+    return { code: `print('\\n'.join(fs.listdir(${JSON.stringify(path)})))`, label: `fs.listdir("${path}")` };
   }
 
   // wc -l <path>
@@ -236,6 +287,12 @@ function tryRewriteAsRepl(command: string, cwd: string): ReplRewrite | null {
   if (wcLine) {
     const [, path] = wcLine;
     return { code: `content = fs.read(${JSON.stringify(path)})\nprint(len(content.split('\\n')))`, label: `line count "${path}"` };
+  }
+  // wc -c <path>  → byte count
+  const wcChar = cmd.match(/^wc\s+-c\s+["']?([^\s"']+)["']?$/);
+  if (wcChar) {
+    const [, path] = wcChar;
+    return { code: `print(len(fs.read(${JSON.stringify(path)})))`, label: `char count "${path}"` };
   }
 
   return null;
@@ -257,7 +314,7 @@ export class BashTool implements Tool {
     this.replEnabled = options?.replEnabled ?? false;
     this.getHandle = options?.getHandle;
     this.description = this.replEnabled
-      ? 'Execute shell commands for building, testing, and running code. Use for: npm, tsc, node, git, docker, make, mkdir, rm, cp, mv. NOT for reading files, searching code, or listing directories — use Repl for all of that.'
+      ? 'Run shell commands. ONLY for: build, test, git, install, file management (mkdir/rm/cp/mv), environment. NEVER for: reading files (use Repl: fs.read), searching code (use Repl: codebase.search), listing directories (use Repl: fs.listdir), or any kind of code/text inspection. If you find yourself reaching for cat/grep/find/ls/head/tail/wc, you are using the wrong tool — use Repl. Reaching for Bash on a navigation task wastes a turn.'
       : 'Execute system commands including file reading (cat, grep, find), build/test (tsc, npm, npx, node), git, file management (mkdir, rm, cp, mv), environment (env, echo), and tools (docker, ori).';
   }
 
@@ -309,7 +366,7 @@ export class BashTool implements Tool {
           return {
             id: '',
             name: this.name,
-            output: `[Routed via Repl: ${rewrite.label}]\n${output || '(no output)'}`,
+            output: `[harness routed your Bash call through Repl. The original "${command}" was rewritten as: ${rewrite.label}\nNext time call Repl directly with: ${rewrite.code}\nThis would have wasted a turn if rewrite hadn't fired.]\n\n${output || '(no output)'}`,
             isError: !!result.exception,
           };
         }

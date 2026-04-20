@@ -38,7 +38,7 @@ Return JSON: {"title": "the insight as a complete claim", "content": "explanatio
   try {
     const result = await router.cheapCall(reflectionPrompt, [
       { role: 'user', content: recentText.slice(0, 6000) },
-    ]);
+    ], { maxTokens: 2000 });
 
     const jsonMatch = result.match(/\{[\s\S]*?\}/);
     if (!jsonMatch) return;

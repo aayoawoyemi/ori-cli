@@ -26,6 +26,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import repl
+from fs import Fs
+from shell import Shell
+from web import Web
 
 # Lazy imports (heavy deps) — only loaded when ops are used
 _indexer = None
@@ -36,6 +39,25 @@ _rlm_module = None
 CODEBASE = None  # CodebaseGraph instance, exposed via REPL namespace
 VAULT = None  # Vault proxy instance, exposed via REPL namespace
 RESEARCH = None  # Research proxy instance, exposed via REPL namespace
+
+# Fs is always available (no connect step, no heavy deps), so instantiate it
+# eagerly at module import. Lives for the full process lifetime. resolve()
+# is called by the main loop when fs_response messages arrive — see the
+# routing block in main() alongside the vault_response/research_response
+# branches. Same pattern as those three proxies (vault, research, fs).
+FS = Fs()
+
+# Shell is also always available — no config needed. Same lifecycle as FS.
+# resolve() called from the shell_response branch in main(). This is the
+# codemode-era replacement for the top-level Bash tool: the model composes
+# `shell.run("npm test")` inside Python instead of reaching for a sibling tool.
+SHELL = Shell()
+
+# Web mirrors Shell/Fs — always available, no config at the Python level.
+# Provider selection (Tavily/Brave/etc) lives on the TS side and is pulled
+# from AriesConfig.webSearch at dispatch time. The model just calls
+# `web.fetch(url)` / `web.search(q)` without caring about backend config.
+WEB = Web()
 
 
 def _lazy_load_indexer():
@@ -164,44 +186,27 @@ def _build_namespace() -> dict:
         "True": True,
         "False": False,
     }
-    # Always available: fs.read() for arbitrary file access
-    import types as _types
-    import pathlib as _pathlib
+    # fs is the unified filesystem primitive — read-side runs locally, write-side
+    # routes through the bridge. Defined in body/fs.py. Replaces the inline
+    # SimpleNamespace that previously lived here (which only had read/listdir/glob
+    # and couldn't do mutations). Mutations now flow through the TS bridge, same
+    # callback pattern as vault/research.
+    #
+    # History: this used to be a SimpleNamespace constructed inline with three
+    # local helper functions (_fs_read, _fs_listdir, _fs_glob). Replaced
+    # 2026-04-19 with body/fs.py's Fs class as part of codemode Phase A1 —
+    # fs.write/fs.edit/fs.patch needed bridge callbacks so the TS side can
+    # own workspace-scope checks, permission prompts, and edit snapshots.
     import json as _json
-
-    def _fs_read(path: str, offset: int = 0, limit: int | None = None) -> str:
-        p = _pathlib.Path(path).expanduser().resolve()
-        if not p.exists():
-            raise FileNotFoundError(f"fs.read: no file at {p}")
-        if p.stat().st_size > 2_000_000:
-            raise ValueError(f"fs.read: file exceeds 2MB ({p.stat().st_size} bytes)")
-        text = p.read_text(encoding="utf-8", errors="replace")
-        lines = text.splitlines(keepends=True)
-        end = offset + limit if limit is not None else len(lines)
-        return "".join(lines[offset:end])
-
-    def _fs_listdir(path: str = ".") -> list[str]:
-        p = _pathlib.Path(path).expanduser().resolve()
-        if not p.exists():
-            raise FileNotFoundError(f"fs.listdir: no directory at {p}")
-        if not p.is_dir():
-            raise ValueError(f"fs.listdir: {p} is not a directory")
-        return sorted(entry.name + ("/" if entry.is_dir() else "") for entry in p.iterdir())
-
-    def _fs_glob(pattern: str, path: str = ".") -> list[str]:
-        p = _pathlib.Path(path).expanduser().resolve()
-        if not p.exists():
-            raise FileNotFoundError(f"fs.glob: no directory at {p}")
-        if not p.is_dir():
-            raise ValueError(f"fs.glob: {p} is not a directory")
-        results = []
-        for match in p.glob(pattern):
-            results.append(str(match.relative_to(p)))
-            if len(results) >= 200:
-                break
-        return sorted(results)
-
-    ns["fs"] = _types.SimpleNamespace(read=_fs_read, listdir=_fs_listdir, glob=_fs_glob)
+    ns["fs"] = FS
+    # shell.run inside the Repl replaces the top-level Bash tool. See
+    # body/shell.py header for the design rationale (no zigzag blocks,
+    # because the model is already in Python — there's nothing to zigzag to).
+    ns["shell"] = SHELL
+    # web.fetch / web.search replace the top-level WebFetch / WebSearch tools.
+    # Model composes search+fetch in a single Repl call instead of two
+    # sequential tool calls.
+    ns["web"] = WEB
     ns["json"] = _json
     # Always available: reindex to point the body at a different project
     ns["reindex"] = _reindex
@@ -467,6 +472,31 @@ def main():
             if RESEARCH is not None:
                 rr = msg["research_response"]
                 RESEARCH.resolve(rr["id"], rr["result"])
+            continue
+
+        # Route fs responses — same deadlock rule as vault/research. The exec
+        # thread is blocked in Fs._call() waiting on a threading.Event; main
+        # loop stays responsive so it can fire the event via FS.resolve().
+        # FS is module-global (not None-checkable like VAULT/RESEARCH) because
+        # it's always instantiated — keep the branch structure identical for
+        # consistency in case we ever gate it.
+        if "fs_response" in msg:
+            fr = msg["fs_response"]
+            FS.resolve(fr["id"], fr["result"])
+            continue
+
+        # Route shell responses — identical shape to fs_response. Exec thread
+        # blocks in Shell._call() waiting for the event, main loop routes the
+        # response. Shell is module-global (same lifecycle as FS).
+        if "shell_response" in msg:
+            sr = msg["shell_response"]
+            SHELL.resolve(sr["id"], sr["result"])
+            continue
+
+        # Route web responses — same pattern. Web is module-global.
+        if "web_response" in msg:
+            wr = msg["web_response"]
+            WEB.resolve(wr["id"], wr["result"])
             continue
 
         # Unblock a timed-out or aborted research call

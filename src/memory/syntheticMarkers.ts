@@ -39,13 +39,19 @@ export function stripSynthetic(text: string, kind?: string): string {
 
 /**
  * Strip all synthetic blocks from every user message's content (in place).
- * Idempotent: safe to call multiple times. O(N) over messages.
+ * Idempotent: safe to call multiple times.
+ *
+ * Optimization 2026-04-19: cheap sentinel check before regex. Most messages
+ * have no markers (especially after the no-injection refactor) — skip the
+ * regex pass entirely when the marker substring is absent.
  */
+const SYNTH_SENTINEL = '<!--ORI_SYNTH-';
 export function stripSyntheticFromMessages(messages: Message[]): void {
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
     if (m.role !== 'user') continue;
     if (typeof m.content !== 'string') continue;
+    if (!m.content.includes(SYNTH_SENTINEL)) continue;
     const cleaned = stripSynthetic(m.content);
     if (cleaned !== m.content) {
       messages[i] = { ...m, content: cleaned };

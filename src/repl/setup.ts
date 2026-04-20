@@ -7,7 +7,7 @@
 import { ReplBridge } from './bridge.js';
 import { TrajectoryLogger, defaultTrajectoryPath } from './trajectory.js';
 import { join } from 'node:path';
-import type { ReplConfig } from '../config/types.js';
+import type { ReplConfig, WebSearchConfig } from '../config/types.js';
 import type { CodeExecution, ReplResult, ReplEvent } from './types.js';
 import type { OriVault } from '../memory/vault.js';
 import type { ModelRouter } from '../router/index.js';
@@ -43,6 +43,12 @@ export interface SetupOptions {
   router?: ModelRouter | null;
   /** Whether to auto-connect the research proxy at startup. Defaults true. */
   connectResearch?: boolean;
+  /**
+   * Web search provider config — used by web.search callbacks inside Repl.
+   * When omitted, WebSearchTool falls back to env vars (TAVILY_API_KEY etc)
+   * then DDG. Pass the AriesConfig.webSearch block through from app.tsx.
+   */
+  webSearchConfig?: WebSearchConfig;
 }
 
 /**
@@ -116,6 +122,20 @@ export async function setupReplBridge(
   });
 
   await bridge.start();
+
+  // Give the bridge the workspace root. fs.write/fs.edit/fs.patch callbacks
+  // from the Python body scope all mutations to paths inside this directory;
+  // without this, the bridge falls back to process.cwd() which is often wrong
+  // when Aries is launched from outside the user's project. See ORI.md's
+  // "callback pattern" rule — we explicitly set everything the bridge needs.
+  bridge.setCwd(opts.cwd);
+
+  // Pass web-search provider config through so web.search (inside Repl)
+  // uses the user's configured backend (Tavily/Brave/Serper/SerpAPI). If
+  // unset, WebSearchTool still works via env-var resolution + DDG fallback.
+  if (opts.webSearchConfig) {
+    bridge.setWebSearchConfig(opts.webSearchConfig);
+  }
 
   // Give bridge the vault reference for proxy callbacks
   if (opts.vault) {

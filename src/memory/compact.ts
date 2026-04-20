@@ -40,7 +40,19 @@ export interface CompactResult {
  *
  * Adopted from OpenCode/KiloCode two-phase compaction pattern.
  */
-function pruneToolOutputs(messages: Message[]): number {
+/**
+ * Exported 2026-04-19 so the live turn loop can call it as a microcompact
+ * pass, not only during full runCompaction. Walks backwards, protects the
+ * most recent PRUNE_PROTECT_TOKENS of tool output, replaces older tool
+ * result bodies with '[output pruned]' in place. Returns tokens freed.
+ *
+ * STOPGAP: this is CC's microcompact pattern applied shallowly (truncate
+ * body, keep call skeleton). The final form is kernel-level handle-based
+ * rehydration — tool result body becomes a handle the model can refetch
+ * via rlm_call on demand. This stopgap ships today; replace when kernel
+ * work starts.
+ */
+export function pruneToolOutputs(messages: Message[]): number {
   let protectedTokens = 0;
   let freedTokens = 0;
 
@@ -98,7 +110,7 @@ Return ONLY a JSON array: [{"title": "prose claim", "content": "brief explanatio
   try {
     const result = await router.cheapCall(extractionPrompt, [
       { role: 'user', content: conversationText.slice(0, 8000) },
-    ]);
+    ], { maxTokens: 2500 });
 
     const jsonMatch = result.match(/\[[\s\S]*?\]/);
     if (!jsonMatch) return [];
@@ -176,7 +188,7 @@ this conversation will have NO context besides this summary and preflight memori
   try {
     return await router.cheapCall(summaryPrompt, [
       { role: 'user', content: conversationText.slice(0, 12000) },
-    ]);
+    ], { maxTokens: 3000 });
   } catch {
     // Fallback: crude summary
     const lastUser = messages.filter(m => m.role === 'user').pop();

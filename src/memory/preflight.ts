@@ -62,13 +62,12 @@ export async function runPreflight(
   const rawQuery = getMessageText(lastUser);
   if (!rawQuery || rawQuery.length < 5) return null;
 
-  // ── Identity-conditioned query ─────────────────────────────────────
-  // Conway's Self-Memory System: identity conditions which memories activate.
-  // Prefix the query with identity context so Q-values learn what matters
-  // to THIS agent, not generic relevance.
-  const query = identityContext
-    ? `[${identityContext.slice(0, 150)}] ${rawQuery}`
-    : rawQuery;
+  // ── Query ──────────────────────────────────────────────────────────
+  // Identity prefix removed 2026-04-19: it corrupted the semantic embedding
+  // by biasing every query toward "Aries"-named notes regardless of the
+  // actual topic. Identity still gets routed through a separate warmthContext
+  // channel below for the warmth-signal path.
+  const query = rawQuery;
 
   const recentMessages = messages
     .slice(-6)

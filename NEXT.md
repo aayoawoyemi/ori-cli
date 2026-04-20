@@ -85,3 +85,61 @@ preflight retrieves them. Active memory means:
 - Could build a micro-WASM runtime that intercepts deterministic patterns before they hit the model
 - Philosophy to steal NOW even without the tech: deterministic operations should be computed, not generated
 - Related: body/server.py REPL already has the sandbox; could add a fast-path eval for simple expressions
+
+---
+
+## Issues — Must Fix
+
+### Response Cutoff Bug
+Agent gets cut off mid-response. Needs investigation — could be token limit, streaming issue, or context window management. Reproduce and fix.
+
+### Permission Modes — Edit Approval System
+Agent currently writes files without asking. Need a tiered permission system with interactive approval UX.
+
+**Four modes:**
+1. **Lockdown** — Agent cannot write/edit anything without explicit approval per file
+2. **Normal** — Agent presents plan, user approves batch (default)
+3. **Accept All Edits** — Agent writes freely, user sees a summary after
+4. **YOLO** — Full autonomy, agent asks when it sees fit
+
+**Approval UX (for Lockdown and Normal modes):**
+When the agent wants to write/edit, a popup box appears in the terminal:
+
+```
+┌─ Aries wants to: Write src/vault/reader.ts (new file, ~120 lines) ─┐
+│                                                                      │
+│  [1] Yes    [2] No    [3] Edit plan    [4] Skip this file           │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+- **1** = approve, proceed
+- **2** = reject, agent adjusts
+- **3** = user gives alternative instruction
+- **4** = skip this specific file, continue with rest
+
+Mode is set at session start or toggled mid-session via `/permissions` command. Persists in config.
+
+**Implementation notes:**
+- Gate lives in the tool execution layer (before Write/Edit/Bash execute)
+- Bash commands that modify files (mkdir, rm, mv, cp) also go through the gate
+- Read-only tools (Repl codebase.*, fs.read, vault.query) are NEVER gated
+- In YOLO mode, the gate is a no-op passthrough
+
+### Terminal-Native Visualization
+Need architecture diagrams and progress visualizations rendered directly in Windows Terminal. Not browser, not VS Code preview. Must work offline.
+
+**Tool:** `beautiful-mermaid` (npm) — TypeScript native, synchronous, renders Mermaid syntax to Unicode box-drawing art. Already tested and working in jubilee-agent. `renderMermaidASCII(code) → string`.
+
+**The harness problem:** Bash tool output gets collapsed to "N lines" in the Ink UI. Diagrams render fine but the user can't see them without expanding. Need either:
+1. **Rich output detection** — if Bash output contains box-drawing characters (─│┌┐└┘├┤┬┴┼►▼◇), render it expanded/inline instead of collapsed
+2. **Explicit `--rich` flag** — agent marks certain Bash calls as "render this output fully" and the harness respects it
+3. **Diagram tool** — dedicated tool (not Bash) that renders Mermaid ASCII and always displays expanded. Like how Read tool output isn't collapsed.
+
+Option 3 is cleanest — a `Diagram` tool that takes Mermaid code, runs `renderMermaidASCII()`, and returns the result through a rendering path that doesn't collapse. The agent calls `Diagram` instead of `Bash` and the output shows inline in the conversation.
+
+**Requirements:**
+- Box-drawing Unicode characters for flowcharts and architecture diagrams
+- Progress tracking (phase completion, what's built vs pending)
+- Architecture views (how components connect)
+- Editable — user can see the plan visually and request changes
+- Works in Windows Terminal (confirmed: WT renders Unicode box-drawing perfectly)

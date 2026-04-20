@@ -8,16 +8,21 @@ import type { ProjectBrain } from './memory/projectBrain.js';
 import type { SessionStorage } from './session/storage.js';
 import type { HooksConfig } from './config/types.js';
 import { executeTools, resetDoomLoop } from './tools/execution.js';
-import { PhaseTracker, getToolsForPhase, type TaskPhase } from './tools/toolSets.js';
+// Phase tracker dropped 2026-04-19. Its widen-path was dead code (model cannot
+// call a tool it cannot see, so the lean phase was a one-way trap). Full tool
+// set exposed every turn now. Following Claude Code's pattern.
+// toolSets.ts kept intact as dead code — delete in a later sweep.
 import { buildAssistantMessage, buildToolResultMessage, getMessageText, healOrphanedToolUses } from './utils/messages.js';
 import { estimateTokens } from './utils/tokens.js';
-import { runPreflight, type PreflightContext } from './memory/preflight.js';
-// current-state injection removed — model calls ori_orient directly
-import { stripSyntheticFromMessages, injectTurnSynthetics } from './memory/syntheticMarkers.js';
+// Per-turn preflight injection killed 2026-04-19 (no-injection architecture).
+// Model pulls memory on-demand via vault.* in the Repl. Preflight functions
+// live on in src/memory/preflight.ts for repurpose as session-start soft-map.
+import { stripSyntheticFromMessages, wrapSynthetic } from './memory/syntheticMarkers.js';
 import { runPostflight } from './memory/postflight.js';
-import { runCompaction } from './memory/compact.js';
-import { tickTurn, needsRefresh, assembleWarmContext } from './memory/warmContext.js';
-import { detectEchoFizzle, sendEchoSignals } from './memory/echoFizzle.js';
+import { runCompaction, pruneToolOutputs } from './memory/compact.js';
+// tickTurn / assembleWarmContext per-turn refresh removed alongside preflight kill.
+// Warm context still assembled at session start; no per-turn vault round-trip.
+// Echo/fizzle vault writes removed entirely (no auto-writes to main vault).
 import { applyNudges, resetNudgeCounters } from './tools/nudge.js';
 import { getPlanModeSparseReminder } from './tools/planInstructions.js';
 
@@ -77,9 +82,10 @@ export interface LoopParams {
    */
   onFileMutated?: (paths: string[]) => Promise<void>;
   /**
-   * Enable dynamic tool exposure — only expose tools relevant to the current
-   * task phase (explore/edit/verify). Reduces tool schema tokens by 70-80%.
-   * Default: false (expose all tools every turn, backwards-compatible).
+   * DEPRECATED 2026-04-19: phase tracker removed (dead code — widen path never
+   * fired because the model cannot call a tool it cannot see in its schema).
+   * Flag kept for backwards compatibility with existing callers; ignored at
+   * runtime. Full tool set is exposed every turn.
    */
   dynamicTools?: boolean;
   /** Ref to the plan file path (set when EnterPlanMode runs). Using a ref so loop reads live value. */
@@ -94,27 +100,46 @@ export interface LoopParams {
 // Cap large outputs at maxChars using head + tail (like Claude Code's 5K+5K).
 // This prevents tool results from accumulating unbounded in conversation history.
 
+const PER_MESSAGE_AGGREGATE_CHARS = 25_000; // ~6250 tokens — cap for all tool_results in one message combined
+
 function applyResultBudget(messages: Message[], maxChars: number): Message[] {
   const half = Math.floor(maxChars / 2);
 
-  function capString(s: string): string {
-    if (s.length <= maxChars) return s;
-    const omitted = s.length - maxChars;
-    return `${s.slice(0, half)}\n\n... [${omitted} chars omitted] ...\n\n${s.slice(-half)}`;
+  function capString(s: string, cap: number): string {
+    if (s.length <= cap) return s;
+    const h = Math.floor(cap / 2);
+    const omitted = s.length - cap;
+    return `${s.slice(0, h)}\n\n... [${omitted} chars omitted] ...\n\n${s.slice(-h)}`;
   }
 
   return messages.map(msg => {
     if (typeof msg.content === 'string') {
-      return msg.content.length > maxChars ? { ...msg, content: capString(msg.content) } : msg;
+      return msg.content.length > maxChars ? { ...msg, content: capString(msg.content, maxChars) } : msg;
     }
     const blocks = msg.content as ContentBlock[];
+
+    // Per-message aggregate cap on tool_results. Five parallel greps each
+    // returning 10k chars would otherwise drop 50k chars of exhaust into one
+    // turn. When aggregate exceeds the cap, compute a per-block budget by
+    // proportional shrinkage (with a floor so tiny results aren't harmed).
+    const toolResults = blocks.filter((b): b is Extract<ContentBlock, { type: 'tool_result' }> => b.type === 'tool_result');
+    const totalToolChars = toolResults.reduce((sum, b) => sum + b.content.length, 0);
+
+    let perBlockBudget = maxChars;
+    if (totalToolChars > PER_MESSAGE_AGGREGATE_CHARS && toolResults.length > 1) {
+      const ratio = PER_MESSAGE_AGGREGATE_CHARS / totalToolChars;
+      perBlockBudget = Math.max(2000, Math.floor(maxChars * ratio));
+    }
+
     const newBlocks = blocks.map(block => {
-      if (block.type === 'tool_result' && block.content.length > maxChars) {
-        return { ...block, content: capString(block.content) };
+      if (block.type === 'tool_result' && block.content.length > perBlockBudget) {
+        return { ...block, content: capString(block.content, perBlockBudget) };
       }
       return block;
     });
     const changed = newBlocks.some((b, i) => b !== blocks[i]);
+    // quieten unused-var for the preserved half constant from before the rewrite
+    void half;
     return changed ? { ...msg, content: newBlocks } : msg;
   });
 }
@@ -142,7 +167,6 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     maxSubagents = 5,
     preflightEnabled = true,
     onFileMutated,
-    dynamicTools = false,
     planFilePathRef,
     permissionModeRef,
     taskMode = 'normal',
@@ -150,12 +174,15 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
 
   const allTools: ToolDefinition[] = registry.definitions();
   const replEnabled = allTools.some(t => t.name === 'Repl');
-  const phaseTracker = dynamicTools ? new PhaseTracker('lean') : null;
   const contextLimit = router.current.contextWindow;
   const compactTokenThreshold = Math.floor(contextLimit * compactThreshold);
   let turnCount = 0;
   let importanceAccumulator = 0;
-  let lastPreflight: PreflightContext | null = null;
+  // Recovery loop tracker — increments on all-failed turns, resets on success.
+  // Drives a system-reminder that forces diagnosis before retry, and at 2+
+  // nudges a vault.explore(error_text) to check if we've hit this before
+  // (memory-first recovery — not in CC/oh-my-pi's version).
+  let consecutiveFailureTurns = 0;
 
   // Reset doom loop tracking on new user input
   resetDoomLoop();
@@ -184,35 +211,24 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     // Reset per-turn nudge counters (sequential read tracking, etc.)
     resetNudgeCounters();
 
-    // ── PREFLIGHT: Re-enabled 2026-04-17. 5-note limit, ~150 tokens/turn.
-    // Agent cannot retrieve what it doesn't know to look for —
-    // preflight bridges user intent to vault knowledge.
-    if (preflightEnabled && vault?.connected) {
-      lastPreflight = await runPreflight(messages, projectBrain, vault, identityContext);
-      if (lastPreflight) {
-        session?.log({ type: 'preflight', projectNotes: lastPreflight.projectNotes.map(n => n.title), vaultNotes: lastPreflight.vaultNotes.map(n => n.title), timestamp: Date.now() });
-        yield { type: 'preflight', projectCount: lastPreflight.projectNotes.length, vaultCount: lastPreflight.vaultNotes.length };
-      }
+    // ── No-injection architecture (2026-04-19) ─────────────────────────
+    // Per-turn preflight, proprioception, and warm-context refresh all removed.
+    // The model pulls memory on-demand via vault.* in the Repl. The status bar
+    // shows context utilization to the user; the model doesn't need to be told.
+    // Auto-compaction (full summarize-and-replace) stays disabled — never
+    // compact mid-task. Microcompact below is a lighter pass that prunes old
+    // tool_result bodies only, never touches conversation.
+
+    // ── MICROCOMPACT (stopgap) ─────────────────────────────────────────
+    // When cumulative history crosses a threshold, prune old tool_result
+    // bodies to '[output pruned]' (keeping the call skeleton intact so the
+    // model knows what tools were used). Protects the most recent 40k tokens
+    // of tool output. Non-LLM, pure bookkeeping. STOPGAP — the final form is
+    // kernel-level handle-based rehydration (see RUNNING.md deferred work).
+    const preCompactTokens = estimateTokens(messages);
+    if (preCompactTokens > 100_000) {
+      pruneToolOutputs(messages);
     }
-
-    // ── CONTEXT PROPRIOCEPTION ─────────────────────────────────────
-    const tokenEst = estimateTokens(messages);
-    const utilizationPct = Math.round((tokenEst / contextLimit) * 100);
-
-    const proprioceptionBlock = [
-      `<context-status>`,
-      `Context: ${utilizationPct}% (${tokenEst}/${contextLimit} tokens estimated)`,
-      `</context-status>`,
-    ].join('\n');
-
-    // ── INJECTION: preflight + proprioception ─────────────────────
-    injectTurnSynthetics(messages, {
-      preflightBefore: lastPreflight?.beforeUserBlock,
-      preflightAfter: lastPreflight?.afterUserBlock,
-      proprio: proprioceptionBlock,
-    });
-
-    // Auto-compaction disabled — never compact mid-task.
 
     // ── RESULT BUDGET ────────────────────────────────────────────────
     const budgetedMessages = applyResultBudget(messages, maxResultChars);
@@ -246,13 +262,15 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
         'VaultSearch', 'VaultRead', 'VaultExplore', 'VaultWarmth', 'ProjectSearch',
       ]);
       activeTools = allTools.filter(t => RESEARCH_ALLOWED.has(t.name));
-    } else if (phaseTracker) {
-      activeTools = getToolsForPhase(registry, phaseTracker.phase, replEnabled);
     } else {
       activeTools = allTools;
     }
 
     // ── Research mode reminder ────────────────────────────────────────
+    // Wrapped in a synthetic marker so the NEXT turn's stripSynthetic removes
+    // it cleanly. Previously used `content.includes('RESEARCH mode')` dedup,
+    // which prevented double-injection but also meant the reminder stayed
+    // baked into the message forever — leaking across mode transitions.
     if (permissionMode === 'research') {
       let lastUserIdx = -1;
       for (let i = budgetedMessages.length - 1; i >= 0; i--) {
@@ -260,12 +278,11 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       }
       if (lastUserIdx >= 0 && typeof budgetedMessages[lastUserIdx]!.content === 'string') {
         const content = budgetedMessages[lastUserIdx]!.content as string;
-        if (!content.includes('RESEARCH mode')) {
-          budgetedMessages[lastUserIdx] = {
-            ...budgetedMessages[lastUserIdx]!,
-            content: `<system-reminder>You are in RESEARCH mode. WebSearch, WebFetch, Write, Edit, Bash, and Agent are NOT available — they have been structurally removed from your tool schema. Research happens through the \`research\` namespace in the Repl tool:\n\n- \`research.discover(query, limit=25)\` → multi-API search (arxiv, semantic scholar, openalex, github, exa, reddit, wikipedia)\n- \`research.ingest(sources[:8])\` → deep-fetch content, returns handles\n- \`research.fetch(url, focus="...")\` → targeted drill-down on a specific URL (replaces WebFetch)\n- \`research.extract(handle, focus="...")\` → pull findings from one source\n- \`research.synthesize(findings, query)\` → cross-source analysis\n- \`research.save(session)\` → persist with a slug (REQUIRED to exit research mode)\n- \`research.list_sessions()\` / \`research.session(slug)\` → prior sessions\n\nThe pipeline is curated and recursive: discover → ingest → extract → reflect → synthesize. Let it run. Steer with focus questions. Pick 5-10 promising sources, not all 25. Show your work — the user can interject. You MUST call \`research.save()\` before ending the turn; that produces the durable artifact and exits research mode.</system-reminder>\n\n${content}`,
-          };
-        }
+        const reminder = `<system-reminder>RESEARCH mode. Repl-only via \`research.*\`: discover, ingest, fetch, extract, synthesize, save. Pipeline: discover → ingest → extract → synthesize → save. Pick 5-10 sources from each discover, not all. \`research.save(slug)\` is REQUIRED to exit.</system-reminder>`;
+        budgetedMessages[lastUserIdx] = {
+          ...budgetedMessages[lastUserIdx]!,
+          content: `${wrapSynthetic('research-mode', reminder)}\n\n${content}`,
+        };
       }
     }
 
@@ -277,12 +294,11 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       }
       if (lastUserIdx >= 0 && typeof budgetedMessages[lastUserIdx]!.content === 'string') {
         const content = budgetedMessages[lastUserIdx]!.content as string;
-        if (!content.includes('EXPLORE mode')) {
-          budgetedMessages[lastUserIdx] = {
-            ...budgetedMessages[lastUserIdx]!,
-            content: `<system-reminder>You are in EXPLORE mode. You can only use Repl, VaultAdd, and ProjectSave. No file modifications, no shell commands. If the user asks you to make changes, tell them to switch to Normal mode (Alt+Z).</system-reminder>\n\n${content}`,
-          };
-        }
+        const reminder = `<system-reminder>EXPLORE mode. Repl, VaultAdd, ProjectSave only. No file mods, no shell. For changes: Alt+Z to exit.</system-reminder>`;
+        budgetedMessages[lastUserIdx] = {
+          ...budgetedMessages[lastUserIdx]!,
+          content: `${wrapSynthetic('explore-mode', reminder)}\n\n${content}`,
+        };
       }
     }
 
@@ -302,12 +318,32 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       }
       if (lastUserIdx >= 0 && typeof budgetedMessages[lastUserIdx]!.content === 'string') {
         const content = budgetedMessages[lastUserIdx]!.content as string;
-        if (!content.includes('Plan mode')) {
-          budgetedMessages[lastUserIdx] = {
-            ...budgetedMessages[lastUserIdx]!,
-            content: `<system-reminder>${getPlanModeSparseReminder(planFilePath)}</system-reminder>\n\n${content}`,
-          };
-        }
+        const reminder = `<system-reminder>${getPlanModeSparseReminder(planFilePath)}</system-reminder>`;
+        budgetedMessages[lastUserIdx] = {
+          ...budgetedMessages[lastUserIdx]!,
+          content: `${wrapSynthetic('plan-mode', reminder)}\n\n${content}`,
+        };
+      }
+    }
+
+    // ── Recovery reminder (failure classifier) ────────────────────────
+    // If the previous turn produced only tool failures, inject a nudge forcing
+    // diagnosis before retry. At 2+ consecutive failed turns, add a memory-first
+    // directive: call vault.explore on the error text before trying again.
+    if (consecutiveFailureTurns > 0) {
+      let lastUserIdx = -1;
+      for (let i = budgetedMessages.length - 1; i >= 0; i--) {
+        if (budgetedMessages[i]!.role === 'user') { lastUserIdx = i; break; }
+      }
+      if (lastUserIdx >= 0 && typeof budgetedMessages[lastUserIdx]!.content === 'string') {
+        const content = budgetedMessages[lastUserIdx]!.content as string;
+        const reminder = consecutiveFailureTurns >= 2
+          ? `<system-reminder>Recovery: ${consecutiveFailureTurns} consecutive failed-tool turns. Before retrying, (1) call \`vault.explore("<short description of the error>")\` to check if we've hit this pattern before, and (2) state your hypothesis about WHY in one sentence. Do NOT repeat the same tool call — something about the approach is wrong.</system-reminder>`
+          : `<system-reminder>Recovery: last tool call failed. State your hypothesis about why in one sentence before retrying. Don't repeat the same call verbatim.</system-reminder>`;
+        budgetedMessages[lastUserIdx] = {
+          ...budgetedMessages[lastUserIdx]!,
+          content: `${wrapSynthetic('recovery', reminder)}\n\n${content}`,
+        };
       }
     }
 
@@ -473,6 +509,17 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
         }
       }
 
+      // Update recovery tracker: all-failed turn increments, any-success resets.
+      if (executedResults.length > 0) {
+        const anySuccess = executedResults.some(r => !r.isError);
+        const anyFailure = executedResults.some(r => r.isError);
+        if (anyFailure && !anySuccess) {
+          consecutiveFailureTurns++;
+        } else if (anySuccess) {
+          consecutiveFailureTurns = 0;
+        }
+      }
+
       // Apply contextual REPL nudges to tool results
       applyNudges(executedResults, replEnabled);
 
@@ -503,10 +550,6 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
             isError: result.isError,
             timestamp: Date.now(),
           });
-          // Phase tracker: transition on tool calls
-          if (phaseTracker) {
-            phaseTracker.onToolCall(result.name, replEnabled);
-          }
         }
       }
 
@@ -571,34 +614,25 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     messages.push({ role: 'assistant', content: assistantText });
     session?.log({ type: 'assistant', content: assistantText, timestamp: Date.now() });
 
-    // ── ECHO/FIZZLE: re-enabled with preflight (2026-04-17) ────────
-    if (lastPreflight) {
-      const ef = detectEchoFizzle(assistantText, lastPreflight);
-      if (ef.echoed.length > 0 || ef.fizzled.length > 0) {
-        yield { type: 'echo_fizzle', echoed: ef.echoed, fizzled: ef.fizzled };
-        await sendEchoSignals(ef, vault);
-      }
-    }
-
-    // ── POSTFLIGHT ───────────────────────────────────────────────────
-    importanceAccumulator = await runPostflight(
-      messages, null, projectBrain, vault, importanceAccumulator, router,
-    );
-
-    // ── WARM CONTEXT TICK ────────────────────────────────────────────
-    // Track turns for periodic warm context refresh.
-    // When refresh is due, re-query vault for latest reflection + warm notes.
-    tickTurn();
-    if (needsRefresh() && vault?.connected) {
-      assembleWarmContext(vault, null).catch(() => {});
-    }
-
-    session?.log({
-      type: 'postflight',
-      importance: importanceAccumulator,
-      reflected: false,
-      timestamp: Date.now(),
+    // ── POSTFLIGHT (gated on work-worthy turns only) ─────────────────
+    // Previously ran a silent cheapCall every clean turn including chat.
+    // Now only runs when this turn produced or consumed tool output, which
+    // is the only signal that durable knowledge might exist to extract.
+    const turnHadToolWork = messages.slice(-3).some(m => {
+      if (typeof m.content === 'string') return false;
+      return (m.content as ContentBlock[]).some(b => b.type === 'tool_use' || b.type === 'tool_result');
     });
+    if (turnHadToolWork) {
+      importanceAccumulator = await runPostflight(
+        messages, null, projectBrain, vault, importanceAccumulator, router,
+      );
+      session?.log({
+        type: 'postflight',
+        importance: importanceAccumulator,
+        reflected: false,
+        timestamp: Date.now(),
+      });
+    }
 
     const finalTokens = estimateTokens(messages);
     yield { type: 'turn_complete', turn: turnCount, tokenEstimate: finalTokens };

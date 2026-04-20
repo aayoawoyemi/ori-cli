@@ -40,9 +40,17 @@ export class ToolRegistry {
     return this.tools.get(name);
   }
 
-  /** Get all tool definitions to send to the model. */
+  /** Get all tool definitions to send to the model.
+   *
+   * Repl is sorted first so it sits at the top of the model's tool schema.
+   * Anthropic models have measurable primacy bias — putting the preferred
+   * action verb first shifts routing toward Repl over Bash for navigation.
+   */
   definitions(): ToolDefinition[] {
-    return Array.from(this.tools.values()).map(t => t.definition());
+    const all = Array.from(this.tools.values()).map(t => t.definition());
+    const repl = all.filter(t => t.name === 'Repl');
+    const rest = all.filter(t => t.name !== 'Repl');
+    return [...repl, ...rest];
   }
 
   /** Get all registered tools. */

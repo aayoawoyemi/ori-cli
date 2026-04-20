@@ -7,9 +7,16 @@
  *   const result = await bridge.exec({ code: "print('hello')" });
  *   await bridge.shutdown();
  */
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { ReplProcess } from './process.js';
+import { fuzzyFind, generateDiff } from '../tools/edit.js';
+import { captureSnapshot } from '../tools/snapshot.js';
+import { WebFetchTool } from '../tools/webFetch.js';
+import { WebSearchTool } from '../tools/webSearch.js';
+import type { WebSearchConfig } from '../config/types.js';
 import type {
   CodeExecution,
   ReplResult,
@@ -49,6 +56,67 @@ const DEFAULT_PYTHON = process.platform === 'win32' ? 'python' : 'python3';
 
 type PendingResolver = (result: any) => void;
 
+// ── Web search output parser ─────────────────────────────────────────────────
+// WebSearchTool produces a flat string (one block per result, separated by
+// blank lines) because it targets the tool-schema contract where ToolResult.
+// output is a single string. Inside codemode, web.search's Python contract
+// is list[dict] — structured data the model can iterate over. We parse back
+// here instead of forking the tool.
+//
+// Block shape produced by every backend (tavily/brave/serper/serpapi/ddg):
+//   Answer: <text>              ← optional, only when backend has an answer box
+//                                  (blank line after)
+//   <title>
+//   <url>
+//   <snippet may span multiple lines>
+//                                  (blank line before next block)
+
+interface WebSearchResult {
+  title: string;
+  url: string;
+  snippet: string;
+  answer?: string;  // only on the first result when the backend surfaced one
+}
+
+function parseWebSearchOutput(output: string, maxResults: number): WebSearchResult[] {
+  const results: WebSearchResult[] = [];
+  let answer: string | undefined;
+
+  // Extract the answer line if present (it always leads the output).
+  let body = output;
+  const answerMatch = body.match(/^Answer:\s*(.+?)\n\n/s);
+  if (answerMatch) {
+    answer = answerMatch[1]!.trim();
+    body = body.slice(answerMatch[0].length);
+  }
+
+  // Each block: 3+ lines separated by blank line(s). First line = title,
+  // second = url, rest = snippet (may span multiple lines).
+  const blocks = body.split(/\n\s*\n/).filter(b => b.trim());
+  for (const block of blocks) {
+    if (results.length >= maxResults) break;
+    const lines = block.split('\n').map(l => l.trim()).filter(Boolean);
+    if (lines.length < 2) continue;  // need at least title + url
+    const title = lines[0]!;
+    const url = lines[1]!;
+    const snippet = lines.slice(2).join(' ');
+    results.push({ title, url, snippet });
+  }
+
+  // Attach the answer to the first result so the model sees them together.
+  // A dedicated `answer` top-level key would be cleaner, but the docstring
+  // in body/web.py already says "first dict may have answer" — keep that
+  // contract for now.
+  if (answer && results.length > 0) {
+    results[0]!.answer = answer;
+  } else if (answer && results.length === 0) {
+    // Pure answer-box case — no organic results. Surface as a synthetic entry.
+    results.push({ title: '(answer)', url: '', snippet: answer, answer });
+  }
+
+  return results;
+}
+
 export class ReplBridge {
   private process: ReplProcess | null = null;
   private pending: PendingResolver[] = [];
@@ -57,6 +125,17 @@ export class ReplBridge {
   private vault: OriVault | null = null;
   private router: ModelRouter | null = null;
   private researchOutputDir: string | null = null;
+  // Workspace root used by fs.* callbacks to scope writes. Defaults to the
+  // process cwd but setup.ts should always override via setCwd(opts.cwd) —
+  // the Aries harness may be invoked from a directory other than the user's
+  // actual workspace, and fs.write's boundary check has to match the project
+  // the user thinks they're in. Never trust the default in production.
+  private cwd: string = process.cwd();
+  // Web search provider config. Passed in via setWebSearchConfig from setup.ts
+  // when AriesConfig.webSearch is set. When unset, WebSearchTool still works
+  // via env vars (TAVILY_API_KEY etc) or falls back to DDG. Holding it here
+  // so web.search callbacks construct WebSearchTool with the right provider.
+  private webSearchConfig: WebSearchConfig = {};
   // Server-side handle store: ingest() returns opaque handles; full sources live here
   private researchHandles: Map<string, IngestedSource> = new Map();
   // Callback fired when research.save() completes — used by app.tsx to exit research mode.
@@ -114,6 +193,29 @@ export class ReplBridge {
           if (msg.research_request) {
             this.handleResearchCallback(msg.research_request);
             return; // Don't resolve pending — exec is still running
+          }
+
+          // Fs callback: Python fs proxy needs TS to perform a workspace-scoped
+          // write/edit/patch. Same non-resolving pattern as vault/research —
+          // the exec thread is blocked in Fs._call() waiting for fs_response.
+          if (msg.fs_request) {
+            this.handleFsCallback(msg.fs_request);
+            return;
+          }
+
+          // Shell callback: Python shell proxy needs TS to run a command.
+          // Same non-resolving pattern — exec thread blocks in Shell._call()
+          // for the duration of the shell command (up to its timeout + 10s).
+          if (msg.shell_request) {
+            this.handleShellCallback(msg.shell_request);
+            return;
+          }
+
+          // Web callback: web.fetch / web.search delegate to the existing
+          // WebFetchTool / WebSearchTool. Same non-resolving pattern.
+          if (msg.web_request) {
+            this.handleWebCallback(msg.web_request);
+            return;
           }
 
           // Normal response — resolve pending request
@@ -435,6 +537,25 @@ export class ReplBridge {
   }
 
   /**
+   * Set the workspace root used by fs.* callbacks to bound writes. Must be
+   * the directory the user considers "the project" — setup.ts passes
+   * opts.cwd here. Until this is called, the bridge uses process.cwd()
+   * which is often wrong when Aries is launched from elsewhere.
+   */
+  setCwd(cwd: string): void {
+    this.cwd = cwd;
+  }
+
+  /**
+   * Set the web-search provider config so web.search callbacks know which
+   * backend (Tavily/Brave/Serper/SerpAPI) to use. Without this, WebSearchTool
+   * falls back to env-var resolution then DDG — still functional, just worse.
+   */
+  setWebSearchConfig(cfg: WebSearchConfig): void {
+    this.webSearchConfig = cfg;
+  }
+
+  /**
    * Register a callback that fires after research.save() persists an artifact.
    * Used by the UI to auto-exit research mode back to the pre-research permission mode.
    */
@@ -703,6 +824,442 @@ export class ReplBridge {
 
       default:
         throw new Error(`unknown research method: ${method}`);
+    }
+  }
+
+  // ── Fs callback handler ──────────────────────────────────────────────────
+  // Handles fs_request messages from body/fs.py. Each handler method writes
+  // fs_response back to Python stdin exactly once, whether the call succeeded
+  // or failed. If we forget to write a response, the Python proxy blocks on
+  // threading.Event forever and the entire exec hangs. That's why every path
+  // through handleFsCallback ends in this.process?.write({fs_response}).
+
+  /**
+   * Route fs_request from Python to the appropriate TS-side operation.
+   * Catches any thrown error and surfaces it as `{error: string}` in the
+   * response — Python's Fs._call lifts that into an FsError exception the
+   * model code can catch with try/except.
+   */
+  private async handleFsCallback(
+    req: { id: number; method: string; args: Record<string, unknown> },
+  ): Promise<void> {
+    let result: unknown;
+    try {
+      result = await this.dispatchFsMethod(req.method, req.args);
+    } catch (err) {
+      result = { error: (err as Error).message };
+    }
+    this.process?.write(JSON.stringify({
+      fs_response: { id: req.id, result },
+    }));
+  }
+
+  /**
+   * Dispatch write/edit/patch fs operations.
+   *
+   * Workspace-scope gate: the resolved path must live inside this.cwd. We
+   * resolve first, then check `startsWith(this.cwd)` on the normalized path.
+   * Anything outside the workspace returns an error asking the model to
+   * use ask() for approval — this is the A1 minimum-viable permission flow
+   * per CODEMODE_ROADMAP.md. A follow-up phase wires onPermissionRequest
+   * through to allow prompt-based approval of external writes.
+   *
+   * All three methods (write/edit/patch) call captureSnapshot so the Aries
+   * undo/history system sees the change. Matches the top-level EditTool
+   * and WriteTool exactly — fs.edit from inside the Repl must produce the
+   * same side effects as the top-level Edit tool, because the point of
+   * codemode is that the model can't tell (and shouldn't care) whether
+   * a capability lives in the namespace or in a tool schema.
+   */
+  private async dispatchFsMethod(
+    method: string,
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    switch (method) {
+      case 'write': {
+        // Full file write. Overwrites. Creates parent dirs. Matches WriteTool.execute.
+        const rawPath = args.path as string;
+        const content = args.content as string;
+        if (!rawPath || typeof rawPath !== 'string') {
+          throw new Error('fs.write: path required (string)');
+        }
+        if (typeof content !== 'string') {
+          throw new Error('fs.write: content required (string)');
+        }
+        const absPath = resolve(this.cwd, rawPath);
+        this.assertInsideWorkspace(absPath, 'fs.write');
+
+        mkdirSync(dirname(absPath), { recursive: true });
+        // Use 'Write' as the snapshot tool label — functionally identical to
+        // the top-level WriteTool, undo treats them the same. If we ever
+        // want to distinguish fs.* from tool-level writes in the undo UI,
+        // widen FileSnapshot.tool in snapshot.ts first.
+        captureSnapshot(absPath, 'Write');
+        writeFileSync(absPath, content, 'utf-8');
+        return {
+          ok: true,
+          path: absPath,
+          bytes: Buffer.byteLength(content, 'utf-8'),
+        };
+      }
+
+      case 'edit': {
+        // Single-pair find/replace via the shared fuzzyFind strategy list.
+        const rawPath = args.path as string;
+        const oldString = args.old as string;
+        const newString = args.new as string;
+        const replaceAll = (args.replace_all as boolean) ?? false;
+        if (!rawPath || typeof oldString !== 'string' || typeof newString !== 'string') {
+          throw new Error('fs.edit: path, old, new required');
+        }
+        const absPath = resolve(this.cwd, rawPath);
+        this.assertInsideWorkspace(absPath, 'fs.edit');
+
+        const content = readFileSync(absPath, 'utf-8');
+        const found = fuzzyFind(content, oldString);
+        if (!found) {
+          throw new Error(`fs.edit: old not found in ${absPath} (tried all fuzzy strategies)`);
+        }
+
+        // Uniqueness check — refuse ambiguous edits unless replace_all is set.
+        // Same semantics as EditTool: protects against sweeping changes the
+        // model didn't intend.
+        if (!replaceAll) {
+          const count = content.split(found.match).length - 1;
+          if (count > 1) {
+            throw new Error(
+              `fs.edit: match appears ${count} times in ${absPath}. Pass replace_all=True or include more context in old.`
+            );
+          }
+        }
+
+        const updated = replaceAll
+          ? content.split(found.match).join(newString)
+          : content.replace(found.match, newString);
+
+        captureSnapshot(absPath, 'Edit');
+        writeFileSync(absPath, updated, 'utf-8');
+        const diff = generateDiff(found.match, newString, absPath);
+        return {
+          ok: true,
+          path: absPath,
+          diff,
+          strategy: found.strategy,
+        };
+      }
+
+      case 'patch': {
+        // Batched edits — N (old, new) pairs in one round-trip. Each edit
+        // applies to the result of the previous. Saves bridge round-trips
+        // and (once wired) saves N-1 permission prompts.
+        const rawPath = args.path as string;
+        const edits = args.edits as Array<[string, string]>;
+        const replaceAll = (args.replace_all as boolean) ?? false;
+        if (!rawPath || !Array.isArray(edits) || edits.length === 0) {
+          throw new Error('fs.patch: path and non-empty edits array required');
+        }
+        const absPath = resolve(this.cwd, rawPath);
+        this.assertInsideWorkspace(absPath, 'fs.patch');
+
+        let working = readFileSync(absPath, 'utf-8');
+        const original = working;
+        let applied = 0;
+
+        for (let i = 0; i < edits.length; i++) {
+          const pair = edits[i]!;
+          const [oldStr, newStr] = pair;
+          const found = fuzzyFind(working, oldStr);
+          if (!found) {
+            throw new Error(
+              `fs.patch: edit ${i + 1}/${edits.length} — old not found. ${applied} edits already applied in-memory, none persisted.`
+            );
+          }
+          if (!replaceAll) {
+            const count = working.split(found.match).length - 1;
+            if (count > 1) {
+              throw new Error(
+                `fs.patch: edit ${i + 1}/${edits.length} — match appears ${count} times. Pass replace_all=True or narrow.`
+              );
+            }
+          }
+          working = replaceAll
+            ? working.split(found.match).join(newStr)
+            : working.replace(found.match, newStr);
+          applied++;
+        }
+
+        // fs.patch is a series of edits, so 'Edit' is the correct label.
+        captureSnapshot(absPath, 'Edit');
+        writeFileSync(absPath, working, 'utf-8');
+        return {
+          ok: true,
+          path: absPath,
+          applied,
+          diff: generateDiff(original, working, absPath),
+        };
+      }
+
+      default:
+        throw new Error(`unknown fs method: ${method}`);
+    }
+  }
+
+  // ── Shell callback handler ───────────────────────────────────────────────
+  // Handles shell_request messages from body/shell.py. The model's
+  // `shell.run("npm test")` call arrives here, runs via spawn, returns
+  // structured {stdout, stderr, code, duration_ms} on success or
+  // {error: "..."} on failure (which the Python proxy lifts to ShellError).
+  //
+  // No blocklist here despite Bash having one. Design rationale: the Bash
+  // tool's blocks (cat/grep/find/sed/awk) exist to fight the Bash↔Repl
+  // zigzag. Inside codemode, the model is already in Python — there's no
+  // zigzag to prevent. If the model calls `shell.run("cat f | grep x")`
+  // it made a deliberate compositional choice. Respect that. If it uses
+  // shell.run for things namespace primitives do better, nudge via the
+  // shell.py docstring, not via runtime blocks.
+
+  /**
+   * Route shell_request from Python to dispatchShellMethod. Shape mirrors
+   * handleFsCallback exactly.
+   */
+  private async handleShellCallback(
+    req: { id: number; method: string; args: Record<string, unknown> },
+  ): Promise<void> {
+    let result: unknown;
+    try {
+      result = await this.dispatchShellMethod(req.method, req.args);
+    } catch (err) {
+      result = { error: (err as Error).message };
+    }
+    this.process?.write(JSON.stringify({
+      shell_response: { id: req.id, result },
+    }));
+  }
+
+  /**
+   * Dispatch shell operations. Currently only `run` — but keeping the
+   * switch structure so future ops (`spawn` for long-running, `pipe` for
+   * streaming, etc.) slot in without architectural churn.
+   */
+  private async dispatchShellMethod(
+    method: string,
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    switch (method) {
+      case 'run': {
+        const cmd = args.cmd as string;
+        const timeoutSec = (args.timeout as number) ?? 30;
+        const rawCwd = args.cwd as string | undefined;
+        if (!cmd || typeof cmd !== 'string') {
+          throw new Error('shell.run: cmd required');
+        }
+
+        // Resolve cwd — if the caller passed one, it must be inside the
+        // workspace. Without this, `shell.run("rm -rf /", cwd="/")` would
+        // be free to damage anything. Same boundary rule as fs.write.
+        let effectiveCwd = this.cwd;
+        if (rawCwd) {
+          const absCwd = resolve(this.cwd, rawCwd);
+          this.assertInsideWorkspace(absCwd, 'shell.run cwd');
+          effectiveCwd = absCwd;
+        }
+
+        return await this.runShellCommand(cmd, effectiveCwd, timeoutSec * 1000);
+      }
+
+      default:
+        throw new Error(`unknown shell method: ${method}`);
+    }
+  }
+
+  /**
+   * Spawn a shell child process, capture stdout/stderr, enforce timeout.
+   *
+   * Why spawn over exec:
+   *   `exec()` throws on non-zero exit codes which forces awkward error
+   *   handling to distinguish "command ran, exited 1" (data, not error)
+   *   from "command could not be run" (actual error). spawn gives us
+   *   both streams and exit code directly via events — cleaner.
+   *
+   * Why the system shell (`/bin/sh` / `cmd.exe`):
+   *   The model writes shell commands (`npm test`, `git status`,
+   *   `x | grep y`) that assume shell-level parsing — pipes, redirects,
+   *   env expansion. Passing via `{shell: true}` or via /bin/sh -c is
+   *   how you honor that. Without a shell, `npm test` alone would try
+   *   to exec a binary named "npm test" (with the space).
+   *
+   * Output caps: capped at 2MB stdout + 2MB stderr combined to prevent
+   * pathological commands (`yes`, `find /`) from exploding memory.
+   * Beyond the cap we truncate with a sentinel; model sees the truncation.
+   */
+  private runShellCommand(
+    cmd: string,
+    cwd: string,
+    timeoutMs: number,
+  ): Promise<unknown> {
+    return new Promise((resolveP) => {
+      const start = Date.now();
+      const isWin = process.platform === 'win32';
+      const shellBin = isWin ? (process.env.COMSPEC ?? 'cmd.exe') : '/bin/sh';
+      const shellArg = isWin ? '/c' : '-c';
+
+      const child = spawn(shellBin, [shellArg, cmd], {
+        cwd,
+        shell: false, // we are explicitly the shell; don't double-wrap
+        env: process.env,
+        windowsHide: true,
+      });
+
+      let stdout = '';
+      let stderr = '';
+      const MAX_OUTPUT = 2_000_000;
+      let outputTruncated = false;
+
+      const capture = (buf: string, chunk: Buffer) => {
+        const remaining = MAX_OUTPUT - buf.length;
+        if (remaining <= 0) {
+          outputTruncated = true;
+          return buf;
+        }
+        const s = chunk.toString('utf-8');
+        if (s.length <= remaining) return buf + s;
+        outputTruncated = true;
+        return buf + s.slice(0, remaining) + '\n...[truncated at 2MB]...\n';
+      };
+
+      child.stdout?.on('data', (c) => { stdout = capture(stdout, c); });
+      child.stderr?.on('data', (c) => { stderr = capture(stderr, c); });
+
+      let killed = false;
+      const timer = setTimeout(() => {
+        killed = true;
+        try { child.kill('SIGKILL'); } catch { /* already dead */ }
+      }, timeoutMs);
+
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        const duration_ms = Date.now() - start;
+        if (killed) {
+          // Timeout — surface as error so Python raises ShellError. Return
+          // whatever partial output we captured; losing it would blind the
+          // model to why the command timed out.
+          resolveP({
+            error: `shell.run: timed out after ${timeoutMs}ms. Partial output follows.\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`,
+          });
+          return;
+        }
+        resolveP({
+          ok: true,
+          stdout,
+          stderr,
+          code: code ?? -1,
+          duration_ms,
+          truncated: outputTruncated,
+        });
+      });
+
+      child.on('error', (err) => {
+        clearTimeout(timer);
+        resolveP({
+          error: `shell.run: spawn failed (${err.message}). cmd='${cmd.slice(0, 200)}'`,
+        });
+      });
+    });
+  }
+
+  // ── Web callback handler ─────────────────────────────────────────────────
+  // Delegates to the existing WebFetchTool / WebSearchTool classes. Zero
+  // re-implementation of HTTP fetch, HTML cleaning, DDG fallback chain,
+  // Tavily/Brave/Serper/SerpAPI providers — that logic has taken months
+  // to stabilize and must not be forked. If a bug exists there, fix it
+  // in the tool; web.fetch/web.search inherit the fix for free.
+
+  /** Route web_request from Python through dispatchWebMethod. */
+  private async handleWebCallback(
+    req: { id: number; method: string; args: Record<string, unknown> },
+  ): Promise<void> {
+    let result: unknown;
+    try {
+      result = await this.dispatchWebMethod(req.method, req.args);
+    } catch (err) {
+      result = { error: (err as Error).message };
+    }
+    this.process?.write(JSON.stringify({
+      web_response: { id: req.id, result },
+    }));
+  }
+
+  /**
+   * Dispatch fetch and search by constructing the relevant tool and calling
+   * its execute(). Tools have no external state (WebFetchTool is stateless,
+   * WebSearchTool only holds its cfg) so we construct per-call. Cheap.
+   */
+  private async dispatchWebMethod(
+    method: string,
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    switch (method) {
+      case 'fetch': {
+        const url = args.url as string;
+        const maxLength = (args.max_length as number) ?? 50_000;
+        if (!url || typeof url !== 'string') {
+          throw new Error('web.fetch: url required');
+        }
+        const tool = new WebFetchTool();
+        // WebFetchTool.execute returns a ToolResult with {output, isError}.
+        // Convert to the same shape the model's try/except expects: on
+        // success return the raw text, on error raise (by surfacing
+        // {error} back to Python).
+        const r = await tool.execute({ url, maxLength });
+        if (r.isError) {
+          throw new Error(r.output);
+        }
+        return r.output;
+      }
+
+      case 'search': {
+        const query = args.query as string;
+        const maxResults = (args.max_results as number) ?? 10;
+        if (!query || typeof query !== 'string') {
+          throw new Error('web.search: query required');
+        }
+        const tool = new WebSearchTool(this.webSearchConfig);
+        const r = await tool.execute({ query, maxResults });
+        if (r.isError) {
+          throw new Error(r.output);
+        }
+        // WebSearchTool returns formatted text blocks, one per result, in a
+        // single string. Python expects a list[dict]. Parse the blocks back
+        // to structured form for consistency with the docstring contract.
+        // Format produced by every backend: "title\nurl\nsnippet\n" separated
+        // by blank lines. First block may start with "Answer: ..." (Tavily /
+        // Serper answer box) — we keep that as an extra field.
+        return parseWebSearchOutput(r.output, maxResults);
+      }
+
+      default:
+        throw new Error(`unknown web method: ${method}`);
+    }
+  }
+
+  /**
+   * Ensure a resolved absolute path is inside the workspace root.
+   * Throws with a teaching error — the message IS the model's next-step hint.
+   *
+   * Boundary trick: we compare `absPath + sep` against `cwd + sep`. Without
+   * the trailing separator, a cwd of `/work/proj` would incorrectly accept
+   * `/work/project-next/evil.ts` because the second literally starts with
+   * the first as a substring. The separator forces a path-boundary check.
+   * The `absPath === cwd` escape hatch allows writing to the workspace
+   * root itself (rare but legitimate — e.g. a new top-level file).
+   */
+  private assertInsideWorkspace(absPath: string, op: string): void {
+    const rootWithSep = this.cwd.endsWith(sep) ? this.cwd : this.cwd + sep;
+    const targetWithSep = absPath + sep;
+    if (absPath !== this.cwd && !targetWithSep.startsWith(rootWithSep)) {
+      throw new Error(
+        `${op}: path outside workspace (${absPath}). Only paths inside ${this.cwd} are allowed. For paths outside the workspace, call ask(question) to get explicit user approval first — per-call permission prompts are not wired for fs.* yet (A1 minimum-viable).`
+      );
     }
   }
 

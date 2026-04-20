@@ -26,8 +26,12 @@ const STRATEGIES: MatchStrategy[] = [
 /**
  * Try to find old_string in content using progressively looser matching.
  * Returns the actual substring in content that matched, or null.
+ *
+ * Exported so body/fs.py's edit/patch callbacks can reuse the same fuzzy
+ * matching the EditTool uses. Do not duplicate this logic — if we change
+ * the strategy list here, fs.edit gets the improvement for free.
  */
-function fuzzyFind(content: string, oldString: string): { match: string; strategy: string } | null {
+export function fuzzyFind(content: string, oldString: string): { match: string; strategy: string } | null {
   for (const strategy of STRATEGIES) {
     const transformedContent = strategy.transform(content);
     const transformedOld = strategy.transform(oldString);
@@ -131,8 +135,12 @@ function contextAwareMatch(content: string, oldString: string): string | null {
 /**
  * Generate a simple unified diff between old and new text.
  * Shows 2 lines of context around changes.
+ *
+ * Exported so fs.edit/fs.patch can return the same diff format the EditTool
+ * surfaces — the model sees identical output whether the edit came from the
+ * top-level Edit tool or from fs.edit inside the Repl.
  */
-function generateDiff(oldText: string, newText: string, filePath: string): string {
+export function generateDiff(oldText: string, newText: string, filePath: string): string {
   const oldLines = oldText.split('\n');
   const newLines = newText.split('\n');
   const result: string[] = [`--- ${filePath}`, `+++ ${filePath}`];

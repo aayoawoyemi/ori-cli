@@ -24,6 +24,7 @@ export async function generateSessionTitle(
           content: `Generate a 3-6 word title for this coding session. No quotes, no punctuation, no markdown. Just the title words.\n\nUser: ${userSnippet}\n\nAssistant: ${assistantSnippet}`,
         },
       ],
+      { maxTokens: 100 },
     );
 
     const title = result.trim().replace(/^["']|["']$/g, '').slice(0, 60);

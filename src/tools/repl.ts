@@ -54,6 +54,30 @@ export class ReplTool implements Tool {
       return { id: '', name: this.name, output: 'Empty code block.', isError: true };
     }
 
+    // ── Client-side lint: catch common guaranteed-failure patterns ─────
+    // The AST guard on the Python side rejects these too, but it costs a
+    // bridge round-trip. Catching locally saves ~50ms and, more importantly,
+    // the error message can be specific about what to do instead.
+    const importMatch = code.match(/^\s*(?:import|from)\s+[\w.]+/m);
+    if (importMatch) {
+      return {
+        id: '',
+        name: this.name,
+        output: `Repl rejected: imports are forbidden (you wrote "${importMatch[0].trim()}"). The Repl namespace is PRE-LOADED with what you need — use these objects directly, no import needed:\n  - fs.read(path) / fs.listdir(path) / fs.glob(pattern, path)\n  - codebase.search / find_symbol / get_context / show_dependents / communities / find_convention\n  - vault.explore / query_ranked / query_warmth / add / orient\n  - rlm_call(slice, question) / rlm_batch([...])\nTry again WITHOUT the import. If you need a stdlib function, it's not available — describe what you need and use the pre-loaded objects.`,
+        isError: true,
+      };
+    }
+
+    // TypeScript syntax sneaking into Python Repl (Sonnet does this occasionally)
+    if (/^\s*(?:const|let|var|function|interface|type)\s+\w+/m.test(code)) {
+      return {
+        id: '',
+        name: this.name,
+        output: `Repl rejected: this code looks like TypeScript/JavaScript. The Repl runs Python. Rewrite using Python syntax (def not function, = not const, dict not interface, etc).`,
+        isError: true,
+      };
+    }
+
     const result = await handle.exec({ code }, _ctx.signal);
 
     if (result.rejected) {

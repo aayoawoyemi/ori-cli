@@ -560,19 +560,46 @@ export class ModelRouter {
     this.providers.set(slot, createProvider(config, this.experimental));
   }
 
-  /** Use the cheap slot (or primary as fallback) for utility calls. */
-  async cheapCall(systemPrompt: string, messages: Message[]): Promise<string> {
+  /**
+   * Use the cheap slot (or primary as fallback) for utility calls.
+   *
+   * `opts.maxTokens` temporarily caps the provider's output budget for this
+   * one call. Useful because utility calls (reflection, extraction, summary)
+   * need ~1-3k tokens of output, not the provider's default 16k. Provider
+   * restores its configured default after the call.
+   */
+  async cheapCall(
+    systemPrompt: string,
+    messages: Message[],
+    opts?: { maxTokens?: number },
+  ): Promise<string> {
     const provider = this.providers.get('cheap') ?? this.providers.get('primary');
     if (!provider) this.requirePrimary();
+
+    // Duck-typed optional max_tokens override. AnthropicProvider implements
+    // setMaxTokens + getMaxTokens; other providers ignore (call passes through
+    // with their configured default).
+    const p = provider as unknown as { setMaxTokens?: (n: number) => void; getMaxTokens?: () => number };
+    const prevMax = (opts?.maxTokens && p.getMaxTokens) ? p.getMaxTokens() : undefined;
+    if (opts?.maxTokens && p.setMaxTokens) {
+      p.setMaxTokens(opts.maxTokens);
+    }
+
     let result = '';
     let inTok = 0, outTok = 0, cacheRead = 0, cacheWrite = 0;
-    for await (const event of provider!.stream(messages, systemPrompt, [], undefined)) {
-      if (event.type === 'text') result += event.content;
-      if (event.type === 'usage') {
-        inTok = event.inputTokens;
-        outTok = event.outputTokens;
-        cacheRead = event.cacheReadTokens ?? 0;
-        cacheWrite = event.cacheWriteTokens ?? 0;
+    try {
+      for await (const event of provider!.stream(messages, systemPrompt, [], undefined)) {
+        if (event.type === 'text') result += event.content;
+        if (event.type === 'usage') {
+          inTok = event.inputTokens;
+          outTok = event.outputTokens;
+          cacheRead = event.cacheReadTokens ?? 0;
+          cacheWrite = event.cacheWriteTokens ?? 0;
+        }
+      }
+    } finally {
+      if (prevMax !== undefined && p.setMaxTokens) {
+        p.setMaxTokens(prevMax);
       }
     }
     // Notify any listeners (UsageTracker in app.tsx) about this call so

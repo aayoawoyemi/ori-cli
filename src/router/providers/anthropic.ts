@@ -291,6 +291,20 @@ export class AnthropicProvider implements ModelProvider {
     this._thinkingBudget = Math.max(0, budget);
   }
 
+  /**
+   * Temporarily set the per-call max_tokens. Used by cheapCall to cap
+   * utility calls (extraction, reflection) at much smaller outputs than
+   * the provider's configured default (typically 16k). Caller is responsible
+   * for restoring via setMaxTokens(previous).
+   */
+  setMaxTokens(n: number): void {
+    this.maxTokens = Math.max(256, n);
+  }
+
+  getMaxTokens(): number {
+    return this.maxTokens;
+  }
+
   /** Ensure OAuth token is fresh. */
   private async ensureToken(): Promise<void> {
     if (!this.useOAuth || !this.oauthCreds || !this.oauthSource) return;

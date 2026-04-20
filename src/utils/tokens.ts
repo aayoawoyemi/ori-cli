@@ -1,10 +1,12 @@
 import type { Message, ContentBlock } from '../router/types.js';
 
 /**
- * Rough token estimation. ~4 chars per token for English text.
- * Good enough for compaction threshold checks. Providers can give exact counts.
+ * Rough token estimation. ~3.5 chars per token for mixed English + code.
+ * Standardized 2026-04-19 to match estimateRequestTokens in the Anthropic
+ * provider; previously this used 4.0 which underestimated by ~12% and caused
+ * the 1M-beta trigger to misfire (request estimated at 178k but actual 198k).
  */
-const CHARS_PER_TOKEN = 4;
+const CHARS_PER_TOKEN = 3.5;
 
 function contentLength(content: string | ContentBlock[]): number {
   if (typeof content === 'string') return content.length;

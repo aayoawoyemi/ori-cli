@@ -51,13 +51,38 @@ export async function appendExperience(projectDir: string, text: string): Promis
 /**
  * Read the experience log as markdown. Returns '' if absent.
  * Synchronous — called during prompt build.
+ *
+ * Process-cached and char-capped (2026-04-19). Previously read from disk
+ * every prompt build; now cached until file mtime changes. Output capped
+ * at MAX_RETURN_CHARS so a runaway log can't bloat the cached prefix.
  */
+const MAX_RETURN_CHARS = 1600; // ~400 tokens
+const cache = new Map<string, { mtimeMs: number; value: string }>();
+
 export function readExperienceLog(projectDir: string): string {
+  const path = experienceLogPath(projectDir);
   try {
-    const content = readFileSync(experienceLogPath(projectDir), 'utf-8');
+    const { statSync } = require('node:fs') as typeof import('node:fs');
+    const stat = statSync(path);
+    const cached = cache.get(path);
+    if (cached && cached.mtimeMs === stat.mtimeMs) return cached.value;
+
+    const content = readFileSync(path, 'utf-8');
     const entries = content.split('\n').filter(line => ENTRY_RE.test(line));
-    if (entries.length === 0) return '';
-    return entries.join('\n');
+    if (entries.length === 0) {
+      cache.set(path, { mtimeMs: stat.mtimeMs, value: '' });
+      return '';
+    }
+
+    // Most-recent first, char-capped
+    const reversed = [...entries].reverse();
+    let result = '';
+    for (const entry of reversed) {
+      if (result.length + entry.length + 1 > MAX_RETURN_CHARS) break;
+      result = result ? `${result}\n${entry}` : entry;
+    }
+    cache.set(path, { mtimeMs: stat.mtimeMs, value: result });
+    return result;
   } catch {
     return '';
   }

@@ -37,42 +37,25 @@ export async function assembleWarmContext(
   vault: OriVault | null,
   identity: VaultIdentity | null,
 ): Promise<string> {
+  // Shrunk 2026-04-19: identity + goals only, capped tighter. The two extra
+  // vault queries (last-reflection, top-warm-notes) were removed entirely —
+  // they pulled ~3-5 lines of low-signal titles into every session-start
+  // prompt and round-tripped through MCP for almost no value. The model can
+  // pull warm notes via vault.query_warmth() in the Repl when relevant.
   const sections: string[] = [];
 
-  // 1. Identity — who the agent is
   if (identity?.identity) {
-    // Take first ~800 chars of identity (the core, not the full file)
-    const core = identity.identity.slice(0, 800).trim();
+    const core = identity.identity.slice(0, 400).trim();
     sections.push(`Identity: ${core}`);
   }
 
-  // 2. Goals — what's active right now
   if (identity?.goals) {
-    const goals = identity.goals.slice(0, 800).trim();
+    const goals = identity.goals.slice(0, 400).trim();
     sections.push(`Active goals:\n${goals}`);
   }
 
-  // 3. Last reflection — most recent synthesized insight
-  if (vault?.connected) {
-    try {
-      const reflections = await vault.queryRanked('recent reflection insight synthesis', 1);
-      if (reflections.length > 0) {
-        sections.push(`Last reflection: "${reflections[0]!.title}"`);
-      }
-    } catch { /* non-fatal */ }
-  }
-
-  // 4. Top warm notes — what's been most active recently
-  if (vault?.connected) {
-    try {
-      const context = identity?.goals ?? 'current work and active projects';
-      const warm = await vault.queryWarmth(context, MAX_WARM_NOTES);
-      if (warm.length > 0) {
-        const lines = warm.map(n => `- "${n.title}"`).join('\n');
-        sections.push(`Warm notes (recently active):\n${lines}`);
-      }
-    } catch { /* non-fatal */ }
-  }
+  // suppress unused-param warning while keeping the call signature stable
+  void vault;
 
   if (sections.length === 0) return '';
 
