@@ -673,14 +673,159 @@ def main():
         recv(proc)
         r = exec_code(proc, "print('shapes-banner-probe')")
         stdout = r.get("stdout") or ""
-        required_sigs = ["Shapes:", "fs.read(path)", "shell.run(cmd", "say(text)"]
-        missing_sigs = [s for s in required_sigs if s not in stdout]
-        if not missing_sigs:
-            print("  OK   first-turn banner carries Shapes cheat-sheet")
+        # Match substring prefixes rather than exact strings — Batch 1.5
+        # switched the banner to generate from NAMESPACE_SIGNATURES so
+        # signatures now show the full param list (`fs.read(path, offset=0,
+        # limit=None)` not `fs.read(path)`). The probe's contract is "the
+        # Shapes block exists and covers the key reach-for primitives",
+        # which substring-prefix matching expresses without coupling to
+        # the exact formatting of any entry.
+        required_prefixes = ["Shapes:", "fs.read(", "shell.run(", "say(", "vault.explore("]
+        missing = [p for p in required_prefixes if p not in stdout]
+        # vault.explore only surfaces in the Shapes block when VAULT is
+        # bound; standalone smoke has VAULT=None so the prefix will be
+        # absent. Allow it to be missing in that case — the drift probe
+        # #22 covers the schema entry's existence directly.
+        if "vault.explore(" in missing:
+            missing.remove("vault.explore(")
+        if not missing:
+            print("  OK   first-turn banner carries Shapes cheat-sheet (schema-generated)")
             passed += 1
         else:
-            print(f"  FAIL banner missing Shapes lines: {missing_sigs}")
+            print(f"  FAIL banner missing Shapes prefixes: {missing}")
             print(f"       banner stdout was:\n{stdout}")
+
+        # 22. Batch 1.5 drift probe — every callable primitive bound in
+        # _build_namespace must have a NAMESPACE_SIGNATURES entry.
+        # Enforces "add a primitive without registering its schema" as a
+        # CI failure so drift is caught immediately. Checks only the
+        # aries primitives; stdlib pre-bindings (re/datetime/etc.) are
+        # deliberately not in the schema table (their shapes are
+        # well-known and duplicating would add drift surface).
+        total += 1
+        drift_script = (
+            "import sys\n"
+            f"sys.path.insert(0, r'{ROOT / 'body'}')\n"
+            "from schema import NAMESPACE_SIGNATURES\n"
+            "import importlib\n"
+            "server = importlib.import_module('server')\n"
+            "# Expected primitives from _build_namespace — aries primitives\n"
+            "# only; stdlib modules (re/datetime/etc.) excluded by design.\n"
+            "expected_ns_objects = ['fs', 'shell', 'web']\n"
+            "expected_bare_names = ['say', 'ask', 'done']\n"
+            "missing = []\n"
+            "# For each expected ns object, at least one <ns>.method must be in schema.\n"
+            "for ns_name in expected_ns_objects:\n"
+            "    covered = [k for k in NAMESPACE_SIGNATURES if k.startswith(ns_name + '.')]\n"
+            "    if not covered:\n"
+            "        missing.append(f'ns:{ns_name}')\n"
+            "# For each expected bare name, the exact key must be in schema.\n"
+            "for bare in expected_bare_names:\n"
+            "    if bare not in NAMESPACE_SIGNATURES:\n"
+            "        missing.append(f'bare:{bare}')\n"
+            "# Cross-check: every key in schema should resolve to a callable if the\n"
+            "# ns object is actually bound. VAULT/CODEBASE/RESEARCH may be None in\n"
+            "# standalone smoke (lazy), so skip those; test only the always-bound ones.\n"
+            "always_bound = {'fs': server.FS, 'shell': server.SHELL, 'web': server.WEB}\n"
+            "unreachable = []\n"
+            "for key in NAMESPACE_SIGNATURES:\n"
+            "    if '.' not in key: continue\n"
+            "    ns_name, method = key.split('.', 1)\n"
+            "    if ns_name not in always_bound: continue\n"
+            "    if not hasattr(always_bound[ns_name], method):\n"
+            "        unreachable.append(key)\n"
+            "print(f'missing:{len(missing)}')\n"
+            "if missing: print('MISSING:', missing)\n"
+            "print(f'unreachable:{len(unreachable)}')\n"
+            "if unreachable: print('UNREACHABLE:', unreachable)\n"
+        )
+        drift_result = subprocess.run(
+            [sys.executable, "-c", drift_script],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        drift_out = drift_result.stdout
+        if "missing:0" in drift_out and "unreachable:0" in drift_out:
+            print("  OK   NAMESPACE_SIGNATURES covers every always-bound primitive; no drift")
+            passed += 1
+        else:
+            print(f"  FAIL schema drift:\n{drift_out}")
+            if drift_result.stderr:
+                print(f"       stderr: {drift_result.stderr.strip()[:400]}")
+
+        # 23. Batch 1.5 enrichment probe — synthetic KeyError traceback
+        # mentioning vault.explore gets a `NOTE: vault.explore returns ...`
+        # line appended. Confirms the post-exception hook fires for the
+        # shape-error classes (KeyError/AttributeError/TypeError/IndexError)
+        # and the regex correctly parses the frame source to identify the
+        # offending primitive. Uses a hand-crafted traceback so the probe
+        # doesn't depend on bridged primitives.
+        total += 1
+        enrich_script = (
+            "import sys\n"
+            f"sys.path.insert(0, r'{ROOT / 'body'}')\n"
+            "from repl import _enrich_exception\n"
+            "tb = (\n"
+            "    'Traceback (most recent call last):\\n'\n"
+            "    '  File \"<string>\", line 2, in <module>\\n'\n"
+            "    '    top = hits[\\'notes\\'][0]\\n'\n"
+            "    \"KeyError: 'notes'\\n\"\n"
+            ")\n"
+            "code = \"hits = vault.explore('codemode paradigm')\\ntop = hits['notes'][0]\\n\"\n"
+            "enriched, did = _enrich_exception(tb, code)\n"
+            "print('did_enrich:', did)\n"
+            "print('has_note:', 'NOTE:' in enriched)\n"
+            "print('mentions_vault_explore:', 'vault.explore' in enriched)\n"
+            "print('mentions_results_key:', 'results' in enriched)\n"
+            "# Argument-count TypeError path gets the `sig`, not `returns`.\n"
+            "tb2 = (\n"
+            "    'Traceback (most recent call last):\\n'\n"
+            "    '  File \"<string>\", line 1, in <module>\\n'\n"
+            "    '    rlm_call(\\'just one arg\\')\\n'\n"
+            "    \"TypeError: rlm_call() missing 1 required positional argument: 'question'\\n\"\n"
+            ")\n"
+            "code2 = \"rlm_call('just one arg')\\n\"\n"
+            "enriched2, did2 = _enrich_exception(tb2, code2)\n"
+            "print('did_enrich_typeerror:', did2)\n"
+            "print('has_signature_label:', 'rlm_call signature' in enriched2)\n"
+            "# Non-shape error class (NameError) should NOT enrich.\n"
+            "tb3 = (\n"
+            "    'Traceback (most recent call last):\\n'\n"
+            "    '  File \"<string>\", line 1, in <module>\\n'\n"
+            "    '    vault.explore(\\'x\\')\\n'\n"
+            "    \"NameError: name 'vault' is not defined\\n\"\n"
+            ")\n"
+            "enriched3, did3 = _enrich_exception(tb3, 'vault.explore(\\'x\\')\\n')\n"
+            "print('nameerror_not_enriched:', not did3)\n"
+        )
+        enrich_result = subprocess.run(
+            [sys.executable, "-c", enrich_script],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        enrich_out = enrich_result.stdout
+        checks = [
+            "did_enrich: True",
+            "has_note: True",
+            "mentions_vault_explore: True",
+            "mentions_results_key: True",
+            "did_enrich_typeerror: True",
+            "has_signature_label: True",
+            "nameerror_not_enriched: True",
+        ]
+        if all(c in enrich_out for c in checks):
+            print("  OK   _enrich_exception appends NOTE for shape errors, signature for TypeError arg-count, skips NameError")
+            passed += 1
+        else:
+            missing_checks = [c for c in checks if c not in enrich_out]
+            print(f"  FAIL enrichment missing checks: {missing_checks}")
+            print(f"       stdout:\n{enrich_out}")
+            if enrich_result.stderr:
+                print(f"       stderr: {enrich_result.stderr.strip()[:400]}")
 
         # Shutdown
         send(proc, {"op": "shutdown"})

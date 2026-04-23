@@ -79,15 +79,15 @@ Use done(value) as the last op when you have the final answer in hand and want t
   ]
 }
 
-# Example: walk a vault region (title → neighbors → backlinks → meta)
+# Example: walk a vault region → read top hit → extract thesis via rlm_call
 {
-  "plan": "Fetch the codemode-paradigm note plus its outbound links, inbound backlinks, and frontmatter meta in one batch.",
+  "plan": "Explore a vault region for the top hit, read the note, extract the thesis with rlm_call, and commit the answer.",
   "operations": [
-    {"purpose": "seed title", "code": "seed = 'codemode paradigm'"},
-    {"purpose": "outbound links", "code": "out = vault.neighbors(seed)"},
-    {"purpose": "inbound links", "code": "back = vault.backlinks(seed)"},
-    {"purpose": "frontmatter meta", "code": "meta = vault.meta(seed)"},
-    {"purpose": "summarize region", "code": "say(f\\"{seed} → {len(out['neighbors'])} outbound, {len(back['backlinks'])} inbound, type={meta.get('type', '?')}\\")"}
+    {"purpose": "explore region", "code": "hits = vault.explore('codemode paradigm', depth=2, limit=5)"},
+    {"purpose": "read top hit",   "code": "top = hits['results'][0]; note = vault.read(top['path'])"},
+    {"purpose": "extract thesis", "code": "thesis = rlm_call(note, 'What is the core thesis in one sentence?')"},
+    {"purpose": "report",         "code": "say(f\\"Recall: {top['title']} — {thesis}\\")"},
+    {"purpose": "commit",         "code": "done({'title': top['title'], 'thesis': thesis})"}
   ]
 }
 

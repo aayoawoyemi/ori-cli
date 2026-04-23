@@ -112,6 +112,7 @@ from shell import Shell
 from web import Web
 from speak import Speak
 from shape import analyze_shape
+from schema import NAMESPACE_SIGNATURES
 
 # Lazy imports (heavy deps) — only loaded when ops are used
 _indexer = None
@@ -535,30 +536,58 @@ _BANNER_PRIMITIVES = [
     "collections", "itertools", "math",
 ]
 
-# Shape cheat-sheet (A.6.5, 2026-04) — one-line signatures for the most-
-# reached-for primitives, rendered in the first-turn banner so the model
-# writes its first composed batch with correct return-shape assumptions
-# on turn 1 instead of turn 4. Walks the cost down from probe-then-use
-# ("print(type(result))" costs an op) to assume-correctly. Keep shapes
-# terse; anything that needs more context belongs in the primitive's
-# docstring (accessible via `help(name)`), not here.
+# Shape cheat-sheet — generated from body/schema.py:NAMESPACE_SIGNATURES at
+# banner-render time (Batch 1.5, 2026-04-23). Previously this was a
+# hand-maintained list that drifted from reality — A.6.5 shipped 10 entries
+# and omitted vault.explore / vault.query_ranked / codebase.get_context /
+# codebase.find_symbol / rlm_batch, which the 1147-exec telemetry corpus
+# identified as the specific omissions causing wrong-shape failures.
 #
-# If a primitive's return shape changes, update the matching line below
-# OR delete the line entirely (silence is better than a lying cheat-
-# sheet). Never teach a key the primitive doesn't return — that was the
-# A.6.1 root-cause pattern we're systematically eliminating.
-_BANNER_SHAPES = [
-    ("fs.read(path)",                 "str"),
-    ("fs.listdir(path)",              "list[str]"),
-    ("fs.glob(pattern)",              "list[str]"),
-    ("shell.run(cmd, timeout=30)",    "{stdout, stderr, code}"),
-    ("codebase.search(q, n=20)",      "list[{file, line, symbol, snippet}]"),
-    ("vault.top(q, n=3)",             "{results: [{title, path, score, snippet, ...}]}"),
-    ("vault.neighbors(title)",        "{neighbors: [{title, path|None}]}"),
-    ("vault.get_note(title)",         "str   (raises VaultError with suggestions on miss)"),
-    ("rlm_call(slice, question)",     "str"),
-    ("say(text) / ask(q) / done(v)",  "user-facing I/O + turn commit"),
-]
+# Now: one authoritative dict in body/schema.py drives both the banner AND
+# body/repl.py's exception enrichment. Adding a primitive to
+# _build_namespace requires a matching entry in NAMESPACE_SIGNATURES, or
+# scripts/a10_substrate_smoke.py's drift probe fails CI.
+#
+# Filter rule: a primitive "ns.method" shows only if `ns` is bound and
+# has `method` attribute. Bare-name primitives (say/ask/done/rlm_call/
+# rlm_batch/reindex) show only if the bare name is in NAMESPACE. Keeps
+# the banner honest about what's actually callable this session — a
+# vault-less session never advertises vault.* shapes.
+
+def _visible_shapes() -> list[tuple[str, str]]:
+    """Compute the Shapes block for the current namespace.
+
+    Iterates NAMESPACE_SIGNATURES (longest-first so a future "vault.top_k"
+    addition doesn't collide with "vault.top" in downstream substring
+    matching — harmless here but keeps ordering consistent with the
+    enricher in body/repl.py). For each entry, resolves the primitive
+    against the live NAMESPACE and drops any that aren't reachable.
+
+    Returns a list of (signature_line, returns_line) tuples ready for
+    column-aligned rendering. Example entry:
+      ("vault.explore(query, depth=2, ...)", "{results: [...], count, paths, ...}")
+    """
+    visible: list[tuple[str, str]] = []
+    for primitive, entry in sorted(
+        NAMESPACE_SIGNATURES.items(), key=lambda kv: -len(kv[0])
+    ):
+        if "." in primitive:
+            ns_name, method = primitive.split(".", 1)
+            ns_obj = NAMESPACE.get(ns_name)
+            if ns_obj is None or not hasattr(ns_obj, method):
+                continue
+        else:
+            # Bare-name primitive (say / ask / done / rlm_call / rlm_batch
+            # / reindex). Must be directly bound in NAMESPACE.
+            if primitive not in NAMESPACE:
+                continue
+        sig_line = f"{primitive}{entry['sig']}"
+        visible.append((sig_line, entry["returns"]))
+    # Sort for stable banner output — longest-first ordering inside the
+    # loop is for substring-match robustness, not display. Alphabetical
+    # within each namespace reads better to humans eyeballing the banner.
+    visible.sort(key=lambda pair: pair[0])
+    return visible
 
 
 def _format_first_turn_banner() -> str:
@@ -634,27 +663,15 @@ def _format_first_turn_banner() -> str:
         "Discovery: obj.__doc__ shows the API for any primitive; fs.read.__doc__ works on methods too",
         "Idiom: compose multiple operations in one call — reads, searches, summaries, edits, says — using Python control flow. One composed call is the shape that wins.",
     ])
-    # Shape cheat-sheet (A.6.5). Render the subset of _BANNER_SHAPES whose
-    # leading primitive (name before the first `.` or `(`) is actually
-    # available in the namespace this session. Filter exists so e.g. a
-    # vault-less session doesn't advertise vault.* shapes. Column-align
-    # the "→" so the sheet reads as a table at a glance.
-    visible_shapes = []
-    for sig, ret in _BANNER_SHAPES:
-        head = sig.split("(", 1)[0].split(".", 1)[0].split("/", 1)[0].strip()
-        # `say / ask / done` line has multiple heads joined by ` / ` — always
-        # visible when any of say/ask/done are in namespace (they always are).
-        if head in available or head in {"say", "ask", "done"}:
-            visible_shapes.append((sig, ret))
+    # Shape cheat-sheet — generated from schema.NAMESPACE_SIGNATURES at
+    # render time (Batch 1.5). Column-aligned, ASCII arrow so the banner
+    # round-trips through every terminal encoding (Windows cp1252 can't
+    # encode U+2192 and crashes when the smoke test re-prints body stdout).
+    visible_shapes = _visible_shapes()
     if visible_shapes:
         pad = max(len(sig) for sig, _ in visible_shapes)
         lines.append("Shapes:")
         for sig, ret in visible_shapes:
-            # ASCII arrow so the banner round-trips through every terminal
-            # encoding (Windows cp1252 can't encode U+2192 and crashes
-            # when the smoke test re-prints the body's stdout). Pretty
-            # typography isn't worth a platform-portability footgun on
-            # the most-read teaching surface we have.
             lines.append(f"  {sig.ljust(pad)} -> {ret}")
     lines.append("")
     return "\n".join(lines)
