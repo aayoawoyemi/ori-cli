@@ -46,6 +46,16 @@ export interface ToolParameter {
   properties?: Record<string, ToolParameter>;
   required?: string[];
   default?: unknown;
+  // JSON Schema constraint fields. Added 2026-04-22 to support the Repl
+  // tool's minItems/minLength composition enforcement (plan field minLength,
+  // operations array minItems/maxItems, per-op purpose/code minLengths).
+  // All three providers (Anthropic/OpenAI-compat/Google) pass input_schema
+  // through to upstream APIs unchanged as verified in router/providers/*,
+  // so these fields reach provider validation without stripping.
+  minItems?: number;
+  maxItems?: number;
+  minLength?: number;
+  maxLength?: number;
 }
 
 export interface ToolDefinition {

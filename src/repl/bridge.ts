@@ -35,7 +35,10 @@ import type {
   SignatureLevel,
   ResearchConnectResult,
 } from './types.js';
-import type { OriVault } from '../memory/vault.js';
+// OriVault needs a value import (not type-only) because Fix 1B auto-creates
+// a project vault inline via `new OriVault(path)` in ensureProjectVault.
+// initVault is the scaffolding helper that invokes `ori init` as a subprocess.
+import { OriVault, initVault } from '../memory/vault.js';
 import type { ModelRouter } from '../router/index.js';
 import { discover } from '../research/discover.js';
 import { ingestSources } from '../research/ingest.js';
@@ -117,12 +120,136 @@ function parseWebSearchOutput(output: string, maxResults: number): WebSearchResu
   return results;
 }
 
+// ── Bridge-side vault projection (v0.5 Phase 1, 2026-04-21) ──────────────
+//
+// Strips decoration fields from vault_response payloads before they reach
+// the Python proxy. Six weeks of REPL telemetry (53 trace files) showed
+// the model never reads `signals`, `spaces`, `rrf`, `composite`, warmth
+// internals, or federation markers — but each retrieval call was paying
+// 2–6K tokens to ship them. Grep confirmed no aries-cli code consumes
+// them either (they were internal state that leaked onto the wire).
+//
+// Keep this shape-aware: retrieval methods return `{results: [...]}` and
+// need per-result projection; non-retrieval methods (orient, status, add,
+// ori_query for backlinks/orphans/dangling) have heterogeneous shapes and
+// pass through untouched.
+//
+// Becomes redundant once Ori MCP ships the trim at source in v0.6.0.
+// Gate behind signature.trimVaultReturns (default true) so a single
+// config flip restores the raw shape if anything downstream breaks.
+
+const RETRIEVAL_METHODS = new Set([
+  'ori_query_ranked',
+  'ori_query_similar',
+  'ori_warmth',
+  'ori_query_important',
+  'ori_query_fading',
+  'ori_explore',
+]);
+
+const RESULT_STRIP_KEYS = [
+  'signals', 'spaces', 'rrf', 'rrf_base', 'composite',
+  'pprScore', 'seedScore', 'warmthScore',
+  '_federated', '_vault', '_sources',
+];
+
+const ENVELOPE_STRIP_KEYS = ['_federated', '_vault', '_sources'];
+
+interface VaultEnvelope {
+  success?: boolean;
+  data?: { results?: unknown[]; warmth?: Record<string, unknown>; [k: string]: unknown };
+  results?: unknown[];
+  warmth?: Record<string, unknown>;
+  [k: string]: unknown;
+}
+
+/**
+ * Project a vault MCP response to the minimal shape the model actually
+ * reads. Returns [projected, bytesStripped]. Non-retrieval methods pass
+ * through untouched (the byte count is 0).
+ *
+ * Retrieval shape preserved: `{success, data: {results: [{title, path,
+ * score, snippet}], ...kept envelope fields}}`. Everything on
+ * RESULT_STRIP_KEYS is removed per-result; warmth.candidates/promoted/
+ * demoted and ENVELOPE_STRIP_KEYS are removed envelope-wide.
+ */
+export function projectVaultResult(
+  method: string,
+  result: unknown,
+): { projected: unknown; bytesStripped: number } {
+  // Non-retrieval methods — pass through. Orient/status/add use
+  // heterogeneous shapes that we don't want to accidentally mutilate.
+  if (!RETRIEVAL_METHODS.has(method)) {
+    return { projected: result, bytesStripped: 0 };
+  }
+  if (!result || typeof result !== 'object') {
+    return { projected: result, bytesStripped: 0 };
+  }
+
+  const originalBytes = JSON.stringify(result).length;
+
+  // ori-memory uniformly wraps payloads as `{success, data: {...}}`.
+  // Occasionally older paths return data inline at the top level — handle
+  // both by finding whichever layer actually carries `results[]`.
+  const env = result as VaultEnvelope;
+  const dataLayer = (env.data && typeof env.data === 'object') ? env.data : env;
+
+  // Project each result item by copying only fields NOT on the strip list.
+  // Preserves whatever legitimate fields (title, path, score, snippet,
+  // type, description, etc.) the server actually sends, without hard-
+  // coding a whitelist that drifts if ori adds new useful fields.
+  const results = Array.isArray(dataLayer.results) ? dataLayer.results : null;
+  if (results) {
+    const projectedResults = results.map((item) => {
+      if (!item || typeof item !== 'object') return item;
+      const entry = item as Record<string, unknown>;
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(entry)) {
+        if (!RESULT_STRIP_KEYS.includes(k)) out[k] = v;
+      }
+      return out;
+    });
+    dataLayer.results = projectedResults;
+  }
+
+  // Warmth debug envelope — `candidates/promoted/demoted` are reranker
+  // diagnostics (which notes moved rank, by how much). Useful for
+  // ori_recent debug surfaces (coming in v0.6.0), not useful per-call.
+  const warmth = dataLayer.warmth;
+  if (warmth && typeof warmth === 'object') {
+    const w = warmth as Record<string, unknown>;
+    delete w.candidates;
+    delete w.promoted;
+    delete w.demoted;
+  }
+
+  // Envelope-level federation decoration. The routing/merge trace was
+  // already logged to stderr during federateRetrieval; the wire payload
+  // should not re-carry it.
+  for (const k of ENVELOPE_STRIP_KEYS) {
+    delete (dataLayer as Record<string, unknown>)[k];
+    delete (env as Record<string, unknown>)[k];
+  }
+
+  const finalBytes = JSON.stringify(result).length;
+  return { projected: result, bytesStripped: Math.max(0, originalBytes - finalBytes) };
+}
+
 export class ReplBridge {
   private process: ReplProcess | null = null;
   private pending: PendingResolver[] = [];
   private restarting = false;
   private restartCount = 0;
   private vault: OriVault | null = null;
+  // Project-local vault (Fix 1B — project-layered). Independent OriVault
+  // pointed at <project>/.ori/. null when no project vault exists yet or
+  // we're in vault-only mode (cwd == global vault). Connected by setup.ts
+  // via setProjectVault, or auto-created on first scope="project" add via
+  // handleVaultCallback's auto-init branch. Note: this is a SECOND
+  // ori-memory MCP subprocess. The two vaults don't share any state —
+  // warmth, Q-value, graph signals all live per-vault. Federation happens
+  // at the bridge layer on retrieval (see routeVaultMethod).
+  private projectVault: OriVault | null = null;
   private router: ModelRouter | null = null;
   private researchOutputDir: string | null = null;
   // Workspace root used by fs.* callbacks to scope writes. Defaults to the
@@ -153,6 +280,11 @@ export class ReplBridge {
   // dropped) and ask() will time out on the Python side after its timeout.
   private onSay: ((text: string) => void) | null = null;
   private onAsk: ((id: number, question: string) => void) | null = null;
+  // Gate for bridge-side vault response trim. Default true — Phase 1 of
+  // v0.5 strips decoration on the wire. Setup.ts reads AriesConfig's
+  // signature.trimVaultReturns and calls setTrimVaultReturns(...) to
+  // honor user override.
+  private trimVaultReturns: boolean = true;
 
   private opts: {
     serverPath: string;
@@ -167,7 +299,10 @@ export class ReplBridge {
     this.opts = {
       serverPath: options.serverPath ?? DEFAULT_SERVER,
       pythonCmd: options.pythonCmd ?? DEFAULT_PYTHON,
-      timeoutMs: options.timeoutMs ?? 30_000,
+      // Default 90s (bumped from 30s 2026-04-21, v0.5 Phase 1.5). vault.explore
+      // can take 30-60s server-side; the prior default guaranteed timeouts on
+      // cold spreading-activation walks. See defaults.ts repl.timeoutMs comment.
+      timeoutMs: options.timeoutMs ?? 90_000,
       maxRestarts: options.maxRestarts ?? 3,
       onEvent: options.onEvent,
       onRestart: options.onRestart,
@@ -190,6 +325,15 @@ export class ReplBridge {
     return new ReplProcess({
       pythonCmd: this.opts.pythonCmd,
       serverPath: this.opts.serverPath,
+      // Body cwd must match the harness workspace root so relative-path
+      // reads inside Python resolve to the same place fs.edit's workspace
+      // gate computes against. this.cwd is already the authoritative
+      // value — populated via setCwd() from setup.ts (opts.cwd). If the
+      // restart path fires before setCwd has been called (theoretically
+      // possible during very early failures), `this.cwd` falls back to
+      // process.cwd() as initialized on line 133 — same behavior as
+      // before this change, just now made explicit rather than implicit.
+      cwd: this.cwd,
       onLine: (line) => {
         try {
           const msg = JSON.parse(line);
@@ -249,6 +393,18 @@ export class ReplBridge {
           // clicks the modal. Same non-resolving pattern as vault/fs.
           if (msg.ask_request) {
             this.handleAskCallback(msg.ask_request);
+            return;
+          }
+
+          // Done sentinel: Python called done(value). Fire-and-forget from
+          // the bridge's perspective — no response is written back, pending
+          // is NOT resolved, exec continues. The value ALSO arrives in the
+          // final exec result (body/server.py harvests the _done_sink
+          // buffer in _run_exec), so the bridge emission here is purely a
+          // real-time observability channel for UI / telemetry subscribers.
+          // Same non-resolving pattern as say / ask_request.
+          if (msg.done) {
+            this.dispatchDone(msg.done);
             return;
           }
 
@@ -389,6 +545,40 @@ export class ReplBridge {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Send environment metadata to the body for the first-turn banner.
+   *
+   * Fires once per body lifetime (including after a restart — onRestart
+   * in setup.ts re-sends). Before A10 these facts lived in four separate
+   * places (setCwd for the workspace gate, the indexer op for codebase,
+   * the connect_vault op for vault, nothing at all for shell) and were
+   * never surfaced to the model. The banner lied by omission. Now: one
+   * op, five fields, straight to the banner's display globals on the
+   * Python side. See body/server.py `configure` handler and the
+   * PROJECT/VAULT_GLOBAL/... block for the receiving end.
+   *
+   * This op is display-only. It does NOT gate writes, select vaults,
+   * or steer indexing — those stay in their own ops. Separation matters
+   * because restart recovery replays specific ops; bundling them would
+   * make partial-failure recovery harder.
+   */
+  async configure(cfg: {
+    project?: string;
+    vaultGlobal?: string;
+    vaultProject?: string | null;
+    mode?: 'project+vault' | 'vault-only';
+    shell?: string;
+  }): Promise<void> {
+    await this.request({
+      op: 'configure',
+      project: cfg.project ?? null,
+      vault_global: cfg.vaultGlobal ?? null,
+      vault_project: cfg.vaultProject ?? null,
+      mode: cfg.mode ?? null,
+      shell: cfg.shell ?? null,
+    }, 5_000);
   }
 
   /**
@@ -555,6 +745,21 @@ export class ReplBridge {
   }
 
   /**
+   * Give the bridge a reference to the project-local vault (Fix 1B).
+   * Independent OriVault instance pointing at <project>/.ori/. Optional —
+   * when null, project-scoped vault ops return an error (or, on ori_add,
+   * trigger the auto-create path in handleVaultCallback).
+   */
+  setProjectVault(vault: OriVault | null): void {
+    this.projectVault = vault;
+  }
+
+  /** Read-only accessor for the current project vault (for banner/config sync). */
+  getProjectVault(): OriVault | null {
+    return this.projectVault;
+  }
+
+  /**
    * Give the bridge the model router so research callbacks can call
    * extractFromSource and synthesize (which need cheapCall).
    */
@@ -658,22 +863,299 @@ export class ReplBridge {
   }
 
   /**
-   * Handle a vault_request from Python: call the TS-owned Ori MCP,
-   * send the result back to Python stdin as vault_response.
+   * Handle a vault_request from Python: dispatch to the correct vault
+   * (global / project / both merged) based on args.scope, then send the
+   * result back to Python stdin as vault_response.
+   *
+   * Scope semantics (Fix 1B — project-layered vaults):
+   *   - "global"  : route to this.vault (the ~/brain MCP). Used for
+   *                 cross-project identity/research notes.
+   *   - "project" : route to this.projectVault (the <cwd>/.ori/ MCP).
+   *                 On ori_add with no project vault connected, auto-
+   *                 scaffold .ori/ in this.cwd and connect before
+   *                 forwarding the call. This matches the "first add
+   *                 creates the vault" UX the user chose.
+   *   - "both"    : retrieval-only. Query both vaults in parallel, merge
+   *                 results by score, de-dup on (title, path), truncate
+   *                 to the original `limit`. Non-retrieval methods with
+   *                 scope="both" fall back to global (writes need a
+   *                 single target).
+   *   - absent    : defaults come from body/vault.py's per-method
+   *                 signature. If Python ever omits scope entirely, the
+   *                 fallback here is "global" so the old behavior is
+   *                 preserved for legacy callers.
+   *
+   * The scope arg is STRIPPED from args before forwarding to the MCP —
+   * ori-memory's MCP tools don't know about scope, they just know what
+   * vault they're pointed at. We route; they work.
    */
   private async handleVaultCallback(req: { id: number; method: string; args: Record<string, unknown> }): Promise<void> {
     let result: unknown = null;
     try {
-      if (!this.vault?.connected) throw new Error('vault not connected');
-      result = await this.vault.callTool(req.method, req.args);
+      // Extract and strip scope from args — MCP tools don't expect it.
+      const scope = (req.args.scope as string | undefined) ?? 'global';
+      const cleanArgs = { ...req.args };
+      delete cleanArgs.scope;
+
+      result = await this.routeVaultMethod(req.method, cleanArgs, scope);
     } catch (err) {
       result = { success: false, error: (err as Error).message };
+    }
+
+    // Phase 1 projection: strip decoration before the Python proxy sees
+    // it. Stderr byte-count log serves as the one-session validation
+    // signal — if any downstream consumer depended on a stripped field
+    // we'll see it break with this log line still printing. See
+    // projectVaultResult for the list of stripped keys.
+    if (this.trimVaultReturns) {
+      const { projected, bytesStripped } = projectVaultResult(req.method, result);
+      result = projected;
+      if (bytesStripped > 0) {
+        process.stderr.write(`[trim] ${req.method} stripped ${bytesStripped}B\n`);
+      }
     }
 
     // Send response back to Python's stdin
     this.process?.write(JSON.stringify({
       vault_response: { id: req.id, result },
     }));
+  }
+
+  /**
+   * Toggle bridge-side vault response trim (Phase 1 of v0.5). setup.ts
+   * calls this with AriesConfig's signature.trimVaultReturns on bridge
+   * init. Default is true; flip to false if you need raw MCP payloads.
+   */
+  setTrimVaultReturns(enabled: boolean): void {
+    this.trimVaultReturns = enabled;
+  }
+
+  /**
+   * Internal dispatch for vault methods by scope. Kept separate from
+   * handleVaultCallback so the scope logic is unit-testable without the
+   * JSON-RPC plumbing. See handleVaultCallback's header for scope
+   * semantics.
+   */
+  private async routeVaultMethod(
+    method: string,
+    args: Record<string, unknown>,
+    scope: string,
+  ): Promise<unknown> {
+    if (scope === 'global') {
+      if (!this.vault?.connected) throw new Error('vault not connected');
+      return this.vault.callTool(method, args);
+    }
+
+    if (scope === 'project') {
+      // Auto-create path: only on ori_add. Reads against a non-existent
+      // project vault should fail loud ("no project vault to read from")
+      // rather than silently auto-scaffold — we don't want the model
+      // creating empty vaults during exploratory queries.
+      if (!this.projectVault?.connected) {
+        if (method === 'ori_add') {
+          const created = await this.ensureProjectVault();
+          if (!created) {
+            throw new Error(
+              'project vault auto-create failed. Either run `ori init` in this directory manually, or use scope="global".'
+            );
+          }
+        } else {
+          throw new Error(
+            `no project vault at ${this.cwd}. ori_add with scope="project" will create one automatically; for ${method} you need a vault that already exists.`
+          );
+        }
+      }
+      // At this point projectVault is guaranteed connected.
+      return this.projectVault!.callTool(method, args);
+    }
+
+    if (scope === 'both') {
+      // Short-circuit: if there's nothing to federate with, skip the
+      // fan-out. In vault-only mode (cwd == vault) projectVault is
+      // intentionally null, so every scope="both" retrieval would
+      // otherwise run federateRetrieval which does a Promise.all against
+      // a null side and emits federation telemetry for a degenerate
+      // one-vault case. Route directly to the global vault instead.
+      // Correctness-equivalent, noise-free, one less async hop per call.
+      if (!this.projectVault?.connected) {
+        if (!this.vault?.connected) throw new Error('no vaults connected');
+        return this.vault.callTool(method, args);
+      }
+      return this.federateRetrieval(method, args);
+    }
+
+    throw new Error(`unknown vault scope: ${scope}. Valid values: "global", "project", "both".`);
+  }
+
+  /**
+   * Create a project vault at this.cwd and connect it. Called by
+   * routeVaultMethod's auto-init path on first scope="project" ori_add.
+   *
+   * Three-step sequence: scaffold via ori-memory init → instantiate
+   * OriVault pointing at the new path → connect (spawns the MCP). All
+   * three must succeed; any failure leaves this.projectVault null so a
+   * subsequent retry sees a clean slate. We do NOT leave a half-
+   * scaffolded .ori/ directory on connect failure — ori-memory init is
+   * idempotent, so re-running it doesn't duplicate work.
+   */
+  private async ensureProjectVault(): Promise<boolean> {
+    try {
+      const ok = await initVault(this.cwd);
+      if (!ok) return false;
+      const pv = new OriVault(this.cwd);
+      await pv.connect();
+      this.projectVault = pv;
+      return true;
+    } catch (err) {
+      this.opts.onEvent?.({
+        type: 'bridge_error',
+        error: `project vault auto-create exception: ${(err as Error).message}`,
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Fan-out retrieval across both vaults, merge, re-rank, de-dup,
+   * truncate. The default path for scope="both" on any retrieval method.
+   *
+   * Merge strategy (simple, defensible):
+   *   1. Call both vaults with the SAME limit — we want enough headroom
+   *      from each side that the merged top-N has something to pick
+   *      from. This doubles the MCP load per retrieval but remains
+   *      bounded.
+   *   2. Concatenate result arrays. If a vault returned an error
+   *      envelope (success: false), skip its contribution rather than
+   *      fail the whole query — partial results beat no results.
+   *   3. De-dup on (title, path) so a note that happens to exist in
+   *      both vaults only surfaces once, under whichever score is
+   *      higher.
+   *   4. Sort descending by score.
+   *   5. Truncate to the original `limit`.
+   *
+   * Score comparability caveat: each vault computes scores
+   * independently (its own warmth, Q-values, graph signals). Cross-
+   * vault comparisons are approximate. The merged result is "here are
+   * the best candidates from both places" not "globally ranked by a
+   * unified metric." Good enough for first-cut project-layered usage;
+   * proper cross-vault normalization is deferred.
+   */
+  private async federateRetrieval(
+    method: string,
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    // If neither vault is connected, surface an error rather than an
+    // empty success (the model can tell the difference and it matters).
+    if (!this.vault?.connected && !this.projectVault?.connected) {
+      throw new Error('no vaults connected — cannot perform scope="both" retrieval');
+    }
+
+    const limit = typeof args.limit === 'number' ? args.limit : 10;
+
+    // Fire both calls in parallel. Catch per-call so one bad vault
+    // doesn't poison the merged result.
+    const [gRes, pRes] = await Promise.all([
+      this.vault?.connected
+        ? this.vault.callTool(method, args).catch((e: Error) => ({ success: false, error: e.message }))
+        : Promise.resolve(null),
+      this.projectVault?.connected
+        ? this.projectVault.callTool(method, args).catch((e: Error) => ({ success: false, error: e.message }))
+        : Promise.resolve(null),
+    ]);
+
+    // Normalize each side to a results array. MCP payloads come back
+    // as {success, data: {results: [...]}} (envelope) OR {results: [...]}
+    // (already unwrapped). callTool does the JSON.parse but NOT the
+    // envelope unwrap — that's the Python side's _unwrap_data. Here we
+    // handle both shapes so federation works regardless.
+    //
+    // Note on the _vault tag: this used to be merged into each result
+    // dict as `_vault: "global" | "project"` so the model could see which
+    // side a result came from. A10 proved that was a net-negative design
+    // choice — the extra field was shape-surprise bait that caused the
+    // model to probe the return instead of composing. We now collect the
+    // provenance here, log it for bridge-side telemetry (see
+    // federation_trace event below), and STRIP it before the payload
+    // leaves. Same rule for the envelope's _federated / _sources fields:
+    // telemetry-only, never in the model's view. See the vault note
+    // "predictable-apis-over-prose-rails-always" for the principle.
+    const extractResults = (raw: unknown): Array<Record<string, unknown>> => {
+      if (!raw || typeof raw !== 'object') return [];
+      const obj = raw as Record<string, unknown>;
+      if (obj.success === false) return [];
+      const payload = (obj.data ?? obj) as Record<string, unknown>;
+      const arr = payload.results;
+      if (!Array.isArray(arr)) return [];
+      return arr as Array<Record<string, unknown>>;
+    };
+
+    const globalResults = extractResults(gRes);
+    const projectResults = extractResults(pRes);
+
+    // De-dup: same (title, path) from both vaults keeps the higher
+    // score. Uses a Map keyed on the compound identifier. We remember
+    // which side won the tie so provenance logging below is accurate.
+    // The Map value pairs the result with its source vault tag; the
+    // tag is dropped before the payload leaves.
+    type Tagged = { result: Record<string, unknown>; source: 'global' | 'project' };
+    const dedup = new Map<string, Tagged>();
+    const push = (arr: Array<Record<string, unknown>>, source: 'global' | 'project') => {
+      for (const r of arr) {
+        const key = `${r.title ?? ''}|${r.path ?? ''}`;
+        const existing = dedup.get(key);
+        const rScore = typeof r.score === 'number' ? r.score : 0;
+        const eScore = existing && typeof existing.result.score === 'number'
+          ? (existing.result.score as number) : 0;
+        if (!existing || rScore > eScore) {
+          dedup.set(key, { result: r, source });
+        }
+      }
+    };
+    push(globalResults, 'global');
+    push(projectResults, 'project');
+
+    const mergedTagged = Array.from(dedup.values())
+      .sort((a, b) => {
+        const sa = typeof a.result.score === 'number' ? a.result.score : 0;
+        const sb = typeof b.result.score === 'number' ? b.result.score : 0;
+        return sb - sa;
+      })
+      .slice(0, limit);
+
+    // Telemetry BEFORE stripping. Logs federation provenance (counts per
+    // side, which-side-won-dedup per row) so the bridge-side debug trail
+    // captures what used to live on the payload itself. A future refactor
+    // that drops this logging will show up as silence in debug output —
+    // a visible failure mode — rather than telemetry evaporating unseen.
+    // Deliberate: this is the canonical place for federation provenance;
+    // do not re-introduce the `_federated`/`_vault`/`_sources` fields on
+    // the payload just to make inline debugging easier.
+    //
+    // Sink is stderr rather than onEvent because onEvent currently routes
+    // to the TUI's event channel, which renders every message to the user.
+    // Federation trace is informational, not a bridge_error — a user
+    // running `ori` shouldn't see "[repl] bridge_error: federation_trace:
+    // ..." in their TUI on every vault retrieval. Stderr gets captured in
+    // log files / redirects without polluting the interactive surface.
+    // If we later add a proper "bridge_trace" event type with a quiet
+    // default renderer, migrate this write there — but NOT to bridge_error.
+    process.stderr.write(
+      `[federation_trace] method=${method} sources={global:${globalResults.length}, project:${projectResults.length}} returned=${mergedTagged.length} winners=${JSON.stringify(mergedTagged.map(t => ({ title: t.result.title, source: t.source })))}\n`
+    );
+
+    const merged = mergedTagged.map(t => t.result);
+
+    // Shape the return to match single-vault retrieval shape so the
+    // Python side's _unwrap_data is happy AND the model sees the exact
+    // same envelope it sees for scope="global" or scope="project". A10
+    // learning: any decoration that varies between scope variants is
+    // shape-surprise bait. Keep the envelope uniform.
+    return {
+      success: true,
+      data: {
+        results: merged,
+      },
+    };
   }
 
   /**
@@ -1339,6 +1821,16 @@ export class ReplBridge {
     }
     // General event channel — observable via onEvent for logging/tracing.
     this.emit({ type: 'repl_say', text });
+  }
+
+  // Dispatch done(value) commit from the Python body. No specific UI channel
+  // is registered (there's no onDone equivalent to onSay) because done() is
+  // a commitment signal meant for telemetry/loop consumption rather than
+  // user-visible rendering. If a future UI wants to surface "answer
+  // committed" toasts, add an onDone handler alongside onSay.
+  private dispatchDone(payload: { value?: unknown }): void {
+    const value = payload?.value;
+    this.emit({ type: 'repl_done', value });
   }
 
   /**

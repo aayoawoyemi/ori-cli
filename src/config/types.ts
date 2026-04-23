@@ -10,6 +10,31 @@ export interface ExperimentalConfig {
    */
   localChatGPTSubscription: boolean;
 }
+
+// Features — per-batch rollout flags. Each flag gates a coherent behavior
+// change from the 2026-04 build plan (schema-enforced Repl + Ori v0.6.0).
+// Default `false` during rollout; a flag flips to `true` only after its
+// batch's ship thresholds pass (see plan verification gates). One-line
+// revert if a field issue appears. Promoted to the config root (not
+// nested under experimental) so the flags stay visible and ephemeral —
+// they graduate to unconditional behavior once the batch's verification
+// has held for N sessions, then the flag is deleted.
+export interface FeaturesConfig {
+  /** Stream A.7 — per-model maxTokens, stream force-flush, cutoff_warning,
+   *  prompt cut, registry factory collapse. */
+  harnessCleanup: boolean;
+  /** Stream A.8 first half — shape-stable returns, structured errors,
+   *  continuation affordances. */
+  contracts: boolean;
+  /** Stream A.8 second half — chainability (fmt.*), _many batch variants,
+   *  input-repair shims, per-tool promptGuidelines, provider-never-throws. */
+  craft: boolean;
+  /** Stream A.9 layer 4 — gotcha capture + per-turn injection. Orthogonal
+   *  to `transactions` — they're separate risk classes. */
+  gotchas: boolean;
+  /** Stream A.9 layer 5 — transactional rollback on destructive batches. */
+  transactions: boolean;
+}
 export interface ModelConfig {
   provider: 'anthropic' | 'google' | 'openai' | 'openai-compatible' | 'moonshot' | 'deepseek' | 'groq' | 'fireworks' | 'openrouter' | 'ollama' | 'custom';
   model: string;
@@ -31,7 +56,9 @@ export interface RouterConfig {
 
 export interface VaultConfig {
   path?: string;
-  preflight: boolean;
+  // VaultConfig.preflight flag removed 2026-04-21 — the ambient preflight
+  // retrieval path was killed 2026-04-19 (codemode harness pulls memory
+  // on-demand via vault.* in the Repl). Flag had no consumers.
   postflight: boolean;
   reflectionThreshold: number;
 }
@@ -113,19 +140,20 @@ export interface SignatureConfig {
   cachePrefix: boolean;
   /** Whether subagents inherit ambient signatures (default: false). */
   includeInSubagents: boolean;
+  /**
+   * Bridge-side tactical trim of vault MCP return payloads — strips
+   * `signals`, `spaces`, `rrf`/`rrf_base`/`composite`, warmth internals,
+   * and federation markers (`_federated`, `_vault`, `_sources`) before
+   * the response reaches the Python proxy. Added 2026-04-21 as Phase 1
+   * of v0.5; becomes redundant once Ori MCP ships server-side trim in
+   * v0.6.0 (Phase 2). Default `true`. Set `false` to get the raw
+   * unmodified MCP payload — useful if you're debugging rank decisions
+   * or need to inspect signal breakdowns.
+   */
+  trimVaultReturns: boolean;
 }
 
-export interface PreflightConfig {
-  /**
-   * Gate for preflight retrieval injection.
-   * - true: always inject preflight results before model call
-   * - false: never inject
-   * - 'auto': inject only when repl.enabled is false (REPL mode lets the model
-   *   pull memory on-demand via vault.query_*, so ambient injection becomes
-   *   redundant overhead)
-   */
-  enabled: boolean | 'auto';
-}
+// PreflightConfig removed 2026-04-21 — see VaultConfig note above.
 
 export interface ReplConfig {
   /** Whether to spawn the Python body subprocess at session start. 'auto' = enable only for REPL-capable models. */
@@ -182,8 +210,8 @@ export interface AriesConfig {
   hooks: HooksConfig;
   repl: ReplConfig;
   signature: SignatureConfig;
-  preflight: PreflightConfig;
   experimental: ExperimentalConfig;
+  features: FeaturesConfig;
   mcp: { servers: Record<string, { command: string; args?: string[] }> };
 }
 

@@ -25,7 +25,6 @@ export const REFLECTION_THRESHOLD = 150;
  */
 export async function runPostflight(
   messages: Message[],
-  _preflight: unknown,
   _projectBrain: ProjectBrain | null,
   vault: OriVault | null,
   currentImportance: number,

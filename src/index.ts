@@ -24,7 +24,6 @@ import type { AriesConfig } from './config/types.js';
 import { assembleWarmContext } from './memory/warmContext.js';
 import { setupReplBridge, type ReplHandle } from './repl/setup.js';
 import { registerReplTool } from './tools/registry.js';
-import { resolvePreflightEnabled } from './memory/preflight.js';
 import { checkForUpdate, getLocalVersion } from './update/check.js';
 import { printUpdateNotification } from './update/notify.js';
 import type { UpdateResult } from './update/check.js';
@@ -71,6 +70,20 @@ function isProjectDirectory(dir: string): boolean {
   // can trick the marker check, and indexing ~/ is always catastrophic.
   if (resolved === resolve(home)) return false;
   return PROJECT_MARKERS.some(marker => existsSync(join(dir, marker)));
+}
+
+// Indexing eligibility — stricter than isProjectDirectory because it ALSO
+// rejects the collision case where cwd IS the vault. A vault with .git
+// (all Ori vaults have it) passes isProjectDirectory but is exactly the
+// case A10 caught: indexing ~/brain treats 952 markdown notes as source
+// code and makes codebase.search return noise for every Python lookup.
+// The rule is: cwd looks like a project AND cwd is not the vault. If
+// you're reaching for a third callsite that needs this same check, use
+// this helper — do NOT re-inline the collision compare.
+function shouldIndexCodebase(cwd: string, vaultPath: string | undefined): boolean {
+  if (!isProjectDirectory(cwd)) return false;
+  if (vaultPath && resolve(cwd) === resolve(vaultPath)) return false;
+  return true;
 }
 
 // ── rlm provider resolution ──────────────────────────────────────────────
@@ -145,9 +158,14 @@ async function compileAmbientSignatures(
 ): Promise<AmbientSignatures> {
   const out: AmbientSignatures = {};
 
-  // Skip codebase indexing if cwd isn't a project directory
-  if (!isProjectDirectory(options.cwd)) {
-    options.log?.('codebase signature: skipped (no project detected)');
+  // Skip codebase indexing if cwd isn't a project directory OR cwd IS the
+  // vault (vault-only mode). See shouldIndexCodebase comment for the A10
+  // reason this gate exists.
+  if (!shouldIndexCodebase(options.cwd, options.vaultPath)) {
+    const reason = !isProjectDirectory(options.cwd)
+      ? 'no project detected'
+      : 'cwd is the vault (vault-only mode)';
+    options.log?.(`codebase signature: skipped (${reason})`);
   } else try {
     const idxResult = await replHandle.bridge.index({ repoPath: options.cwd });
     if (idxResult.ok) {
@@ -398,7 +416,11 @@ if (isSubagent) {
 
   let subCodebaseSignatureMd: string | undefined;
   let subVaultSignatureMd: string | undefined;
-  const isProject = isProjectDirectory(cwd);
+  // Use shouldIndexCodebase so the subagent's mini-bridge respects the same
+  // vault-only collision rule as the main bridge. Without this, a subagent
+  // launched while cwd == vault would re-trigger markdown-as-code indexing
+  // on every fork.
+  const isProject = shouldIndexCodebase(cwd, vaultPath ?? undefined);
 
   if (config.signature.includeInSubagents && replEnabled) {
     let subRepl: ReplHandle | null = null;
@@ -413,6 +435,7 @@ if (isSubagent) {
         rlmModel: rlm.rlmModel,
         vault,
         shouldIndex: isProject,
+        trimVaultReturns: config.signature.trimVaultReturns,
       });
       if (subRepl) {
         const sigs = await compileAmbientSignatures(subRepl, {
@@ -460,7 +483,6 @@ if (isSubagent) {
     hooks: config.hooks,
     permissionMode: readOnlyMode ? ('plan' as const) : ('accept' as const),
     maxTurns,
-    preflightEnabled: resolvePreflightEnabled(config.preflight, replEnabled),
   })) {
     if (event.type === 'text') finalText += event.content;
     if (event.type === 'error') {
@@ -522,12 +544,25 @@ async function main(): Promise<void> {
   ];
 
   const cliVersion = `v${getLocalVersion()}`;
+  // Splash labels — explicit `project:` and `vault:` prefixes. The old
+  // version rendered the vault as `~/brain` (path-last-segment glued to
+  // `~/`), which visually read as "current directory" — so a user who
+  // launched `ori` from aries-cli saw the splash say `~/brain` and
+  // concluded they were accidentally in brain. They weren't — cwd was
+  // aries-cli all along, the label was just lying about what it represents.
+  // Fix: show both project AND vault, always labeled, using basenames so
+  // the line stays short. For truly ambiguous cases (vault or project
+  // whose basename collides with another path), the explicit prefix makes
+  // it unambiguous.
+  const projectBasename = cwd.split(/[/\\]/).pop() ?? cwd;
+  const projectLabel = `project: ${projectBasename}`;
   const vaultLabel = vault?.connected
-    ? `~/${vault.vaultPath?.split(/[/\\]/).pop() ?? 'brain'}`
+    ? `vault: ${vault.vaultPath?.split(/[/\\]/).pop() ?? 'brain'}`
     : '';
   const infoParts = [
     cliVersion,
     agentLabel !== 'Ori' ? agentLabel : null,
+    projectLabel,
     vaultLabel || null,
   ].filter(Boolean) as string[];
   const infoLine = chalk.dim(infoParts.join('  ·  '));
@@ -589,7 +624,6 @@ async function main(): Promise<void> {
         : config.permissions.mode === 'manual' ? 'default' as const
           : 'default' as const,
       replHandle: null, // will be set async
-      preflightEnabled: resolvePreflightEnabled(config.preflight, replEnabled),
       resumedMessages,
       initialResumePicker: resumeArg === '',
       experimental: config.experimental,
@@ -618,7 +652,8 @@ async function main(): Promise<void> {
           rlmModel: rlm.rlmModel,
           vault,
           router,
-          shouldIndex: isProjectDirectory(cwd),
+          shouldIndex: shouldIndexCodebase(cwd, vaultPath ?? undefined),
+          trimVaultReturns: config.signature.trimVaultReturns,
           onEvent: (e) => {
             if (e.type === 'bridge_restart') {
               console.error(chalk.yellow(`  [repl] bridge_restart: ${e.reason} (attempt ${e.attempt})`));

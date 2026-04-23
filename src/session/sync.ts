@@ -23,7 +23,7 @@ export async function syncSession(
   if (messages.length < 2) return;
 
   // 1. Final postflight
-  await runPostflight(messages, null, projectBrain, vault, importanceAccumulator);
+  await runPostflight(messages, projectBrain, vault, importanceAccumulator);
 
   // 2. Always reflect at session end — no threshold gate.
   // Every session gets a synthesis moment. The agent identified this gap:

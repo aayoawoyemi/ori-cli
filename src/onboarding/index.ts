@@ -114,7 +114,6 @@ agent:
 
 vault:
   path: ${vaultPath}
-  preflight: true
   postflight: true
 `;
 

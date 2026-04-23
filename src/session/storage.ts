@@ -12,6 +12,24 @@ export type SessionEntry =
   | { type: 'tool_call'; id: string; name: string; input: Record<string, unknown>; timestamp: number }
   | { type: 'tool_result'; id: string; name: string; output: string; isError: boolean; timestamp: number }
   | { type: 'code_execution'; code: string; stdout: string; stderr: string; exception: string | null; duration_ms: number; rejected: { reason: string } | null; timed_out: boolean; rlm_stats?: { call_count: number; total_tokens: number }; timestamp: number }
+  // Shape telemetry per Repl exec. Added 2026-04-22 for the schema-enforced
+  // Repl composition experiment — metrics measure whether the model is
+  // composing real multi-step work or filling minItems with trivial ops.
+  // Correlates with tool_call/tool_result via tool_use_id. See body/shape.py
+  // for the source metrics and the plan-file risk register for the
+  // hypothesis being measured.
+  | { type: 'repl_shape'; tool_use_id: string; stmt_count: number; distinct_primitive_count: number; total_primitive_call_count: number; has_for_or_while: boolean; has_if: boolean; has_def: boolean; has_try: boolean; has_comprehension: boolean; is_micro_repl: boolean; is_composed: boolean; primitives_called: string[]; parse_error?: string; timestamp: number }
+  // End-of-turn aggregate. Added 2026-04-22 alongside repl_shape. Captures
+  // per-turn counts: Repl-call count, whether any call this turn was
+  // composed / micro, whether done() fired. This is the turn-level signal
+  // the composition experiment reports against — a session with high
+  // any_composed and high committed is the target behavior.
+  | { type: 'turn_metrics'; turn_index: number; repl_calls: number; any_composed: boolean; any_micro: boolean; committed: boolean; timestamp: number }
+  // Fires when the model called done(value) during a Repl exec. The value
+  // is stored raw (no truncation) so post-hoc analysis can inspect what
+  // frontier models actually commit. If values grow unbounded in practice,
+  // add a serialized-size cap here — until then, raw is more useful.
+  | { type: 'done_committed'; tool_use_id: string; value: unknown; timestamp: number }
   | { type: 'preflight'; projectNotes: string[]; vaultNotes: string[]; timestamp: number }
   | { type: 'postflight'; importance: number; reflected: boolean; timestamp: number }
   | { type: 'compact_boundary'; summary: string; insightsSaved: number; pruneOnly: boolean; timestamp: number }

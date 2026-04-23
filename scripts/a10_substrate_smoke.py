@@ -1,0 +1,700 @@
+"""
+A10 substrate smoke — verifies the Python body boots clean, the JSON-RPC
+protocol speaks, and the Repl namespace has every primitive bound.
+
+Runs body/server.py as a subprocess. Sends `ping`, then `exec` calls that
+exercise ONLY paths that don't need the TS bridge (local fs.read / fs.listdir /
+fs.glob, pure Python, namespace introspection). Bridged primitives (fs.write,
+shell.run, web.*, vault.*, codebase.*, research.*, say, ask) cannot be tested
+here — they block on callbacks the TS host provides. Those must be exercised
+in the live aries-cli session.
+
+What this catches:
+  - body doesn't start (import error in any primitive module)
+  - JSON protocol regression
+  - Namespace missing an expected name
+  - Security AST pre-pass blocking something it shouldn't
+  - Local fs read path broken
+
+What this does NOT catch:
+  - Any callback primitive (the bridge is the TS harness)
+  - Model composition behavior (that's the live-session half of A10)
+"""
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+BODY = ROOT / "body" / "server.py"
+
+# Eager primitives bind at body startup — must be present in every standalone
+# run. Absence here means the build is broken, not that the bridge hasn't
+# connected yet.
+EAGER_NAMES = {
+    "fs", "shell", "web",   # bridged primitives (objects bound, not lazy)
+    "say", "ask",           # bare user-I/O callables
+    "done",                 # commitment primitive (v0.5 Phase 3 / 2026-04-22)
+    "json", "reindex",      # pre-bound stdlib + reindex helper
+    "os",                   # os.path stub — kills `import os` reflex
+    "help",                 # native introspection — A7 banner promises it
+    "codebase",             # Fix B — stub pre-binds; becomes real graph post-index
+}
+
+# Lazy primitives require TS-side bridge messages (connect_vault, index,
+# configure_rlm, connect_research) before they land in the namespace. Absent
+# in standalone smoke runs by design — we just record that they're expected
+# but unbound in this context so the test doesn't false-fail.
+LAZY_NAMES = {
+    "vault", "research",
+    "rlm_call", "rlm_batch",
+}
+
+
+def send(proc, obj):
+    line = json.dumps(obj) + "\n"
+    proc.stdin.write(line.encode())
+    proc.stdin.flush()
+
+
+def recv(proc, timeout=10.0):
+    """Read one JSON line from stdout, skipping `say` sentinels and
+    erroring on bridge callbacks we'd normally answer from the TS side.
+
+    `say` sentinels are fire-and-forget — the body emits the
+    {"say": {...}} envelope on sys.__stdout__ as part of the UI-streaming
+    path, but doesn't block waiting for a response. Smoke tests should
+    skip past them and keep reading for the actual exec result. The A.6.2
+    dual-write means `say()` inside exec emits one sentinel on the bridge
+    channel AND echoes the text into the captured sys.stdout buffer
+    (returned as result.stdout); we want the latter visible to the probe,
+    and the former is noise the loop needs to step over.
+
+    Genuinely bridged requests (vault_request, fs_request, etc.) DO block
+    waiting for a TS response — if a smoke probe invokes one by accident,
+    the body hangs forever, so we surface them as `_bridge_leak` for the
+    probe to fail fast on."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        line = proc.stdout.readline()
+        if not line:
+            time.sleep(0.05)
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if any(k in obj for k in ("vault_request", "fs_request", "shell_request",
+                                  "web_request", "research_request", "ask_request")):
+            # Genuine bridge callback — body will block forever waiting
+            # for a response we can't send. Fail the probe immediately.
+            return {"_bridge_leak": obj}
+        if "say" in obj:
+            # A.6.2 dual-write: say() emits this sentinel on the bridge
+            # channel (UI streaming) AND echoes into the captured stdout
+            # (result.stdout). Smoke test only cares about the latter; skip.
+            continue
+        return obj
+    return {"_timeout": True}
+
+
+def exec_code(proc, code):
+    send(proc, {"op": "exec", "code": code, "timeout_ms": 5000})
+    return recv(proc)
+
+
+def assert_ok(label, result):
+    if result.get("_timeout"):
+        print(f"  FAIL {label}: timeout")
+        return False
+    if result.get("_bridge_leak"):
+        print(f"  FAIL {label}: unexpected bridge callback {result['_bridge_leak']}")
+        return False
+    if result.get("rejected"):
+        print(f"  FAIL {label}: AST rejected — {result['rejected']}")
+        return False
+    if result.get("exception"):
+        print(f"  FAIL {label}: exception\n{result['exception']}")
+        return False
+    if result.get("timed_out"):
+        print(f"  FAIL {label}: timed_out")
+        return False
+    print(f"  OK   {label}")
+    if result.get("stdout"):
+        for line in result["stdout"].rstrip().splitlines():
+            print(f"       | {line}")
+    return True
+
+
+def main():
+    print(f"Spawning body: {BODY}")
+    proc = subprocess.Popen(
+        [sys.executable, "-u", str(BODY)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=str(ROOT),
+    )
+    try:
+        # 1. Protocol alive
+        send(proc, {"op": "ping"})
+        r = recv(proc, timeout=15.0)
+        if not r.get("pong"):
+            print(f"FAIL ping: {r}")
+            print("stderr:", proc.stderr.read(4096).decode(errors="replace"))
+            return 1
+        print("OK   ping")
+
+        passed = 0
+        total = 0
+
+        # 2. Namespace completeness — probe each name individually.
+        # dir()/globals()/vars() are not in the safe builtins (by design), so
+        # we can't enumerate; instead reference each name and catch NameError.
+        # Split eager (must-be-present) from lazy (bridge-dependent, expected
+        # absent in standalone). Only eager misses are failures.
+        total += 1
+        all_probes = sorted(EAGER_NAMES | LAZY_NAMES)
+        probes = "\n".join(
+            f"try:\n  {n}\n  print('ok:{n}')\nexcept NameError:\n  print('missing:{n}')\n"
+            for n in all_probes
+        )
+        r = exec_code(proc, probes)
+        if assert_ok("namespace completeness", r):
+            missing = {
+                line.split(":", 1)[1]
+                for line in (r.get("stdout") or "").splitlines()
+                if line.startswith("missing:")
+            }
+            eager_missing = missing & EAGER_NAMES
+            lazy_missing = missing & LAZY_NAMES
+            if not eager_missing:
+                passed += 1
+                if lazy_missing:
+                    print(f"       (lazy unbound in standalone, expected: {sorted(lazy_missing)})")
+            else:
+                print(f"       EAGER MISSING (bug): {sorted(eager_missing)}")
+
+        # 3. Pure python still works (persistent state across calls)
+        total += 1
+        r = exec_code(proc, "x = 42\nprint('set x')")
+        a = assert_ok("set variable", r)
+        total += 1
+        r = exec_code(proc, "print('x is', x)")
+        b = assert_ok("recall variable across calls", r)
+        if a and b and "42" in (r.get("stdout") or ""):
+            passed += 2
+
+        # 4. Local fs.read — no bridge
+        total += 1
+        r = exec_code(
+            proc,
+            "data = fs.read('package.json')\n"
+            "print('len:', len(data))\n"
+            "print('first:', data[:40])\n",
+        )
+        if assert_ok("fs.read package.json", r):
+            passed += 1
+
+        # 5. Local fs.listdir
+        total += 1
+        r = exec_code(proc, "names = fs.listdir('body')\nprint('count:', len(names))")
+        if assert_ok("fs.listdir body/", r):
+            passed += 1
+
+        # 6. Local fs.glob
+        total += 1
+        r = exec_code(proc, "hits = fs.glob('body/*.py')\nprint('py files:', len(hits))")
+        if assert_ok("fs.glob body/*.py", r):
+            passed += 1
+
+        # 7. Docstring introspection — the banner tells the model `help(name)`
+        # works, but `help` is not in safe_builtins. Verify the claim OR flag
+        # the bug. We try the advertised path first.
+        total += 1
+        r = exec_code(proc, "print(repr(fs.__doc__)[:120] if fs.__doc__ else 'no docstring')")
+        if assert_ok("fs.__doc__ (docstring access)", r):
+            passed += 1
+        total += 1
+        send(proc, {"op": "exec", "code": "help(fs)", "timeout_ms": 5000})
+        r = recv(proc)
+        if r.get("exception") and "help" in r.get("exception", ""):
+            print("  NOTE help(name) is NOT bound — banner advertises it but it raises NameError")
+            print("       banner in server.py line 312 needs fix OR help needs to be added to safe_builtins")
+        else:
+            print("  OK   help(fs) works as banner claims")
+            passed += 1
+
+        # 8. Security AST pre-pass still blocks dangerous code
+        total += 1
+        send(proc, {"op": "exec", "code": "import os\nos.system('echo hi')", "timeout_ms": 5000})
+        r = recv(proc)
+        if r.get("rejected"):
+            print(f"  OK   security blocks os.system: {r['rejected']['reason']}")
+            passed += 1
+        else:
+            print(f"  FAIL security should have rejected os.system: {r}")
+
+        # 9. os.path binding is usable and scoped. Checks that os.path.join
+        # works (the composition push's #1 target — model's import-os reflex)
+        # AND that os.system is NOT reachable (we bound only .path, not the
+        # full module). Both must hold for the binding to be a safe replace.
+        total += 1
+        r = exec_code(
+            proc,
+            "joined = os.path.join('a', 'b', 'c.md')\n"
+            "print('join:', joined)\n"
+            "print('has_system:', hasattr(os, 'system'))\n"
+            "print('has_environ:', hasattr(os, 'environ'))\n",
+        )
+        stdout = r.get("stdout") or ""
+        if ("join:" in stdout and "has_system: False" in stdout
+                and "has_environ: False" in stdout):
+            print("  OK   os.path bound; os.system / os.environ not reachable")
+            passed += 1
+        else:
+            print(f"  FAIL os.path binding incorrect:\n{stdout}")
+
+        # 10. Codebase stub returns teaching error pre-index (Fix B). Before
+        # configure sets ENV_MODE, the stub's _MSG_BUILDING branch should
+        # fire — teaches the model to retry or fall back. This probe runs
+        # BEFORE the configure op below so we catch the default (no-mode)
+        # case where the stub must still return a usable error.
+        total += 1
+        r = exec_code(
+            proc,
+            "result = codebase.search('anything')\n"
+            "print('got_error:', 'error' in result)\n"
+            "print('mentions_retry:', 'retry' in result.get('error', '').lower() or 'fall back' in result.get('error', '').lower())\n",
+        )
+        stdout = r.get("stdout") or ""
+        if "got_error: True" in stdout and "mentions_retry: True" in stdout:
+            print("  OK   codebase stub returns teaching error with retry/fallback hint")
+            passed += 1
+        else:
+            print(f"  FAIL codebase stub didn't teach correctly:\n{stdout}")
+
+        # 11. Configure op populates banner env lines (Fix 1A). Reset first
+        # so _exec_count goes back to 0 and the next exec re-emits the
+        # banner; then send configure; then exec and grep for the env
+        # lines. Confirms end-to-end that TS's configure op reaches the
+        # banner formatter.
+        total += 1
+        send(proc, {"op": "reset"})
+        recv(proc)  # discard reset response
+        send(proc, {
+            "op": "configure",
+            "project": "/tmp/smoke-project",
+            "vault_global": "/tmp/smoke-brain",
+            "vault_project": None,
+            "mode": "project+vault",
+            "shell": "/bin/sh",
+        })
+        recv(proc)  # discard configure response
+        r = exec_code(proc, "print('post-configure')")
+        stdout = r.get("stdout") or ""
+        required_lines = [
+            "Project: /tmp/smoke-project",
+            "Vault (global): /tmp/smoke-brain",
+            "Mode: project+vault",
+            "Shell: /bin/sh",
+        ]
+        missing_lines = [ln for ln in required_lines if ln not in stdout]
+        if not missing_lines:
+            print("  OK   configure op populates banner env lines")
+            passed += 1
+        else:
+            print(f"  FAIL banner missing env lines after configure: {missing_lines}")
+            print(f"       banner stdout was:\n{stdout}")
+
+        # 12. Vault traversal verbs exist on the Vault class (v0.5 Phase 1).
+        # Can't INVOKE them in standalone smoke (vault is lazy — bound only
+        # after the TS bridge sends connect_vault). But we can import the
+        # Vault class directly and assert the methods are defined with the
+        # expected parameters. Catches the most common regression: a refactor
+        # or merge silently drops one of the new methods.
+        total += 1
+        check_script = (
+            "import sys, inspect\n"
+            f"sys.path.insert(0, r'{ROOT}')\n"
+            "from body.vault import Vault\n"
+            "required = {\n"
+            "    'top': ['self', 'query', 'n', 'scope'],\n"
+            "    'explore': ['self', 'query', 'depth', 'limit', 'recursive', 'include_content', 'scope'],\n"
+            "    'neighbors': ['self', 'title'],\n"
+            "    'backlinks': ['self', 'title'],\n"
+            "    'meta': ['self', 'title'],\n"
+            "}\n"
+            "for name, expected_params in required.items():\n"
+            "    m = getattr(Vault, name, None)\n"
+            "    if m is None:\n"
+            "        print(f'MISSING:{name}'); continue\n"
+            "    actual = list(inspect.signature(m).parameters.keys())\n"
+            "    if all(p in actual for p in expected_params):\n"
+            "        print(f'OK:{name}')\n"
+            "    else:\n"
+            "        print(f'BADSIG:{name}:want={expected_params}:got={actual}')\n"
+        )
+        check_result = subprocess.run(
+            [sys.executable, "-c", check_script],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        check_out = check_result.stdout
+        expected_verbs = ["top", "explore", "neighbors", "backlinks", "meta"]
+        if all(f"OK:{v}" in check_out for v in expected_verbs):
+            print("  OK   vault class exposes top/explore/neighbors/backlinks/meta with expected signatures")
+            passed += 1
+        else:
+            print(f"  FAIL vault verb signature check:\n{check_out}")
+
+        # 13. Bridge trim projection strips decoration without losing envelope.
+        # Imports the compiled projectVaultResult from dist/repl/bridge.js via
+        # node and runs it against a mock ori_query_ranked payload. Requires
+        # `npm run build` to have been run (dist/ present); skipped with a
+        # note if the build isn't up to date.
+        total += 1
+        bridge_js = ROOT / "dist" / "repl" / "bridge.js"
+        if not bridge_js.is_file():
+            print("  SKIP bridge trim — dist/repl/bridge.js not present (run npm run build to enable this probe)")
+            total -= 1  # skipped probes don't count against pass-total
+        else:
+            # Build a payload that's representative of what ori-memory MCP
+            # returns today: envelope with warmth internals + per-result
+            # signals/spaces/federation markers. After projection, only the
+            # core {title, path, score} (plus any non-stripped fields) should
+            # remain per result; warmth.{candidates,promoted,demoted} + all
+            # federation markers should be gone envelope-wide.
+            node_script = (
+                "import('./dist/repl/bridge.js').then(({ projectVaultResult }) => {\n"
+                "  const payload = {\n"
+                "    success: true,\n"
+                "    data: {\n"
+                "      results: [\n"
+                "        { title: 'codemode paradigm', path: 'notes/cm.md', score: 0.9,\n"
+                "          signals: { composite: 0.8, rrf: 0.002, rrf_base: 0.002 },\n"
+                "          spaces: { text: 0.5, temporal: 0.9 },\n"
+                "          _vault: 'global' },\n"
+                "      ],\n"
+                "      warmth: { enabled: true, weight: 0.3, candidates: 5,\n"
+                "                promoted: [{ title: 'x' }], demoted: [{ title: 'y' }] },\n"
+                "      _federated: true,\n"
+                "      _sources: { global: 1, project: 0 },\n"
+                "    },\n"
+                "  };\n"
+                "  const { projected, bytesStripped } = projectVaultResult('ori_query_ranked', payload);\n"
+                "  const r0 = projected.data.results[0];\n"
+                "  const bad = [];\n"
+                "  for (const k of ['signals', 'spaces', 'rrf', 'rrf_base', 'composite', '_vault']) {\n"
+                "    if (k in r0) bad.push('result.' + k);\n"
+                "  }\n"
+                "  for (const k of ['_federated', '_sources']) {\n"
+                "    if (k in projected.data) bad.push('data.' + k);\n"
+                "  }\n"
+                "  for (const k of ['candidates', 'promoted', 'demoted']) {\n"
+                "    if (k in projected.data.warmth) bad.push('warmth.' + k);\n"
+                "  }\n"
+                "  if (bad.length === 0 && bytesStripped > 0) console.log('TRIM_OK bytes=' + bytesStripped);\n"
+                "  else console.log('TRIM_FAIL leaked=' + bad.join(',') + ' stripped=' + bytesStripped);\n"
+                "}).catch(e => { console.log('TRIM_ERROR ' + e.message); });\n"
+            )
+            node_result = subprocess.run(
+                ["node", "--input-type=module", "-e", node_script],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            node_out = node_result.stdout.strip()
+            if node_out.startswith("TRIM_OK"):
+                print(f"  OK   bridge trim strips signals/spaces/warmth-internals/federation ({node_out})")
+                passed += 1
+            else:
+                print(f"  FAIL bridge trim: {node_out}")
+                if node_result.stderr:
+                    print(f"       stderr: {node_result.stderr.strip()[:400]}")
+
+        # 14. done() primitive is callable and signals correctly. Can't test
+        # the full sentinel path in standalone smoke (that needs the TS bridge
+        # to observe the stdout marker), but we can confirm the binding
+        # exists and is callable. Actual bridge sentinel reception is
+        # exercised in live aries-cli sessions where app.tsx routes repl_done
+        # events.
+        total += 1
+        r = exec_code(
+            proc,
+            "print('callable:', callable(done))\n"
+            "print('name:', done.__name__ if hasattr(done, '__name__') else 'unnamed')\n",
+        )
+        stdout = r.get("stdout") or ""
+        if "callable: True" in stdout:
+            print("  OK   done() primitive is callable")
+            passed += 1
+        else:
+            print(f"  FAIL done() primitive:\n{stdout}")
+
+        # 15. shape field is attached to exec result envelope. analyze_shape
+        # runs unconditionally in _run_exec — every exec result should carry
+        # a `shape` dict with at least stmt_count and is_composed. This is
+        # the per-call telemetry field the TS side logs as `repl_shape`.
+        total += 1
+        r = exec_code(proc, "z = 1\nprint('hi')")  # simple 2-stmt code
+        shape = r.get("shape")
+        expected_shape_keys = {
+            "stmt_count", "line_count", "char_count",
+            "primitives_called", "distinct_primitive_count",
+            "total_primitive_call_count",
+            "has_for_or_while", "has_if", "has_def", "has_try",
+            "has_comprehension", "is_micro_repl", "is_composed",
+        }
+        if isinstance(shape, dict) and expected_shape_keys.issubset(shape.keys()):
+            print(f"  OK   exec result carries shape telemetry (stmt_count={shape['stmt_count']}, composed={shape['is_composed']})")
+            passed += 1
+        else:
+            print(f"  FAIL shape field missing or incomplete: keys={list(shape.keys()) if isinstance(shape, dict) else 'not a dict'}")
+
+        # 16. analyze_shape correctly classifies composed vs micro_repl code.
+        # Import analyze_shape directly and feed it two contrived samples —
+        # one micro (single statement, single primitive), one composed
+        # (multi-statement, multi-primitive, control flow). If the heuristic
+        # is broken, the telemetry metric is lying about composition.
+        total += 1
+        shape_script = (
+            "import sys\n"
+            f"sys.path.insert(0, r'{ROOT / 'body'}')\n"
+            "from shape import analyze_shape\n"
+            "micro = analyze_shape('x = fs.read(\"foo\")')\n"
+            "composed = analyze_shape('hits = vault.top(\"auth\")\\nfor h in hits:\\n    print(h)\\nsay(\"done\")')\n"
+            "print('micro_is_composed:', micro['is_composed'])\n"
+            "print('micro_is_micro:', micro['is_micro_repl'])\n"
+            "print('composed_is_composed:', composed['is_composed'])\n"
+            "print('composed_is_micro:', composed['is_micro_repl'])\n"
+        )
+        shape_result = subprocess.run(
+            [sys.executable, "-c", shape_script],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        shape_out = shape_result.stdout
+        if ("micro_is_composed: False" in shape_out
+                and "micro_is_micro: True" in shape_out
+                and "composed_is_composed: True" in shape_out
+                and "composed_is_micro: False" in shape_out):
+            print("  OK   analyze_shape classifies micro vs composed correctly")
+            passed += 1
+        else:
+            print(f"  FAIL analyze_shape classification:\n{shape_out}")
+            if shape_result.stderr:
+                print(f"       stderr: {shape_result.stderr.strip()[:400]}")
+
+        # 17. A.6.1 path injection — Vault._inject_paths augments every
+        # retrieval entry with a `path` key, resolved via _resolve_path
+        # from the title's slug. Testable in standalone because the helper
+        # is pure python (no bridge call) — we instantiate Vault with a
+        # temp vault dir, drop a fixture file matching the slug, and call
+        # _inject_paths on a mock result. Pre-fix: ScoredNote envelopes
+        # carried no `path` and every docstring-taught h['path'] access
+        # was a KeyError. Post-fix: `path` present on every entry, None
+        # when the title doesn't resolve to a real file on disk.
+        total += 1
+        inject_script = (
+            "import sys, os, tempfile\n"
+            f"sys.path.insert(0, r'{ROOT / 'body'}')\n"
+            "from vault import Vault\n"
+            "with tempfile.TemporaryDirectory() as d:\n"
+            "    notes = os.path.join(d, 'notes')\n"
+            "    os.makedirs(notes, exist_ok=True)\n"
+            "    with open(os.path.join(notes, 'codemode-paradigm.md'), 'w') as f:\n"
+            "        f.write('stub')\n"
+            "    v = Vault(d)\n"
+            "    mock = {'results': [\n"
+            "        {'title': 'codemode paradigm', 'score': 0.9},\n"
+            "        {'title': 'does-not-exist-xyz', 'score': 0.3},\n"
+            "    ]}\n"
+            "    out = v._inject_paths(mock)\n"
+            "    print('has_path_0:', 'path' in out['results'][0])\n"
+            "    print('path_0_resolved:', out['results'][0]['path'])\n"
+            "    print('has_path_1:', 'path' in out['results'][1])\n"
+            "    print('path_1_none:', out['results'][1]['path'] is None)\n"
+            "    # Idempotence — re-apply, path stays, not re-resolved\n"
+            "    preset = {'results': [{'title': 'x', 'path': 'explicit/path.md'}]}\n"
+            "    again = v._inject_paths(preset)\n"
+            "    print('idempotent:', again['results'][0]['path'] == 'explicit/path.md')\n"
+        )
+        inject_result = subprocess.run(
+            [sys.executable, "-c", inject_script],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        inject_out = inject_result.stdout
+        if ("has_path_0: True" in inject_out
+                and "path_0_resolved: notes" in inject_out
+                and "has_path_1: True" in inject_out
+                and "path_1_none: True" in inject_out
+                and "idempotent: True" in inject_out):
+            print("  OK   Vault._inject_paths resolves real files, returns None for dangling, idempotent")
+            passed += 1
+        else:
+            print(f"  FAIL Vault._inject_paths:\n{inject_out}")
+            if inject_result.stderr:
+                print(f"       stderr: {inject_result.stderr.strip()[:400]}")
+
+        # 18. A.6.2 say() dual-write — say(text) writes to sys.__stdout__
+        # (bridge-protocol sentinel for UI streaming) AND echoes to
+        # sys.stdout (captured buffer during exec, becomes result.stdout).
+        # Before the echo, the model's own say() prints were invisible in
+        # its own tool_result and it couldn't self-debug. Probe: invoke
+        # say('HELLO_MARKER_A62') inside exec; assert result.stdout
+        # contains the marker. recv() was patched above to skip past the
+        # bridge-channel {"say": ...} sentinel this call emits.
+        total += 1
+        r = exec_code(proc, "say('HELLO_MARKER_A62')\nprint('post-say-sentinel')")
+        stdout = r.get("stdout") or ""
+        if "HELLO_MARKER_A62" in stdout and "post-say-sentinel" in stdout:
+            print("  OK   say() dual-write lands in result.stdout (model-visible)")
+            passed += 1
+        else:
+            print(f"  FAIL say() dual-write missing marker in stdout:\n{stdout}")
+
+        # 19. A.6.3 _format_not_found embeds fuzzy suggestions — get_note
+        # on a missing title now raises VaultError whose message carries
+        # up to 3 candidate titles + scores inline. Model can parse and
+        # retry in the same batch via try/except instead of losing a turn.
+        # Test the formatter directly since it's pure-python: stub self.top
+        # to return a mock, call _format_not_found, check message shape.
+        total += 1
+        fmt_script = (
+            "import sys\n"
+            f"sys.path.insert(0, r'{ROOT / 'body'}')\n"
+            "from vault import Vault\n"
+            "v = Vault('/tmp/fake_vault_a63')\n"
+            "# Disconnected fallback — top() raises because _require() fails,\n"
+            "# caught internally, returns base message with no suggestions.\n"
+            "base = v._format_not_found('zyxwvu_does_not_exist_23984')\n"
+            "print('base_has_prefix:', base.startswith(\"note not found: 'zyxwvu_does_not_exist_23984'\"))\n"
+            "print('base_no_didyoumean:', 'Did you mean' not in base)\n"
+            "# Stub top() with a mock so the suggestion path fires.\n"
+            "v.top = lambda q, n=5: {'results': [\n"
+            "    {'title': 'codemode-primitive-set', 'score': 0.89},\n"
+            "    {'title': 'codemode-sandbox', 'score': 0.77},\n"
+            "    {'title': 'codemode-agilis', 'score': 0.72},\n"
+            "    {'title': 'extra-4', 'score': 0.55},\n"
+            "]}\n"
+            "msg = v._format_not_found('codemode paradigm')\n"
+            "print('msg_has_didyoumean:', 'Did you mean:' in msg)\n"
+            "print('msg_has_prim_set:', 'codemode-primitive-set' in msg)\n"
+            "print('msg_has_score_089:', '(score 0.89)' in msg)\n"
+            "print('msg_capped_at_3:', msg.count(' - ') == 3)\n"
+        )
+        fmt_result = subprocess.run(
+            [sys.executable, "-c", fmt_script],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        fmt_out = fmt_result.stdout
+        if ("base_has_prefix: True" in fmt_out
+                and "base_no_didyoumean: True" in fmt_out
+                and "msg_has_didyoumean: True" in fmt_out
+                and "msg_has_prim_set: True" in fmt_out
+                and "msg_has_score_089: True" in fmt_out
+                and "msg_capped_at_3: True" in fmt_out):
+            print("  OK   Vault._format_not_found embeds suggestions (top 3, with scores)")
+            passed += 1
+        else:
+            print(f"  FAIL Vault._format_not_found:\n{fmt_out}")
+            if fmt_result.stderr:
+                print(f"       stderr: {fmt_result.stderr.strip()[:400]}")
+
+        # 20. A.6.4 pre-bound pure-function stdlib modules — re / datetime
+        # / random / statistics / collections / itertools / math are bound
+        # in the Repl namespace so `import re` reflex doesn't cost a turn.
+        # Probe: call one method per module and verify output. Also verify
+        # the `import re` guard still fires (pre-binding is a namespace
+        # add, not a guard relaxation).
+        total += 1
+        r = exec_code(
+            proc,
+            "print('re:', re.search(r'\\d+', 'abc123').group())\n"
+            "print('datetime_ok:', bool(datetime.date.today().isoformat()))\n"
+            "print('stats:', statistics.mean([1, 2, 3]))\n"
+            "print('counter:', collections.Counter('aab').most_common(1))\n"
+            "print('islice:', list(itertools.islice(range(10), 3)))\n"
+            "print('sqrt:', math.sqrt(16))\n"
+            "print('rand_ok:', isinstance(random.randint(0, 10), int))\n",
+        )
+        stdout = r.get("stdout") or ""
+        if ("re: 123" in stdout
+                and "datetime_ok: True" in stdout
+                and "stats: 2" in stdout
+                and "counter: [('a', 2)]" in stdout
+                and "islice: [0, 1, 2]" in stdout
+                and "sqrt: 4.0" in stdout
+                and "rand_ok: True" in stdout):
+            print("  OK   stdlib bindings (re/datetime/random/statistics/collections/itertools/math) callable")
+            passed += 1
+        else:
+            print(f"  FAIL stdlib bindings:\n{stdout}")
+        # Import guard still fires — binding doesn't relax the block.
+        total += 1
+        send(proc, {"op": "exec", "code": "import re", "timeout_ms": 5000})
+        r = recv(proc)
+        if r.get("rejected"):
+            print(f"  OK   `import re` still rejected (pre-binding doesn't relax guard): {r['rejected']['reason']}")
+            passed += 1
+        else:
+            print(f"  FAIL `import re` should have been rejected even with re pre-bound: {r}")
+
+        # 21. A.6.5 first-turn banner Shapes cheat-sheet — the banner now
+        # includes a "Shapes:" block with signatures for the most-reached-
+        # for primitives (fs.read, vault.top, etc.). The model writes its
+        # first composed batch with correct return-shape assumptions on
+        # turn 1 instead of turn 4. Reset + configure re-arms the banner
+        # (probe #11 already validated env lines; here we add the Shapes
+        # lines). Both probes can coexist because reset zeroes _exec_count.
+        total += 1
+        send(proc, {"op": "reset"})
+        recv(proc)
+        send(proc, {
+            "op": "configure",
+            "project": "/tmp/smoke-shapes",
+            "vault_global": "/tmp/smoke-shapes-brain",
+            "mode": "project+vault",
+            "shell": "/bin/sh",
+        })
+        recv(proc)
+        r = exec_code(proc, "print('shapes-banner-probe')")
+        stdout = r.get("stdout") or ""
+        required_sigs = ["Shapes:", "fs.read(path)", "shell.run(cmd", "say(text)"]
+        missing_sigs = [s for s in required_sigs if s not in stdout]
+        if not missing_sigs:
+            print("  OK   first-turn banner carries Shapes cheat-sheet")
+            passed += 1
+        else:
+            print(f"  FAIL banner missing Shapes lines: {missing_sigs}")
+            print(f"       banner stdout was:\n{stdout}")
+
+        # Shutdown
+        send(proc, {"op": "shutdown"})
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+        print(f"\n{passed}/{total} checks passed")
+        return 0 if passed == total else 1
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

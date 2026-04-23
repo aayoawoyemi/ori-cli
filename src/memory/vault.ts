@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { readFileSync, existsSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve as resolvePath } from 'node:path';
 import { createRequire } from 'node:module';
 
 // Resolve ori-memory binary from our own node_modules (installed as dependency).
@@ -202,8 +202,33 @@ class McpClient extends EventEmitter {
     const result = await this.call('tools/call', { name, arguments: args }) as {
       content?: Array<{ type: string; text: string }>;
     };
+    // MCP contract: tool results come back as {content: [{type: "text",
+    // text: "<JSON-encoded payload>"}]}. The text field is supposed to be
+    // valid JSON. But "supposed to" is not a guarantee — Ori Mnemos releases
+    // independently of aries-cli, and A10 surfaced ori_warmth returning text
+    // that didn't parse cleanly (triggered the opaque "JSON parse failure on
+    // the MCP bridge" error the model couldn't recover from).
+    //
+    // We used to call JSON.parse unguarded. That meant one malformed response
+    // from the MCP would bubble an uncaught exception up through
+    // handleVaultCallback, where it got stringified into {success: false,
+    // error: "<stack trace>"} — a teaching error pretending to be a crash.
+    //
+    // Now: wrap the parse. On failure return the same {success, error}
+    // envelope shape the Python side already handles at body/vault.py:197,
+    // so the model sees a clean VaultError with a teaching message instead
+    // of a stack trace. Include a snippet of the offending text (first 200
+    // chars) so debugging is possible without turning on MCP trace logs.
     if (result?.content?.[0]?.text) {
-      return JSON.parse(result.content[0].text);
+      const raw = result.content[0].text;
+      try {
+        return JSON.parse(raw);
+      } catch (err) {
+        return {
+          success: false,
+          error: `malformed MCP response from ${name}: ${(err as Error).message}. First 200 chars of payload: ${JSON.stringify(raw.slice(0, 200))}`,
+        };
+      }
     }
     return result;
   }
@@ -363,32 +388,9 @@ export class OriVault {
     return this.client.callTool(name, args);
   }
 
-  // ── Compound Retrieval ──────────────────────────────────────────────────
-
-  /**
-   * Single-call preflight: ranked + warmth + explore + similar, deduped and
-   * contradiction-flagged server-side. Returns null if ori_preflight is not
-   * available (older Ori version), allowing fallback to 5-way fan-out.
-   */
-  async preflight(query: string, context?: string, limit = 12): Promise<{
-    notes: Array<{ title: string; score: number; source: string; contradicting: boolean }>;
-    contradictions: string[];
-    count: number;
-  } | null> {
-    try {
-      const result = await this.client.callTool('ori_preflight', {
-        query, context, limit, include_contradictions: true,
-      }) as { success: boolean; data?: {
-        notes: Array<{ title: string; score: number; source: string; contradicting: boolean }>;
-        contradictions: string[];
-        count: number;
-      } };
-
-      return result.data ?? null;
-    } catch {
-      return null; // Graceful fallback — ori_preflight not available
-    }
-  }
+  // Compound Retrieval section (ori_preflight wrapper) removed 2026-04-21 —
+  // runPreflight was killed 2026-04-19, preflight.ts deleted in v0.5 Phase 1
+  // cleanup; method had no remaining callers.
 
   // ── Write ───────────────────────────────────────────────────────────────
 
@@ -474,7 +476,95 @@ export class OriVault {
   }
 }
 
+// ── Vault Scaffolding ───────────────────────────────────────────────────────
+
+/**
+ * Scaffold a fresh Ori vault at `targetDir` by invoking ori-memory's `init`
+ * subcommand. Creates `.ori/`, `notes/`, `self/`, etc. from the ori-memory
+ * package's built-in scaffold template.
+ *
+ * Fix 1B auto-create path: called by bridge.handleVaultCallback when a
+ * vault.add(scope="project") fires and no project vault exists yet. User
+ * chose "auto on add" for init UX — first add in a new project creates
+ * the vault inline. No separate `ori vault init` step required.
+ *
+ * Invoked as a subprocess rather than in-process import because ori-memory
+ * doesn't declare an exports map and subpath imports into its dist/ tree
+ * are a semver hazard across future ori-memory versions. Spawning the CLI
+ * is the stable contract.
+ *
+ * Returns true on success, false on any failure. Caller logs the failure
+ * mode — we don't throw because auto-create is best-effort UX, not a
+ * correctness requirement.
+ */
+export async function initVault(targetDir: string): Promise<boolean> {
+  const bin = getOriMemoryBin();
+  return new Promise((resolve) => {
+    const child = spawn(bin.cmd, [...bin.args, 'init', targetDir, '--json'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env },
+      shell: bin.cmd === 'ori-memory',
+    });
+    let stderrBuf = '';
+    child.stderr?.on('data', (c) => { stderrBuf += c.toString(); });
+    child.on('error', () => resolve(false));
+    child.on('exit', (code) => {
+      if (code === 0) {
+        resolve(true);
+      } else {
+        // Surface the failure on stderr so debug info isn't silent. The
+        // caller turns this into a user-visible vault error anyway.
+        process.stderr.write(`[initVault] ori-memory init failed (code ${code}): ${stderrBuf.slice(0, 400)}\n`);
+        resolve(false);
+      }
+    });
+  });
+}
+
 // ── Vault Discovery ─────────────────────────────────────────────────────────
+
+/**
+ * Walk up from `startDir` looking for a project-local `.ori/` vault.
+ *
+ * Separate from findVault() because the two have different semantics:
+ *   - findVault() discovers the GLOBAL vault (user's ~/brain or similar).
+ *     It checks common home-dir locations first and walks up from
+ *     process.cwd() as a fallback. Returns the user's intentional
+ *     memory substrate.
+ *   - findProjectVault() discovers a PROJECT-LOCAL vault — an .ori/
+ *     scaffolded inside a specific project directory for low-noise
+ *     memory that only pertains to that project. It starts from an
+ *     explicit directory (opts.cwd in setup.ts), walks UP, and STOPS
+ *     early if the first .ori/ it hits is the global vault (same path).
+ *     We don't want to mistake the global vault for a "project vault".
+ *
+ * Returns null when no project vault exists. The Fix 1B auto-create path
+ * in bridge.handleVaultCallback will mkdir `.ori/` + scaffold on first
+ * `vault.add(scope="project")` when this returns null.
+ *
+ * Matches findVault's marker test (`.ori/` directory plus `notes/` or
+ * `self/`) so a half-scaffolded directory with just a `.ori/` file isn't
+ * picked up by mistake.
+ */
+export function findProjectVault(startDir: string, globalVaultPath?: string): string | null {
+  const normalizedGlobal = globalVaultPath ? resolvePath(globalVaultPath) : null;
+
+  let dir = resolvePath(startDir);
+  while (true) {
+    if (normalizedGlobal && dir === normalizedGlobal) {
+      // We've walked into the global vault — abort. Inside the global
+      // vault we're in vault-only mode; there's no project layer above it.
+      return null;
+    }
+    if (existsSync(join(dir, '.ori')) && (existsSync(join(dir, 'notes')) || existsSync(join(dir, 'self')))) {
+      return dir;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
 
 /** Find an Ori vault by checking common locations. */
 export function findVault(configPath?: string): string | null {

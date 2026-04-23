@@ -29,6 +29,33 @@ export interface ReplResult {
       output_tokens: number;
     }>;
   };
+  // Populated when the model called `done(value)` during exec. Last commit
+  // wins if done() fires multiple times in one batch. The bridge also emits
+  // a `repl_done` ReplEvent in real time (during exec) — this field is the
+  // post-exec harvest for callers that don't subscribe to events.
+  done?: { value: unknown };
+  // Shape telemetry from body/shape.py — attached unconditionally by
+  // _run_exec so every Repl result carries composition metrics. Consumed
+  // by src/loop.ts to log a `repl_shape` session event per exec and a
+  // `turn_metrics` aggregate at end-of-turn. If AST parsing failed on the
+  // body side, `shape.error` will be present — still attached, so
+  // downstream aggregators can filter rather than silently skipping.
+  shape?: {
+    stmt_count: number;
+    line_count: number;
+    char_count: number;
+    primitives_called: string[];
+    distinct_primitive_count: number;
+    total_primitive_call_count: number;
+    has_for_or_while: boolean;
+    has_if: boolean;
+    has_def: boolean;
+    has_try: boolean;
+    has_comprehension: boolean;
+    is_micro_repl: boolean;
+    is_composed: boolean;
+    error?: string;
+  };
 }
 
 export type ReplEvent =
@@ -47,7 +74,13 @@ export type ReplEvent =
   // blocked on a threading.Event — the UI MUST eventually call
   // bridge.resolveAsk(id, answer) to unblock, or ask() will time out
   // after its configured timeout (default 300s in body/speak.py).
-  | { type: 'repl_ask'; id: number; question: string };
+  | { type: 'repl_ask'; id: number; question: string }
+  // repl_done fires when Python calls done(value) during exec. Real-time
+  // observation channel — UI or telemetry can react immediately. The value
+  // also appears post-exec as result.done on ReplResult, so callers that
+  // don't subscribe to events still see the commit. Fire-and-forget from
+  // Python (no bridge response needed); exec continues.
+  | { type: 'repl_done'; value: unknown };
 
 export interface ReplOptions {
   /** Path to body/server.py. Defaults to <repo>/body/server.py */

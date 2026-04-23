@@ -25,6 +25,16 @@ export interface ProcessOptions {
   readySignal?: string;
   /** Max time to wait for ready signal before failing. */
   readyTimeoutMs?: number;
+  /**
+   * Working directory to spawn the body in. Controls body/fs.py's local
+   * read resolution (_local_read uses pathlib.resolve() which is cwd-
+   * relative). When omitted, body inherits this Node process's cwd —
+   * fragile when the TS side's cwd drifts from the user's "project" root.
+   * A10 caught this: body read brain/package.json because the TS parent's
+   * cwd was brain while the user expected aries-cli. Always pass this
+   * from setupReplBridge so body's cwd matches the harness's intent.
+   */
+  cwd?: string;
 }
 
 export class ReplProcess {
@@ -47,6 +57,7 @@ export class ReplProcess {
     this.proc = spawn(this.opts.pythonCmd, [this.opts.serverPath], {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+      cwd: this.opts.cwd,
     });
 
     this.rl = createInterface({

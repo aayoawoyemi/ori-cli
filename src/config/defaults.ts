@@ -10,7 +10,8 @@ export const DEFAULT_CONFIG: AriesConfig = {
   // The router throws a readable error at first call if primary is unset.
   models: {} as AriesConfig['models'],
   vault: {
-    preflight: true,
+    // preflight flag removed 2026-04-21 — ambient preflight retrieval path
+    // killed 2026-04-19; codemode pulls memory on-demand via vault.* in Repl.
     postflight: true,
     reflectionThreshold: 150,
   },
@@ -51,7 +52,16 @@ export const DEFAULT_CONFIG: AriesConfig = {
   hooks: {},
   repl: {
     enabled: 'auto',
-    timeoutMs: 30_000,
+    // Bumped 30s → 90s on 2026-04-21 (v0.5 Phase 1.5). The walk-codemode-region
+    // manual trace on both Sonnet and Opus hit a 26.7s bridge timeout on the
+    // first vault.explore call, then the model fragmented into 8+ recovery
+    // probes trying to figure out what was available. vault.explore can take
+    // 30-60s server-side on a cold spreading-activation walk; the prior 30s
+    // budget guaranteed the timeout. 90s gives a real worst-case headroom
+    // without inviting the model to write infinite-runtime scripts (per-call
+    // hard cap stays in place). Server-side trim (Phase 2) will further
+    // reduce the latency floor; this bump is the unconditional safety margin.
+    timeoutMs: 90_000,
     maxIterations: 1000,
     maxRlmCalls: 10,
     sandbox: 'same_process',
@@ -62,13 +72,29 @@ export const DEFAULT_CONFIG: AriesConfig = {
     vault: { level: 'standard', maxTokens: 600 },
     cachePrefix: true,
     includeInSubagents: false,
+    // trimVaultReturns added 2026-04-21 (v0.5 Phase 1). Default true —
+    // strips decoration (signals/spaces/rrf/warmth.internals/federation
+    // markers) from MCP retrieval responses. Flip to false if you need
+    // the full unmodified payload for debugging. Becomes redundant when
+    // Ori MCP v0.6.0 ships source-side trim.
+    trimVaultReturns: true,
   },
-  preflight: {
-    enabled: 'auto',  // auto-disables when repl.enabled (REPL pulls memory on-demand)
-  },
+  // top-level preflight config removed 2026-04-21 — see vault.postflight note.
   experimental: {
     localClaudeSubscription: false,
     localChatGPTSubscription: false,
+  },
+  // Features — per-batch rollout flags for the 2026-04 build plan.
+  // All default `false` during rollout; each flag flips to `true` only
+  // after its batch's ship thresholds pass (manual ack at checkpoints).
+  // Once a flag has held `true` across N sessions without regression,
+  // graduate the behavior to unconditional and delete the flag.
+  features: {
+    harnessCleanup: false,
+    contracts: false,
+    craft: false,
+    gotchas: false,
+    transactions: false,
   },
   mcp: {
     servers: {},

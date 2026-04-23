@@ -1,13 +1,16 @@
 /**
  * Stable markers for synthetic content injected into user messages.
  *
- * Every turn, preflight + current_state + proprioception get wrapped in markers
- * so they can be stripped idempotently before new injection. Without markers,
- * each turn's injection stacks on top of previous turns, linearly accumulating
- * stale memory context (the Finding 4 bug).
+ * Per-turn blocks (proprioception, etc.) get wrapped in markers so they can
+ * be stripped idempotently before new injection. Without markers, each turn's
+ * injection stacks on top of previous turns, linearly accumulating stale
+ * context (the Finding 4 bug).
  *
  * Markers use HTML comment syntax — invisible in most markdown renders, won't
  * collide with user text, greppable.
+ *
+ * Preflight blocks (preflightBefore/After) removed 2026-04-21 — preflight
+ * itself was killed 2026-04-19; this wrapper's preflight fields were dead.
  */
 import type { Message } from '../router/types.js';
 
@@ -66,20 +69,20 @@ function escapeRegex(s: string): string {
 /**
  * Inject all turn-level synthetic blocks into the latest user message.
  *
- * Order (top to bottom in user.content):
- *   1. preflightBefore  (historical memory context)
- *   2. [user's actual message]
- *   4. preflightAfter   (contradictions as required-response blocks)
- *   5. proprio          (context-status block, highest salience before generation)
+ * Current blocks (after preflight removal 2026-04-21):
+ *   - proprio (context-status block, appended after user text for highest
+ *     salience before generation)
  *
  * All blocks are wrapped with stable markers so the next turn can strip them
  * idempotently via stripSyntheticFromMessages().
  *
  * Precondition: stripSyntheticFromMessages() should have run first this turn.
+ *
+ * Historical note: preflightBefore / preflightAfter wrappers were removed
+ * 2026-04-21 — the preflight retrieval path was killed 2026-04-19 and the
+ * wrapper fields had no remaining producers.
  */
 export interface TurnSynthetics {
-  preflightBefore?: string;
-  preflightAfter?: string;
   proprio?: string;
 }
 
@@ -99,27 +102,17 @@ export function injectTurnSynthetics(
 
   const userContent = messages[lastUserIdx].content as string;
 
-  // Build leading block (before user text)
-  const beforeParts: string[] = [];
-  if (blocks.preflightBefore) {
-    beforeParts.push(wrapSynthetic('preflight-before', `<system-reminder>\n<memory-context>\n${blocks.preflightBefore}\n</memory-context>\n</system-reminder>`));
-  }
-  const leading = beforeParts.length > 0 ? beforeParts.join('\n\n') + '\n\n' : '';
+  // proprio rides after the user text — closest to generation, highest
+  // salience. No leading block today (preflight was the only producer).
+  if (!blocks.proprio) return;
 
-  // Build trailing block (after user text)
-  const afterParts: string[] = [];
-  if (blocks.preflightAfter) {
-    afterParts.push(wrapSynthetic('preflight-after', blocks.preflightAfter));
-  }
-  if (blocks.proprio) {
-    afterParts.push(wrapSynthetic('proprio', `<system-reminder>\n${blocks.proprio}\n</system-reminder>`));
-  }
-  const trailing = afterParts.length > 0 ? '\n\n' + afterParts.join('\n\n') : '';
-
-  if (!leading && !trailing) return;
+  const trailing = '\n\n' + wrapSynthetic(
+    'proprio',
+    `<system-reminder>\n${blocks.proprio}\n</system-reminder>`,
+  );
 
   messages[lastUserIdx] = {
     ...messages[lastUserIdx],
-    content: `${leading}${userContent}${trailing}`,
+    content: `${userContent}${trailing}`,
   };
 }

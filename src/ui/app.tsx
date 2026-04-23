@@ -46,7 +46,6 @@ interface AppProps {
   initialPrompt?: string;
   initialPermissionMode?: PermissionMode;
   replHandle?: ReplHandle | null;
-  preflightEnabled?: boolean;
   resumedMessages?: Message[] | null;
   initialResumePicker?: boolean;
   experimental?: ExperimentalConfig;
@@ -57,7 +56,7 @@ export function App(props: AppProps): React.ReactElement {
   const {
     agentName, cwd, router, registry, vault, projectBrain,
     session, systemPrompt, hooks, vaultNoteCount, initialPrompt,
-    initialPermissionMode, replHandle, preflightEnabled = true,
+    initialPermissionMode, replHandle,
     resumedMessages: initialResumedMessages, initialResumePicker,
     experimental,
   } = props;
@@ -579,7 +578,6 @@ export function App(props: AppProps): React.ReactElement {
         alwaysAllowTools: alwaysAllowRef.current,
         identityContext: identityCtx,
         maxSubagents: 5,
-        preflightEnabled,
         dynamicTools: true,
         planFilePathRef,
         taskMode,
@@ -766,16 +764,9 @@ export function App(props: AppProps): React.ReactElement {
         }]);
         break;
 
-      case 'echo_fizzle':
-        // Show dim indicator of what the engine learned
-        if (event.echoed.length > 0) {
-          setDisplayMessages(prev => [...prev, {
-            role: 'system',
-            text: `Memory: ${event.echoed.length} note${event.echoed.length > 1 ? 's' : ''} used → boosted`,
-            subtype: 'info',
-          }]);
-        }
-        break;
+      // echo_fizzle UI case removed 2026-04-21 — echoFizzle.ts deleted
+      // (dead plumbing from preflight era); event type also removed from
+      // loop.ts. No producer means the case was unreachable.
 
       case 'compact':
         setDisplayMessages(prev => [...prev, {

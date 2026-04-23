@@ -100,12 +100,20 @@ class Speak:
         Args:
             text: the string to display. Coerced to str if not already.
 
-        Note: `say` writes to sys.__stdout__ (the REAL stdout), not
-        sys.stdout. During exec, repl.py captures sys.stdout so print()
-        output lands in the buffer that becomes tool_result. The model
-        sees what IT said via the code it wrote (the `say("...")` call
-        is visible in the tool_use block for the next turn), so there's
-        no need to also duplicate the text into tool_result stdout.
+        Dual-write behavior (added 2026-04, A.6.2): say() writes the text
+        TWICE — once to sys.__stdout__ (the REAL stdout, where the bridge
+        protocol reads the {"say": {...}} sentinel and streams it to the
+        user's message feed in real time), and once to sys.stdout (the
+        captured buffer during exec, which becomes result.stdout in the
+        model's tool_result). The first write is the user-visible path;
+        the second is the model-visible path — without the echo, the
+        model writing `say(f"title: {x}")` to inspect x sees an empty
+        tool_result and can't self-debug. Before dual-write, the Opus
+        walk-codemode trace burned 3+ ops on blind-iteration because
+        its own `say()` prints were invisible to it. Terminal UIs render
+        the bridge sentinel stream — they do not double-display the
+        echoed copy because tool_result doesn't surface to the user's
+        message feed, it goes back to the model as input.
         """
         if not isinstance(text, str):
             text = str(text)
@@ -113,6 +121,13 @@ class Speak:
         with self._stdout_lock:
             sys.__stdout__.write(msg + "\n")
             sys.__stdout__.flush()
+        # Echo to sys.stdout so the model sees its own output in
+        # tool_result. repl.py redirects sys.stdout during exec; this
+        # print() lands in the captured buffer that becomes result.stdout.
+        # Outside exec (e.g. standalone smoke tests importing Speak
+        # directly), sys.stdout is the real stdout and this is a no-op
+        # visual duplicate — harmless.
+        print(text)
 
     # ── ask — blocking proxy ───────────────────────────────────────────────
     # Full callback round-trip with threading.Event. Timeout defaults to 5

@@ -2,7 +2,7 @@ import { resolve } from 'node:path';
 import type { Message, ToolCall, ToolDefinition, ContentBlock } from './router/types.js';
 import type { ModelRouter } from './router/index.js';
 import type { ToolRegistry } from './tools/registry.js';
-import type { ToolContext } from './tools/types.js';
+import type { ToolContext, TurnStats } from './tools/types.js';
 import type { OriVault } from './memory/vault.js';
 import type { ProjectBrain } from './memory/projectBrain.js';
 import type { SessionStorage } from './session/storage.js';
@@ -39,9 +39,7 @@ export type LoopEvent =
   | { type: 'tool_denied'; id: string; name: string }
   | { type: 'plan_step'; toolCall: ToolCall }
   | { type: 'plan_complete'; steps: ToolCall[]; explanation: string }
-  | { type: 'echo_fizzle'; echoed: string[]; fizzled: string[] }
   | { type: 'usage'; inputTokens: number; outputTokens: number; totalTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
-  | { type: 'preflight'; projectCount: number; vaultCount: number }
   | { type: 'compact'; summary: string; savedCount: number; pruneOnly: boolean }
   | { type: 'turn_complete'; turn: number; tokenEstimate: number }
   | { type: 'error'; error: unknown };
@@ -70,12 +68,6 @@ export interface LoopParams {
   identityContext?: string;
   /** Max concurrent subagent processes (default: 5) */
   maxSubagents?: number;
-  /**
-   * Whether to run preflight retrieval + inject results. When false, the loop
-   * skips the 5 parallel vault queries entirely (REPL mode pulls memory on-demand).
-   * Current-state injection is independent of this flag.
-   */
-  preflightEnabled?: boolean;
   /**
    * Called after Edit/Write tools complete with the list of mutated file paths.
    * Used for post-edit codebase graph refresh.
@@ -165,7 +157,6 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     alwaysAllowTools,
     identityContext,
     maxSubagents = 5,
-    preflightEnabled = true,
     onFileMutated,
     planFilePathRef,
     permissionModeRef,
@@ -189,6 +180,24 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
 
   while (turnCount < maxTurns) {
     turnCount++;
+
+    // ── Turn-scoped shape aggregator ─────────────────────────────────
+    // Fresh per turn iteration. Tools (currently only Repl) mutate this
+    // in place via ToolContext.turnStats. Logged as a `turn_metrics`
+    // session event at both exit paths below — after tool execution
+    // (before `continue`) and at text-only turn completion. Part of the
+    // schema-enforced Repl composition measurement.
+    const turnStats: TurnStats = {
+      replCalls: 0,
+      anyComposed: false,
+      anyMicro: false,
+      committed: false,
+    };
+    const turnCtx: ToolContext = {
+      ...toolContext,
+      log: (entry) => session?.log(entry),
+      turnStats,
+    };
 
     // Live-read permissionMode from ref each turn so ExitPlanMode approval
     // takes effect immediately (not stale from agentLoop call-site).
@@ -506,7 +515,7 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       let executedResults: { id: string; name: string; output: string; isError: boolean }[] = [];
       if (approvedCalls.length > 0) {
         try {
-          executedResults = await executeTools(approvedCalls, registry, toolContext, hooks, vault?.vaultPath, maxSubagents);
+          executedResults = await executeTools(approvedCalls, registry, turnCtx, hooks, vault?.vaultPath, maxSubagents);
         } catch (err) {
           // Never leave orphaned tool_use in history. Synthesize an error
           // result for every approved call so the conversation stays valid.
@@ -576,6 +585,20 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
         }
       }
 
+      // Log turn_metrics before continuing to next turn. Captures the
+      // schema-enforced Repl composition signal for this turn (how many
+      // Repl calls, whether any were composed / micro, whether done()
+      // fired). turnStats is reset fresh at the top of the next iteration.
+      session?.log({
+        type: 'turn_metrics',
+        turn_index: turnCount,
+        repl_calls: turnStats.replCalls,
+        any_composed: turnStats.anyComposed,
+        any_micro: turnStats.anyMicro,
+        committed: turnStats.committed,
+        timestamp: Date.now(),
+      });
+
       continue;
     }
 
@@ -588,9 +611,25 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
         if (m.role !== 'assistant' || typeof m.content === 'string' || !Array.isArray(m.content)) continue;
         for (const block of m.content) {
           if ((block as { type?: string }).type !== 'tool_use') continue;
-          const tu = block as { name?: string; input?: { code?: string } };
-          if (tu.name !== 'Repl' || !tu.input?.code) continue;
-          const code = tu.input.code;
+          // Updated 2026-04-22: Repl tool_use input is now {plan, operations[]}
+          // not {code}. Concatenate every op's code field for the research-mode
+          // pattern scan. If the assistant message predates the schema change
+          // and has a legacy .code field, fall back to that so old sessions
+          // don't mis-classify.
+          const tu = block as {
+            name?: string;
+            input?: { code?: string; operations?: Array<{ code?: string }> };
+          };
+          if (tu.name !== 'Repl' || !tu.input) continue;
+          let code = '';
+          if (Array.isArray(tu.input.operations)) {
+            code = tu.input.operations
+              .map((op) => (typeof op?.code === 'string' ? op.code : ''))
+              .join('\n');
+          } else if (typeof tu.input.code === 'string') {
+            code = tu.input.code;
+          }
+          if (!code) continue;
           if (/\bresearch\.(discover|ingest|extract|synthesize|fetch|reflect)\b/.test(code)) {
             researchStarted = true;
           }
@@ -637,6 +676,20 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     messages.push({ role: 'assistant', content: assistantText });
     session?.log({ type: 'assistant', content: assistantText, timestamp: Date.now() });
 
+    // Log turn_metrics for text-only turn completion. Most text-only turns
+    // will have zero Repl calls (model just chatting), which itself is
+    // telemetry — zero-repl-turn frequency is the baseline against which
+    // composed-turn rates are measured.
+    session?.log({
+      type: 'turn_metrics',
+      turn_index: turnCount,
+      repl_calls: turnStats.replCalls,
+      any_composed: turnStats.anyComposed,
+      any_micro: turnStats.anyMicro,
+      committed: turnStats.committed,
+      timestamp: Date.now(),
+    });
+
     // ── POSTFLIGHT (gated on work-worthy turns only) ─────────────────
     // Previously ran a silent cheapCall every clean turn including chat.
     // Now only runs when this turn produced or consumed tool output, which
@@ -647,7 +700,7 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     });
     if (turnHadToolWork) {
       importanceAccumulator = await runPostflight(
-        messages, null, projectBrain, vault, importanceAccumulator, router,
+        messages, projectBrain, vault, importanceAccumulator, router,
       );
       session?.log({
         type: 'postflight',

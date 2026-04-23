@@ -201,9 +201,13 @@ async function executeSingle(
           ctx.signal!.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
         })
       : null;
+    // Inject the current tool_use id into ctx so tools can correlate
+    // telemetry events (repl_shape, done_committed) with the matching
+    // tool_call / tool_result entries in the session log.
+    const ctxWithId = { ...ctx, toolUseId: tc.id };
     const result = abortPromise
-      ? await Promise.race([tool.execute(tc.input, ctx), abortPromise])
-      : await tool.execute(tc.input, ctx);
+      ? await Promise.race([tool.execute(tc.input, ctxWithId), abortPromise])
+      : await tool.execute(tc.input, ctxWithId);
     const finalResult = { ...result, id: tc.id };
 
     // ── PostToolUse hook (fire-and-forget) ─────────────────────────────
