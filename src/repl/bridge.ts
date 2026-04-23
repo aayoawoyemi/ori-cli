@@ -598,8 +598,20 @@ export class ReplBridge {
         code: execution.code,
         timeout_ms: timeout,
       },
-      // Give the body extra wall-clock slack beyond its own timeout
-      timeout + 5_000,
+      // Give the body extra wall-clock slack beyond its own timeout.
+      //
+      // Bumped 5s → 30s in Batch 2 (A.6.6, 2026-04). The walk-codemode
+      // trace surfaced a 95s bridge timeout; Batch 2's 100-trial repro
+      // (scripts/done_hang_repro.py) failed to reproduce the stdout-lock
+      // deadlock hypothesis (0 hangs), which makes slow body-side cleanup
+      // the more plausible cause — `repl.execute` already does a best-
+      // effort `t.join(timeout=1.0)` after `_async_raise(TimeoutError)`,
+      // but a daemon thread lingering past that join for a few seconds
+      // while finishing a stdout.flush() is still possible and would
+      // blow the 5s slack budget. 30s is defensive without sacrificing
+      // fail-fast on a genuinely wedged body (still far below wall-clock
+      // patience for any real task).
+      timeout + 30_000,
       signal,
     )) as ReplResult;
 
