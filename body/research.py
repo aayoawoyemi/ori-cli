@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import sys
+
+from _protocol import write_message
 import threading
 from typing import Optional, Any
 
@@ -66,8 +68,9 @@ class Research:
         self._connected = False
         self._request_id = 0
         self._pending: dict[int, dict[str, Any]] = {}
+        # _lock guards _pending. _stdout_lock removed in Batch 1.6 —
+        # see body/_protocol.py header.
         self._lock = threading.Lock()
-        self._stdout_lock = threading.Lock()
 
     @property
     def connected(self) -> bool:
@@ -110,10 +113,8 @@ class Research:
         with self._lock:
             self._pending[req_id] = {"event": event, "result": None}
 
-        msg = json.dumps({"research_request": {"id": req_id, "method": method, "args": args}})
-        with self._stdout_lock:
-            sys.__stdout__.write(msg + "\n")
-            sys.__stdout__.flush()
+        # Atomic bridge write via _protocol.write_message (Batch 1.6).
+        write_message({"research_request": {"id": req_id, "method": method, "args": args}})
 
         if not event.wait(timeout=timeout):
             with self._lock:

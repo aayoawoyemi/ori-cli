@@ -317,8 +317,13 @@ def main():
         total += 1
         check_script = (
             "import sys, inspect\n"
-            f"sys.path.insert(0, r'{ROOT}')\n"
-            "from body.vault import Vault\n"
+            # body/ goes on sys.path directly so vault.py's internal
+            # `from _protocol import write_message` (Batch 1.6) resolves.
+            # Previously this inserted ROOT and used `body.vault` which
+            # worked for namespace-package resolution but not for the
+            # top-level `_protocol` import vault.py now requires.
+            f"sys.path.insert(0, r'{ROOT / 'body'}')\n"
+            "from vault import Vault\n"
             "required = {\n"
             "    'top': ['self', 'query', 'n', 'scope'],\n"
             "    'explore': ['self', 'query', 'depth', 'limit', 'recursive', 'include_content', 'scope'],\n"

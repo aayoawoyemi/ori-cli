@@ -61,28 +61,35 @@ NAMESPACE_SIGNATURES: dict[str, dict[str, str]] = {
                    "returns": "{ok, results, ...}"},
 
     # ── vault (body/vault.py) ───────────────────────────────────────────
+    # All vault retrievals share the {results: [...], ...} envelope. Access
+    # pattern hint is deliberately inline in `returns` because tonight's
+    # checkpoint trace (2026-04-23T05-15-50) caught Opus writing
+    # `for h in hits:` on the dict — got TypeError because it iterated
+    # string keys. The NOTE enrichment fired with the return shape; this
+    # hint makes the correct access pattern visible in the banner + NOTE
+    # output so Opus's training prior doesn't fill in the wrong shape.
     "vault.top":             {"sig": "(query, n=3, scope='both')",
-                              "returns": "{results: [{title, path, score, snippet}], ...}"},
+                              "returns": "{results: [{title, path, score, snippet}], ...}  # iterate as result['results']"},
     "vault.query_ranked":    {"sig": "(query, limit=10, include_archived=False, scope='both')",
-                              "returns": "{results: [{title, path, score}], warmth: {...}}"},
+                              "returns": "{results: [{title, path, score}], warmth: {...}}  # iterate as result['results']"},
     "vault.query_similar":   {"sig": "(query, limit=10, include_archived=False, scope='both')",
-                              "returns": "{results: [{title, path, score}]}"},
+                              "returns": "{results: [{title, path, score}]}  # iterate as result['results']"},
     "vault.query_warmth":    {"sig": "(query, limit=10, scope='both')",
-                              "returns": "{results: [{title, path, score}], warmth: {...}}  # empty results is valid signal"},
+                              "returns": "{results: [{title, path, score}], warmth: {...}}  # empty results is valid signal; iterate as result['results']"},
     "vault.query_important": {"sig": "(limit=10, scope='both')",
-                              "returns": "{results: [{title, path, score}]}"},
+                              "returns": "{results: [{title, path, score}]}  # iterate as result['results']"},
     "vault.query_fading":    {"sig": "(limit=10, include_archived=False, scope='both')",
-                              "returns": "{results: [{title, path, score, days_since_active}]}"},
+                              "returns": "{results: [{title, path, score, days_since_active}]}  # iterate as result['results']"},
     "vault.explore":         {"sig": "(query, depth=2, limit=15, recursive=True, include_content=True, scope='both')",
-                              "returns": "{results: [{title, path, score, snippet, body?}], count, paths, seed_count, ppr_alpha, depth, ppr_iterations, elapsed_ms}"},
+                              "returns": "{results: [{title, path, score, snippet, body?}], count, paths, seed_count, ppr_alpha, depth, ppr_iterations, elapsed_ms}  # iterate as result['results']"},
     "vault.read":            {"sig": "(path)",
                               "returns": "str  # raises VaultError on escape/missing"},
     "vault.get_note":        {"sig": "(title)",
                               "returns": "str  # raises VaultError with fuzzy suggestions on miss"},
     "vault.neighbors":       {"sig": "(title)",
-                              "returns": "{neighbors: [{title, path|None}]}"},
+                              "returns": "{neighbors: [{title, path|None}]}  # iterate as result['neighbors']"},
     "vault.backlinks":       {"sig": "(title)",
-                              "returns": "{backlinks: [{title, path}]}"},
+                              "returns": "{backlinks: [{title, path}]}  # iterate as result['backlinks']"},
     "vault.meta":            {"sig": "(title)",
                               "returns": "dict  # yaml frontmatter as {key: value_str}"},
     "vault.add":             {"sig": "(title, content=None, type='insight', scope='project')",

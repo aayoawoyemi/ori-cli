@@ -15,6 +15,8 @@ import sys
 import threading
 from typing import Optional, Any
 
+from _protocol import write_message
+
 
 class VaultError(Exception):
     pass
@@ -164,8 +166,9 @@ class Vault:
         self._connected = False
         self._request_id = 0
         self._pending: dict[int, dict[str, Any]] = {}
+        # _lock guards _pending (Python state). _stdout_lock removed in
+        # Batch 1.6 — see body/_protocol.py header for rationale.
         self._lock = threading.Lock()
-        self._stdout_lock = threading.Lock()
 
     @property
     def path(self) -> str:
@@ -206,12 +209,11 @@ class Vault:
         with self._lock:
             self._pending[req_id] = {"event": event, "result": None}
 
-        # Write request to stdout — TS bridge intercepts this
-        msg = json.dumps({"vault_request": {"id": req_id, "method": method, "args": args}})
-        with self._stdout_lock:
-            # Write to the REAL stdout (not the captured one during exec)
-            sys.__stdout__.write(msg + "\n")
-            sys.__stdout__.flush()
+        # Atomic bridge write via _protocol.write_message (Batch 1.6).
+        # os.write on sys.__stdout__.fileno() bypasses the captured
+        # sys.stdout that repl.py redirects during exec AND eliminates
+        # the deadlock window from the former `with _stdout_lock:` block.
+        write_message({"vault_request": {"id": req_id, "method": method, "args": args}})
 
         # Block until response arrives
         if not event.wait(timeout=timeout):

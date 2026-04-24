@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import json
 import sys
+
+from _protocol import write_message
 import threading
 from typing import Any, Optional
 
@@ -61,8 +63,9 @@ class Shell:
     def __init__(self) -> None:
         self._request_id = 0
         self._pending: dict[int, dict[str, Any]] = {}
+        # _lock guards _pending. _stdout_lock removed in Batch 1.6 —
+        # see body/_protocol.py header.
         self._lock = threading.Lock()
-        self._stdout_lock = threading.Lock()
 
     def resolve(self, request_id: int, result: Any) -> None:
         """Called by server.py main loop when shell_response arrives from TS."""
@@ -91,14 +94,8 @@ class Shell:
         with self._lock:
             self._pending[req_id] = {"event": event, "result": None}
 
-        # Write to real stdout — during exec, sys.stdout is captured by
-        # repl.py into a StringIO buffer that goes back as tool output. If
-        # we wrote there, the bridge would never see the request. Same
-        # workaround as vault.py / fs.py.
-        msg = json.dumps({"shell_request": {"id": req_id, "method": method, "args": args}})
-        with self._stdout_lock:
-            sys.__stdout__.write(msg + "\n")
-            sys.__stdout__.flush()
+        # Atomic bridge write via _protocol.write_message (Batch 1.6).
+        write_message({"shell_request": {"id": req_id, "method": method, "args": args}})
 
         if not event.wait(timeout=timeout):
             with self._lock:

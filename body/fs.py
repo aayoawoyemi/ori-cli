@@ -20,6 +20,8 @@
 from __future__ import annotations
 
 import json
+
+from _protocol import write_message
 import os
 import pathlib
 import sys
@@ -108,8 +110,10 @@ class Fs:
     def __init__(self) -> None:
         self._request_id = 0
         self._pending: dict[int, dict[str, Any]] = {}
+        # _lock guards _pending (Python state). _stdout_lock removed in
+        # Batch 1.6 — protocol writes go through _protocol.write_message
+        # which is atomic via os.write. See _protocol.py header.
         self._lock = threading.Lock()
-        self._stdout_lock = threading.Lock()
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
     # Fs has no "connect" step (unlike Vault, which needs a vault path).
@@ -142,14 +146,10 @@ class Fs:
         with self._lock:
             self._pending[req_id] = {"event": event, "result": None}
 
-        # Important: write to sys.__stdout__ (the REAL stdout), not sys.stdout.
-        # During exec, repl.py captures sys.stdout so print() output lands in
-        # the stdout buffer — if we wrote there, the bridge would never see
-        # the request. vault.py has the exact same workaround.
-        msg = json.dumps({"fs_request": {"id": req_id, "method": method, "args": args}})
-        with self._stdout_lock:
-            sys.__stdout__.write(msg + "\n")
-            sys.__stdout__.flush()
+        # Protocol write via _protocol.write_message — atomic os.write on
+        # sys.__stdout__.fileno(), bypasses the captured sys.stdout that
+        # repl.py redirects during exec. Batch 1.6 (2026-04-23).
+        write_message({"fs_request": {"id": req_id, "method": method, "args": args}})
 
         if not event.wait(timeout=timeout):
             with self._lock:

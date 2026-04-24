@@ -29,10 +29,11 @@
 
 from __future__ import annotations
 
-import json
 import sys
 import threading
 from typing import Any
+
+from _protocol import write_message
 
 
 class AskError(Exception):
@@ -62,8 +63,11 @@ class Speak:
     def __init__(self) -> None:
         self._request_id = 0
         self._pending: dict[int, dict[str, Any]] = {}
+        # _lock guards the _pending dict (Python state, not the pipe).
+        # _stdout_lock deleted in Batch 1.6 — protocol writes go through
+        # _protocol.write_message which is atomic via os.write. See the
+        # _protocol.py header for the full rationale.
         self._lock = threading.Lock()
-        self._stdout_lock = threading.Lock()
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
     # Speak has no "connect" step (same as Fs / Shell / Web). Always available
@@ -117,10 +121,10 @@ class Speak:
         """
         if not isinstance(text, str):
             text = str(text)
-        msg = json.dumps({"say": {"text": text}})
-        with self._stdout_lock:
-            sys.__stdout__.write(msg + "\n")
-            sys.__stdout__.flush()
+        # Atomic bridge-channel write via _protocol.write_message (Batch 1.6).
+        # Previously used `with self._stdout_lock: sys.__stdout__.write +
+        # flush` — see _protocol.py header for why we dropped the lock.
+        write_message({"say": {"text": text}})
         # Echo to sys.stdout so the model sees its own output in
         # tool_result. repl.py redirects sys.stdout during exec; this
         # print() lands in the captured buffer that becomes result.stdout.
@@ -161,14 +165,10 @@ class Speak:
         with self._lock:
             self._pending[req_id] = {"event": event, "result": None}
 
-        # Same sys.__stdout__ vs sys.stdout rationale as say(): repl.py's
-        # sys.stdout capture would swallow the request if we wrote to the
-        # captured stream, leaving TS never to receive it and Python blocking
-        # forever on the Event. Always use __stdout__ for bridge protocol.
-        msg = json.dumps({"ask_request": {"id": req_id, "question": question}})
-        with self._stdout_lock:
-            sys.__stdout__.write(msg + "\n")
-            sys.__stdout__.flush()
+        # Bridge protocol write — atomic via os.write (Batch 1.6).
+        # repl.py redirects sys.stdout during exec, so write_message goes
+        # to the real stdout via os.write on sys.__stdout__.fileno().
+        write_message({"ask_request": {"id": req_id, "question": question}})
 
         if not event.wait(timeout=timeout):
             # Timeout cleanup — drop the pending entry so if the response

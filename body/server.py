@@ -113,6 +113,7 @@ from web import Web
 from speak import Speak
 from shape import analyze_shape
 from schema import NAMESPACE_SIGNATURES
+from _protocol import write_message
 
 # Lazy imports (heavy deps) — only loaded when ops are used
 _indexer = None
@@ -240,15 +241,14 @@ def _done_primitive(value=None):
         done({"result": my_answer, "files_touched": paths})
     """
     safe = _safe_for_json(value)
-    # Write the real-time sentinel to the REAL stdout (not the captured
-    # stream that repl.py redirects during exec). Same rationale as say()
-    # and ask_request — the bridge protocol must not be swallowed by the
-    # stdout capture, or the bridge will never see the signal.
-    payload = json.dumps({"done": {"value": safe}})
-    with _stdout_lock:
-        sys.__stdout__.write(payload + "\n")
-        sys.__stdout__.flush()
+    # Sentinel must go to the REAL stdout (sys.__stdout__), not the
+    # captured stream repl.py redirects during exec. write_message
+    # (body/_protocol.py, Batch 1.6 2026-04-23) writes atomically via
+    # os.write — replaces the previous `with _stdout_lock: write; flush`
+    # pattern that had a deadlock window if _async_raise fired mid-lock.
+    write_message({"done": {"value": safe}})
     # Also buffer for _run_exec to harvest post-exec and attach to result.
+    # _done_sink_lock guards a Python list (not the pipe), so it stays.
     with _done_sink_lock:
         _done_sink.append(safe)
 
@@ -498,15 +498,18 @@ DEFAULT_TIMEOUT_MS = 90000
 # main loop, not the exec worker), so the ordering is safe.
 _exec_count = 0
 
-# Lock for stdout writes — both main thread and exec worker may write
-_stdout_lock = threading.Lock()
-
+# Protocol writes go through _protocol.write_message (Batch 1.6). The
+# previous module-level `_stdout_lock` was removed — see body/_protocol.py
+# header for the full rationale. Summary: body/ only has one writer at a
+# time in practice (main joins the exec thread before accepting new ops;
+# main itself doesn't write during exec); the lock was defense-in-depth
+# for a threat that doesn't exist, and it opened a deadlock window when
+# _async_raise(TimeoutError) fires at a bytecode boundary inside the
+# `with lock:` block. os.write on a pipe is atomic for our message sizes.
 
 def _write_response(response: dict) -> None:
-    """Thread-safe write to stdout."""
-    with _stdout_lock:
-        sys.__stdout__.write(json.dumps(response) + "\n")
-        sys.__stdout__.flush()
+    """Write a protocol response to bridge stdout. Atomic via os.write."""
+    write_message(response)
 
 
 # ── First-turn banner ────────────────────────────────────────────────────

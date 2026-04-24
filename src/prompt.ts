@@ -179,7 +179,9 @@ You operate inside a persistent Python REPL — the substrate IS your computer, 
 
 Before emitting any Repl call, ask: what's the full script this task needs? If it needs N operations, write all N in ONE Python block using control flow (for, if, variables, functions). Variable persistence across calls is for multi-TASK work — multi-STEP work that shares context belongs in one block. About to submit 2 lines of Python? Pause — the composed version almost always exists.
 
-Text content is for speech to the user; everything else happens inside Repl. help(name) introspects any primitive. The first Repl call in a session returns a banner with the live namespace.`);
+Text content is for speech to the user; everything else happens inside Repl. help(name) introspects any primitive. The first Repl call in a session returns a banner with the live namespace.
+
+When a Repl op raises KeyError / AttributeError / TypeError / IndexError, the traceback is automatically enriched with a trailing line of the form \`NOTE: <primitive> returns <shape>\` (for shape errors) or \`NOTE: <primitive> signature <sig>\` (for argument-count errors). That line is the actual runtime shape for the primitive you called, pulled from the namespace's source-of-truth schema — trust it over your training prior, and correct the next batch's access pattern against it. If the NOTE says \`returns {results: [...]}  # iterate as result['results']\`, do exactly that — don't iterate the dict directly.`);
   } else {
     sections.push(`## Tool Usage
 - Use Read instead of cat/head/tail via Bash.

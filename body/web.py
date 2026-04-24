@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import sys
+
+from _protocol import write_message
 import threading
 from typing import Any
 
@@ -43,8 +45,9 @@ class Web:
     def __init__(self) -> None:
         self._request_id = 0
         self._pending: dict[int, dict[str, Any]] = {}
+        # _lock guards _pending. _stdout_lock removed in Batch 1.6 —
+        # see body/_protocol.py header.
         self._lock = threading.Lock()
-        self._stdout_lock = threading.Lock()
 
     def resolve(self, request_id: int, result: Any) -> None:
         """Called by server.py main loop when web_response arrives from TS."""
@@ -72,12 +75,8 @@ class Web:
         with self._lock:
             self._pending[req_id] = {"event": event, "result": None}
 
-        msg = json.dumps({"web_request": {"id": req_id, "method": method, "args": args}})
-        with self._stdout_lock:
-            # Real stdout, not the exec-captured sys.stdout — see vault.py / fs.py
-            # for the rationale. Same trick everywhere.
-            sys.__stdout__.write(msg + "\n")
-            sys.__stdout__.flush()
+        # Atomic bridge write via _protocol.write_message (Batch 1.6).
+        write_message({"web_request": {"id": req_id, "method": method, "args": args}})
 
         if not event.wait(timeout=timeout):
             with self._lock:
