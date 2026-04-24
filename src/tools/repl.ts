@@ -128,6 +128,145 @@ function rejectOp(index: number, reason: string): ToolResult {
   };
 }
 
+// ── Input repair shim (Batch 1.7 — 2026-04-23) ────────────────────────
+// Frontier models occasionally emit broken input shapes on first batch
+// of a session — Opus's own diagnosis called this "jammed the operations
+// array into the wrong JSON field; pure model serialization noise on a
+// complex nested schema." The rejection path works as a teaching signal
+// but costs a round-trip. Repair-then-run-with-note is better: the work
+// ships AND the model sees what the correct shape should have been.
+//
+// repairInput runs BEFORE the client-side validation in execute(). On a
+// match, it returns the repaired input plus a human-readable note that
+// gets appended to the eventual tool_result output. If no repair
+// matches, un-repairable inputs fall through to the existing rejection
+// path unchanged. Zero risk to well-formed submissions — they hit the
+// early `no-repair-needed` branch and short-circuit.
+//
+// Repair cases (first-match wins):
+//   1. Pre-Stream-A `{code: "..."}` — wraps into {plan, operations} with
+//      one real op + one confirm op (pads to minItems=2).
+//   2. `{plan, code}` — code at root instead of in operations[0]. Moves
+//      it into operations with the same pad.
+//   3. `{plan, operations: "[...json...]"}` — operations double-serialized
+//      as a JSON string. JSON.parse it into a real array.
+//   4. `{plan, ops: [...]}` — wrong key name ("ops" vs "operations").
+//      Rename in place.
+//   5. Valid shape but some ops lack `purpose` — synthesize from the
+//      op's leading `# comment` or generate from position + first line.
+//
+// Cases deliberately NOT repaired:
+//   - Genuine 1-op submissions (`{plan, operations: [<one op>]}`). Padding
+//     to 2 ops on the harness side would defeat the schema floor — the
+//     minItems=2 contract is how we structurally prevent fragmentation.
+//     Let that hit the rejection path so the model learns to compose.
+
+interface RepairResult {
+  input: Record<string, unknown>;
+  note: string | null;
+}
+
+function repairInput(input: Record<string, unknown>): RepairResult {
+  // Already valid in shape terms — only repair nested ops if purpose is missing.
+  if (typeof input.plan === 'string' && Array.isArray(input.operations)) {
+    const ops = input.operations as Array<Record<string, unknown>>;
+    const purposeMissing = ops.some(
+      (op) =>
+        op && typeof op === 'object' &&
+        typeof op.code === 'string' && typeof op.purpose !== 'string',
+    );
+    if (!purposeMissing) return { input, note: null };
+    const repairedOps = ops.map((op, i) => {
+      if (op && typeof op === 'object' && typeof op.code === 'string' && typeof op.purpose !== 'string') {
+        const firstLine = (op.code as string).split('\n', 1)[0].trim();
+        const fromComment = firstLine.startsWith('#')
+          ? firstLine.replace(/^#+\s*/, '').trim()
+          : '';
+        const synth =
+          fromComment.length >= 8
+            ? fromComment.slice(0, 60)
+            : `step ${i + 1}: ${firstLine.slice(0, 40) || 'run'}`;
+        return { ...op, purpose: synth };
+      }
+      return op;
+    });
+    return {
+      input: { ...input, operations: repairedOps },
+      note: "synthesized missing `purpose` fields from op leading comments or positions — include `purpose` explicitly on each op next time",
+    };
+  }
+
+  // Case 1: pre-Stream-A single `{code: "..."}` submission.
+  if (
+    typeof input.code === 'string' &&
+    input.operations === undefined &&
+    input.plan === undefined
+  ) {
+    const code = (input.code as string).trim();
+    return {
+      input: {
+        plan: 'Execute the submitted Python block — input was repaired from the pre-Stream-A {code: ...} shape to {plan, operations}.',
+        operations: [
+          { purpose: 'execute submitted code', code },
+          { purpose: 'confirm completion', code: "say('ok — repaired from single-code submission')" },
+        ],
+      },
+      note: "repaired from pre-Stream-A `{code: ...}` shape. Submit {plan, operations: [{purpose, code}, ...]} with ≥2 substantive ops next time; composed work is why this harness exists.",
+    };
+  }
+
+  // Case 2: `{plan, code}` — plan present but code at root (no operations).
+  if (
+    typeof input.plan === 'string' &&
+    typeof input.code === 'string' &&
+    input.operations === undefined
+  ) {
+    return {
+      input: {
+        plan: input.plan,
+        operations: [
+          { purpose: 'execute submitted code', code: input.code as string },
+          { purpose: 'confirm completion', code: "say('ok — repaired from plan+code shape')" },
+        ],
+      },
+      note: "moved `code` at root into operations[0] — submit code INSIDE the operations array as {purpose, code} entries, not at the input root",
+    };
+  }
+
+  // Case 3: `{plan, operations: "[json...]"}` — operations stringified.
+  if (typeof input.plan === 'string' && typeof input.operations === 'string') {
+    try {
+      const parsed = JSON.parse(input.operations);
+      if (Array.isArray(parsed)) {
+        return {
+          input: { ...input, operations: parsed },
+          note: "JSON-parsed a stringified operations value — submit operations as a raw JSON array, not a JSON-encoded string",
+        };
+      }
+    } catch {
+      // Fall through to rejection — un-parseable string isn't something
+      // we can reasonably repair.
+    }
+  }
+
+  // Case 4: `{plan, ops: [...]}` — wrong key name.
+  if (
+    typeof input.plan === 'string' &&
+    Array.isArray((input as Record<string, unknown>).ops) &&
+    input.operations === undefined
+  ) {
+    const renamed = { ...input, operations: (input as Record<string, unknown>).ops };
+    delete (renamed as Record<string, unknown>).ops;
+    return {
+      input: renamed,
+      note: "renamed `ops` to `operations` — the field must be called `operations` (plural, full word)",
+    };
+  }
+
+  // No repair matched — let the existing validation path reject.
+  return { input, note: null };
+}
+
 export class ReplTool implements Tool {
   readonly name = 'Repl';
   readonly description = REPL_DESCRIPTION;
@@ -180,7 +319,7 @@ export class ReplTool implements Tool {
   }
 
   async execute(
-    input: Record<string, unknown>,
+    rawInput: Record<string, unknown>,
     _ctx: ToolContext,
   ): Promise<ToolResult> {
     const handle = this.getHandle();
@@ -191,6 +330,24 @@ export class ReplTool implements Tool {
         output: 'REPL not available. Set `repl.enabled: true` in config and restart.',
         isError: true,
       };
+    }
+
+    // ── Input repair (Batch 1.7) ────────────────────────────────────────
+    // Runs BEFORE schema validation. Common model serialization jitter
+    // (pre-Stream-A {code: ...} shape, stringified operations, wrong key
+    // name, missing purpose) gets auto-fixed and a teaching note is
+    // appended to the tool_result. Un-repairable shapes fall through to
+    // the existing rejection path unchanged. See repairInput() header
+    // for the full case list + rationale on what we deliberately do NOT
+    // repair (1-op submissions — padding would defeat the schema floor).
+    const { input, note: repairNote } = repairInput(rawInput);
+    if (repairNote && _ctx.log && _ctx.toolUseId) {
+      _ctx.log({
+        type: 'input_repaired',
+        tool_use_id: _ctx.toolUseId,
+        note: repairNote,
+        timestamp: Date.now(),
+      });
     }
 
     // ── Validate {plan, operations} shape ──────────────────────────────
@@ -336,10 +493,18 @@ export class ReplTool implements Tool {
     }
     parts.push(`(${statsParts.join(' · ')})`);
 
+    // Prepend the repair note so the model sees what the harness fixed
+    // BEFORE reading the output. The note is a one-line teaching signal
+    // — same ergonomic role as Batch 1.5's exception enrichment NOTE.
+    const output = parts.join('\n\n') || '(no output)';
+    const finalOutput = repairNote
+      ? `NOTE: harness repaired input shape — ${repairNote}\n\n${output}`
+      : output;
+
     return {
       id: '',
       name: this.name,
-      output: parts.join('\n\n') || '(no output)',
+      output: finalOutput,
       isError: result.exception !== null,
     };
   }

@@ -30,6 +30,12 @@ export type SessionEntry =
   // frontier models actually commit. If values grow unbounded in practice,
   // add a serialized-size cap here — until then, raw is more useful.
   | { type: 'done_committed'; tool_use_id: string; value: unknown; timestamp: number }
+  // Fires when the Batch 1.7 input-repair shim rewrites a broken submission
+  // shape before validation. `note` is the human-readable explanation appended
+  // to the tool_result so the model learns. Lets us measure how often frontier
+  // models emit pre-Stream-A / wrong-key / stringified-operations shapes —
+  // if a given repair case never fires across 50+ sessions, drop it.
+  | { type: 'input_repaired'; tool_use_id: string; note: string; timestamp: number }
   | { type: 'preflight'; projectNotes: string[]; vaultNotes: string[]; timestamp: number }
   | { type: 'postflight'; importance: number; reflected: boolean; timestamp: number }
   | { type: 'compact_boundary'; summary: string; insightsSaved: number; pruneOnly: boolean; timestamp: number }
