@@ -3,8 +3,8 @@
  *
  * Schema is structurally composed: the model submits {plan, operations[]}
  * where operations is an array of {purpose, code} entries. The harness
- * concatenates operations[].code into one Python block and executes as a
- * single batch. Single-op submissions are structurally impossible to emit —
+ * executes each operation independently in the same persistent namespace.
+ * If one op fails, the rest still run. Single-op submissions are structurally impossible to emit —
  * the input_schema enforces minItems:2 at the tool-contract level, and all
  * three supported providers (Anthropic/OpenAI-compat/Google) validate
  * input_schema server-side before the tool_use reaches us. This is the
@@ -15,6 +15,7 @@
 import type { Tool, ToolContext } from './types.js';
 import type { ToolDefinition, ToolResult } from '../router/types.js';
 import type { ReplHandle } from '../repl/setup.js';
+import type { ReplResult } from '../repl/types.js';
 
 // ── Repl tool description — the structural teaching channel ──────────────
 // Why this description is long and example-heavy: the `description` field
@@ -46,7 +47,7 @@ You do NOT submit raw code. You submit {plan, operations}:
   - purpose: short label for this step (≥8 characters — "read file" is fine, "step 1" is not)
   - code: the actual Python for this step (≥10 characters)
 
-The harness concatenates operations[].code into one Python block with a # op: <purpose> header comment above each, then executes as one batch. Variables set in op N are visible in op N+1 because they run in the same Python namespace. Use control flow (for/if/try/def/comprehension) inside any op.
+The harness executes each operation independently in the same persistent namespace. If one op fails, the rest still run — you'll see per-op results with timing. Variables set in op N are visible in op N+1 because they share the same Python namespace. Use control flow (for/if/try/def/comprehension) inside any op.
 
 ## The shape that wins
 
@@ -79,17 +80,22 @@ Use done(value) as the last op when you have the final answer in hand and want t
   ]
 }
 
-# Example: walk a vault region → read top hit → extract thesis via rlm_call
+# Example: walk a vault region -> read top hit -> surface enough evidence
 {
-  "plan": "Explore a vault region for the top hit, read the note, extract the thesis with rlm_call, and commit the answer.",
+  "plan": "Explore a vault region for the top hit, read the note, surface the relevant excerpt, and commit the title.",
   "operations": [
     {"purpose": "explore region", "code": "hits = vault.explore('codemode paradigm', depth=2, limit=5)"},
     {"purpose": "read top hit",   "code": "top = hits['results'][0]; note = vault.read(top['path'])"},
-    {"purpose": "extract thesis", "code": "thesis = rlm_call(note, 'What is the core thesis in one sentence?')"},
-    {"purpose": "report",         "code": "say(f\\"Recall: {top['title']} — {thesis}\\")"},
-    {"purpose": "commit",         "code": "done({'title': top['title'], 'thesis': thesis})"}
+    {"purpose": "surface excerpt", "code": "excerpt = note[:1200]\\nsay(f\\"Recall: {top['title']}\\n\\n{excerpt}\\")"},
+    {"purpose": "commit title",    "code": "done({'title': top['title'], 'path': top['path']})"}
   ]
 }
+
+Use rlm_call/rlm_batch only when you need cheap focused reasoning over MANY
+independent slices (for example summarizing 10 files). Do NOT use rlm_call to
+summarize a single retrieved note for the user; return the note/excerpt and
+write the synthesis yourself in the next assistant turn. Nested model calls add
+latency and can fail independently of the main model.
 
 Anti-pattern: submitting a 2-op batch of [{purpose: "step 1", code: "x = 1"}, {purpose: "step 2", code: "print(x)"}] to satisfy the floor. That's schema-gaming, not composition. Write real operations that do real work. If the task only needs one action + a report, do one action + say(report) — two ops, both substantive.
 
@@ -126,6 +132,60 @@ function rejectOp(index: number, reason: string): ToolResult {
     output: `Repl rejected: operations[${index}] ${reason}. Each op needs a descriptive purpose (≥8 chars) and real Python code (≥10 chars). Resubmit with substantive ops — don't pad with placeholder text.`,
     isError: true,
   };
+}
+
+// ── TS-shape detector (restored 2026-04-26 with string-literal pre-pass) ──
+// History: this detector existed → was removed 2026-04-25 because the regexes
+// false-positived on TS content INSIDE Python string literals (fs.write call
+// bodies, triple-quoted blocks, raw strings holding `=>`). The fix was
+// always the same: strip Python string contents before running TS patterns.
+// This restores the detector with that pre-pass.
+//
+// Why keep the detector at all (instead of letting Python's SyntaxError
+// teach): the intercept fires BEFORE the body subprocess executes the op.
+// That kills the round-trip where the model writes 50 lines of TS, the
+// body parses and SyntaxErrors, the model reads the traceback, retries.
+// A fast pre-execution intercept routes the model to fs.read/fs.edit on
+// the first attempt — same teaching content, one fewer bridge round-trip.
+// The cost is staying honest about false positives, hence the pre-pass.
+//
+// Pre-pass scope: replace contents of '...', "...", '''...''', """...""",
+// and `# ...` comments with spaces (newlines preserved so `^` anchors still
+// land on real-code lines). Prefixed strings (r/R/b/B/u/U/f/F) are caught
+// because the regex matches the quote regardless of preceding letter — the
+// prefix character is left alone, the string body becomes spaces.
+//
+// Out of scope (documented, not handled): line-continuation strings using
+// trailing `\`, concatenated adjacent literals (`'a' 'b'`), nested f-string
+// `{...}` interpolation containing TS shapes. None of these are realistic
+// false-positive vectors for the model writing Python.
+function stripPythonStringsAndComments(code: string): string {
+  // Replace match content with same-length spaces (keep newlines as-is so
+  // multiline `^` anchoring in the TS patterns still fires on real lines).
+  const blank = (m: string) => m.replace(/[^\n]/g, ' ');
+  return code
+    // Triple-quoted FIRST so the single-quote pass below doesn't chew the
+    // opener (`"""` would otherwise look like an empty `""` followed by `"`).
+    .replace(/"""[\s\S]*?"""/g, blank)
+    .replace(/'''[\s\S]*?'''/g, blank)
+    // Single-line strings: allow escaped chars, no unescaped newline.
+    .replace(/"(?:\\.|[^"\\\n])*"/g, blank)
+    .replace(/'(?:\\.|[^'\\\n])*'/g, blank)
+    // Hash comment to end of line.
+    .replace(/#[^\n]*/g, blank);
+}
+
+function looksLikeTypeScriptOrJavaScript(code: string): boolean {
+  const stripped = stripPythonStringsAndComments(code);
+  const tsPatterns = [
+    /^\s*import\s+(?:type\s+)?[{*\w]/m,
+    /^\s*export\s+(?:type\s+|interface\s+|class\s+|const\s+|function\s+)/m,
+    /^\s*(?:const|let|var|function|interface|type)\s+\w+/m,
+    /^\s*(?:async\s+)?function\s+\w+\s*\(/m,
+    /^\s*\w+\s*:\s*(?:string|number|boolean|unknown|Record<|Array<|\w+\[\])/m,
+    /=>/,
+  ];
+  return tsPatterns.some((pattern) => pattern.test(stripped));
 }
 
 // ── Input repair shim (Batch 1.7 — 2026-04-23) ────────────────────────
@@ -290,7 +350,7 @@ export class ReplTool implements Tool {
           operations: {
             type: 'array',
             description:
-              'At least 2 {purpose, code} entries. Harness concatenates operations[].code into one Python block with a # op: <purpose> header per op; variables persist across ops within the batch.',
+              'At least 2 {purpose, code} entries. Harness executes each operation independently in the same persistent namespace. If one op fails, the rest still run. Variables persist across ops within the batch.',
             minItems: 2,
             maxItems: 20,
             items: {
@@ -375,137 +435,198 @@ export class ReplTool implements Tool {
       if (opCode.trim().length < 10) return rejectOp(i, `code is ${opCode.trim().length} chars, need ≥10`);
     }
 
-    // ── Concatenate ops into one Python block ──────────────────────────
-    // Each op gets a `# op: <purpose>` header comment so AST walkers and
-    // exception tracebacks can attribute failures to specific ops. Double
-    // newline between ops keeps the AST clean (each op's statements are
-    // top-level in the combined block, not accidentally nested).
-    const typedOps = ops as Array<{ purpose: string; code: string }>;
-    const code = typedOps
-      .map((op) => `# op: ${op.purpose}\n${op.code}`)
-      .join('\n\n');
-
-    // ── Client-side lint on the concatenated code ──────────────────────
-    // The AST guard on the Python side rejects these too, but catching
-    // locally saves a bridge round-trip and produces teaching messages.
+    // -- Per-op execution ----------------------------------------------------------
+    // Each op is exec'd independently via the bridge. If one fails, the
+    // rest still run. The Python namespace persists across bridge.exec()
+    // calls (existing tested behavior). Per-op isolation means the model
+    // sees which ops succeeded and which failed, and partial results
+    // aren't lost.
     //
-    // History: the earlier version of this rejection message omitted half
-    // the bound names (said nothing about json/say/ask/shell/web/reindex)
-    // and explicitly asserted "stdlib is not available" — which is false
-    // because body/server.py:231 binds `json` directly into the namespace.
-    // A10 caught the drift: model typed `import json`, got rejected, saw
-    // "stdlib not available," worked around a module that was already
-    // there. The message must stay in sync with _build_namespace. If you
-    // add or remove a bound name in body/server.py, update this list too.
-    const importMatch = code.match(/^\s*(?:import|from)\s+[\w.]+/m);
-    if (importMatch) {
-      return {
-        id: '',
-        name: this.name,
-        output: `Repl rejected: imports are forbidden (you wrote "${importMatch[0].trim()}"). The Repl namespace is PRE-LOADED — use these objects directly, no import needed:\n  - fs.read / fs.listdir / fs.glob / fs.write / fs.edit / fs.patch\n  - shell.run(cmd, timeout=30, cwd=None)\n  - web.fetch(url) / web.search(query)\n  - codebase.search / find_symbol / get_context / show_dependents / communities / find_convention\n  - vault.top(q, n) / vault.explore(q) — retrieval + mapping defaults\n  - vault.neighbors(title) / vault.backlinks(title) / vault.meta(title) — precision traversal\n  - vault.read(path) / vault.get_note(title) / vault.add(title, content) / vault.orient\n  - vault.query_ranked / query_warmth / query_similar / query_important / query_fading — escape hatches\n  - research.plan / read / extract / synthesize / save\n  - rlm_call(slice, question) / rlm_batch([...])\n  - say(text) / ask(question) — user-visible I/O\n  - done(value) — commit final answer and terminate the turn\n  - json — pre-bound module (json.loads, json.dumps) — do NOT import it\n  - os.path — pre-bound (os.path.join, os.path.normpath, os.path.basename, etc.) — do NOT import os\n  - reindex(path) — re-point the codebase graph\nUse help(name) to see the API for any primitive — help(fs), help(vault.top), etc.\nResubmit WITHOUT the import. Every stdlib path you'd normally reach for has a namespace primitive above.`,
-        isError: true,
-      };
+    // History: replaced all-or-nothing concatenation (2026-04-25). The old
+    // approach killed ops 3-5 if op 2 failed.
+    const typedOps = ops as Array<{ purpose: string; code: string }>;
+
+    // Per-op results collector
+    const opResults: Array<{
+      purpose: string;
+      stdout: string;
+      stderr: string;
+      exception: string | null;
+      duration_ms: number;
+      rejected: boolean;
+      rejectedReason?: string;
+      timed_out: boolean;
+      lintError?: string;
+      skipped?: boolean;
+      done?: { value: unknown };
+      rlm_stats?: ReplResult['rlm_stats'];
+      shape?: ReplResult['shape'];
+    }> = [];
+    let totalDuration = 0;
+    const BATCH_TIMEOUT = 90_000;
+    let anyError = false;
+
+    for (const op of typedOps) {
+      // Batch timeout guard
+      if (totalDuration >= BATCH_TIMEOUT) {
+        opResults.push({
+          purpose: op.purpose,
+          stdout: '', stderr: '', exception: null,
+          duration_ms: 0, rejected: false, timed_out: false,
+          skipped: true,
+        });
+        continue;
+      }
+
+      const opCode = `# op: ${op.purpose}\n${op.code}`;
+
+      // Per-op client-side lint: TS/JS shape detection. Runs BEFORE the
+      // import check because import statements can be valid Python OR TS;
+      // the TS check is more specific and we want its teaching message to
+      // win when both could fire. The detector strips Python string and
+      // comment content first so `fs.write('x.ts', 'const x = 1')` doesn't
+      // trip on the inner string. See stripPythonStringsAndComments above.
+      if (looksLikeTypeScriptOrJavaScript(op.code)) {
+        opResults.push({
+          purpose: op.purpose,
+          stdout: '', stderr: '', exception: null,
+          duration_ms: 0, rejected: false, timed_out: false,
+          lintError:
+            'Looks like TypeScript/JavaScript. Repl is Python. ' +
+            'Use fs.read/fs.edit/fs.write from Python for TS file work, and ' +
+            'shell.run("npm run typecheck") or shell.run("npx tsx <file>") to validate. ' +
+            'If you meant Python, rewrite with def (not function), = (not const), dict (not interface).',
+        });
+        anyError = true;
+        continue;
+      }
+
+      // Per-op client-side lint: import check
+      const importMatch = op.code.match(/^\s*(?:import|from)\s+[\w.]+/m);
+      if (importMatch) {
+        opResults.push({
+          purpose: op.purpose,
+          stdout: '', stderr: '', exception: null,
+          duration_ms: 0, rejected: false, timed_out: false,
+          lintError: `Imports are forbidden (you wrote "${importMatch[0].trim()}"). Use pre-loaded namespace primitives.`,
+        });
+        anyError = true;
+        continue;
+      }
+
+      // Execute this op independently
+      const result = await handle.exec({ code: opCode }, _ctx.signal);
+
+      if (result.exception || result.rejected || result.timed_out) {
+        anyError = true;
+      }
+      totalDuration += result.duration_ms;
+
+      opResults.push({
+        purpose: op.purpose,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exception: result.exception,
+        duration_ms: result.duration_ms,
+        rejected: result.rejected !== null,
+        rejectedReason: result.rejected?.reason,
+        timed_out: result.timed_out,
+        done: result.done,
+        rlm_stats: result.rlm_stats,
+        shape: result.shape,
+      });
     }
 
-    // TypeScript syntax sneaking into Python Repl (Sonnet does this occasionally).
-    // Runs on the concatenated code so TS that snuck into any op is caught.
-    if (/^\s*(?:const|let|var|function|interface|type)\s+\w+/m.test(code)) {
-      return {
-        id: '',
-        name: this.name,
-        output: `Repl rejected: one of your ops looks like TypeScript/JavaScript. The Repl runs Python. Rewrite using Python syntax (def not function, = not const, dict not interface, etc).`,
-        isError: true,
-      };
-    }
-
-    const result = await handle.exec({ code }, _ctx.signal);
-
-    // ── Telemetry: shape + done events, plus turn-stats aggregation ─────
-    // Fires BEFORE the rejection/timeout short-circuits so we capture
-    // shape data even for rejected execs — micro-batch rejections are
-    // themselves telemetry-worthy. Skip only if logger/correlation
-    // context is missing (manual invocation paths, tests).
-    const shape = result.shape;
-    if (_ctx.log && _ctx.toolUseId && shape) {
+    // -- Telemetry: shape from first op that returned shape data ---------
+    const firstShape = opResults.find(r => r.shape)?.shape;
+    if (_ctx.log && _ctx.toolUseId && firstShape) {
       _ctx.log({
         type: 'repl_shape',
         tool_use_id: _ctx.toolUseId,
-        stmt_count: shape.stmt_count,
-        distinct_primitive_count: shape.distinct_primitive_count,
-        total_primitive_call_count: shape.total_primitive_call_count,
-        has_for_or_while: shape.has_for_or_while,
-        has_if: shape.has_if,
-        has_def: shape.has_def,
-        has_try: shape.has_try,
-        has_comprehension: shape.has_comprehension,
-        is_micro_repl: shape.is_micro_repl,
-        is_composed: shape.is_composed,
-        primitives_called: shape.primitives_called,
-        parse_error: shape.error,
+        ops_count: typedOps.length,
+        stmt_count: firstShape.stmt_count,
+        distinct_primitive_count: firstShape.distinct_primitive_count,
+        total_primitive_call_count: firstShape.total_primitive_call_count,
+        has_for_or_while: firstShape.has_for_or_while,
+        has_if: firstShape.has_if,
+        has_def: firstShape.has_def,
+        has_try: firstShape.has_try,
+        has_comprehension: firstShape.has_comprehension,
+        is_micro_repl: firstShape.is_micro_repl,
+        is_composed: firstShape.is_composed,
+        primitives_called: firstShape.primitives_called,
+        parse_error: firstShape.error,
         timestamp: Date.now(),
       });
     }
-    if (_ctx.log && _ctx.toolUseId && result.done) {
+    // done(): last-commit-wins across all ops
+    const lastDone = [...opResults].reverse().find(r => r.done)?.done;
+    if (_ctx.log && _ctx.toolUseId && lastDone) {
       _ctx.log({
         type: 'done_committed',
         tool_use_id: _ctx.toolUseId,
-        value: result.done.value,
+        value: lastDone.value,
         timestamp: Date.now(),
       });
     }
     if (_ctx.turnStats) {
       _ctx.turnStats.replCalls += 1;
-      if (shape?.is_composed) _ctx.turnStats.anyComposed = true;
-      if (shape?.is_micro_repl) _ctx.turnStats.anyMicro = true;
-      if (result.done) _ctx.turnStats.committed = true;
+      if (firstShape?.is_composed) _ctx.turnStats.anyComposed = true;
+      if (firstShape?.is_micro_repl) _ctx.turnStats.anyMicro = true;
+      if (lastDone) _ctx.turnStats.committed = true;
     }
 
-    if (result.rejected) {
-      return {
-        id: '',
-        name: this.name,
-        output: `AST guard rejected: ${result.rejected.reason}`,
-        isError: true,
-      };
+    // -- Format per-op output ------------------------------------------------
+    const outputParts: string[] = [];
+    let failedCount = 0;
+    let totalRlmCalls = 0;
+    let totalRlmTokens = 0;
+
+    for (const r of opResults) {
+      const header = r.skipped
+        ? `# op: ${r.purpose} [skipped: batch timeout exceeded]`
+        : r.lintError
+          ? `# op: ${r.purpose} [lint error]`
+          : `# op: ${r.purpose} (${r.duration_ms}ms)`;
+
+      const parts: string[] = [header];
+
+      if (r.lintError) {
+        parts.push(r.lintError);
+        failedCount++;
+      } else if (r.skipped) {
+        failedCount++;
+      } else {
+        if (r.stdout) parts.push(r.stdout.trimEnd());
+        if (r.stderr) parts.push(`[stderr]\n${r.stderr.trimEnd()}`);
+        if (r.exception) { parts.push(`[exception]\n${r.exception.trimEnd()}`); failedCount++; }
+        if (r.rejected) { parts.push(`AST guard rejected: ${r.rejectedReason}`); failedCount++; }
+        if (r.timed_out) { parts.push(`Timed out after ${r.duration_ms}ms`); failedCount++; }
+        if (r.rlm_stats && r.rlm_stats.call_count > 0) {
+          totalRlmCalls += r.rlm_stats.call_count;
+          totalRlmTokens += r.rlm_stats.total_tokens;
+        }
+      }
+
+      outputParts.push(parts.join('\n'));
     }
 
-    if (result.timed_out) {
-      return {
-        id: '',
-        name: this.name,
-        output: `Timed out after ${result.duration_ms}ms`,
-        isError: true,
-      };
-    }
+    // Footer with aggregate stats
+    const footerParts: string[] = [`${totalDuration}ms total`, `${typedOps.length} ops`];
+    if (failedCount > 0) footerParts.push(`${failedCount} failed`);
+    if (totalRlmCalls > 0) footerParts.push(`${totalRlmCalls} rlm calls`, `${totalRlmTokens} tokens`);
+    outputParts.push(`(${footerParts.join(' \u00b7 ')})`);
 
-    // Format output for the model
-    const parts: string[] = [];
-    if (result.stdout) parts.push(result.stdout.trimEnd());
-    if (result.stderr) parts.push(`[stderr]\n${result.stderr.trimEnd()}`);
-    if (result.exception) parts.push(`[exception]\n${result.exception.trimEnd()}`);
-
-    const statsParts: string[] = [`${result.duration_ms}ms`, `${typedOps.length} ops`];
-    if (result.rlm_stats && result.rlm_stats.call_count > 0) {
-      statsParts.push(
-        `${result.rlm_stats.call_count} rlm calls`,
-        `${result.rlm_stats.total_tokens} tokens`,
-      );
-    }
-    parts.push(`(${statsParts.join(' · ')})`);
-
-    // Prepend the repair note so the model sees what the harness fixed
-    // BEFORE reading the output. The note is a one-line teaching signal
-    // — same ergonomic role as Batch 1.5's exception enrichment NOTE.
-    const output = parts.join('\n\n') || '(no output)';
+    const output = outputParts.join('\n\n') || '(no output)';
     const finalOutput = repairNote
-      ? `NOTE: harness repaired input shape — ${repairNote}\n\n${output}`
+      ? `NOTE: harness repaired input shape -- ${repairNote}\n\n${output}`
       : output;
 
     return {
       id: '',
       name: this.name,
       output: finalOutput,
-      isError: result.exception !== null,
+      isError: anyError,
     };
   }
 }

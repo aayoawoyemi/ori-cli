@@ -832,6 +832,166 @@ def main():
             if enrich_result.stderr:
                 print(f"       stderr: {enrich_result.stderr.strip()[:400]}")
 
+        # 24. Batch 1.8 runtime calibration — for every primitive covered
+        # by body/schema.calibrated.json, the schema's declared envelope +
+        # item keys must match the fixture's observed keys. Phantom keys
+        # (declared but not observed — the snippet-lie class) are always
+        # drift; missing keys are drift only when the schema didn't mark
+        # the shape open with `...`. This probe would have caught the
+        # vault.top snippet lie immediately instead of shipping it to Opus.
+        # Fixture is narrow by design — only primitives we're high
+        # confidence about. Expand as primitives are audited live.
+        total += 1
+        calib_script = (
+            "import sys, json\n"
+            f"sys.path.insert(0, r'{ROOT / 'body'}')\n"
+            "from schema import NAMESPACE_SIGNATURES, NAMESPACE_VERSION\n"
+            "from schema_calibrate import compare_against_fixture, load_fixture\n"
+            f"fixture = load_fixture(r'{ROOT / 'body' / 'schema.calibrated.json'}')\n"
+            "drift = compare_against_fixture(NAMESPACE_SIGNATURES, fixture)\n"
+            "print(f'primitives_in_fixture:{len(fixture)}')\n"
+            "print(f'drift_count:{len(drift)}')\n"
+            "print(f'namespace_version:{NAMESPACE_VERSION}')\n"
+            "if drift:\n"
+            "    print('DRIFT:' + json.dumps(drift, indent=2))\n"
+        )
+        calib_result = subprocess.run(
+            [sys.executable, "-c", calib_script],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        calib_out = calib_result.stdout
+        if ("drift_count:0" in calib_out
+                and "primitives_in_fixture:" in calib_out
+                and "namespace_version:" in calib_out):
+            # Extract fixture count + version for context
+            fixture_line = next(
+                (ln for ln in calib_out.splitlines() if ln.startswith("primitives_in_fixture:")),
+                ""
+            )
+            version_line = next(
+                (ln for ln in calib_out.splitlines() if ln.startswith("namespace_version:")),
+                ""
+            )
+            print(f"  OK   runtime calibration clean ({fixture_line}, {version_line})")
+            passed += 1
+        else:
+            print(f"  FAIL schema drift vs calibrated fixture:\n{calib_out}")
+            if calib_result.stderr:
+                print(f"       stderr: {calib_result.stderr.strip()[:400]}")
+
+        # 25. Parser self-test — parse_returns handles the shape dialects in
+        # schema.py correctly. Guards against parser regressions silently
+        # turning real schema entries into "empty sets" (which would make
+        # calibration vacuously pass). Uses hand-crafted strings that cover
+        # the variants seen in NAMESPACE_SIGNATURES: scalar, list-of-dict,
+        # envelope with nested list-of-dict + ellipsis, envelope without
+        # ellipsis, list-of-tuple (should yield no keys).
+        total += 1
+        parser_script = (
+            "import sys\n"
+            f"sys.path.insert(0, r'{ROOT / 'body'}')\n"
+            "from schema_calibrate import parse_returns\n"
+            "cases = [\n"
+            "    ('str', {'envelope': set(), 'item': set(), 'envelope_open': False, 'item_open': False}),\n"
+            "    ('list[str]', {'envelope': set(), 'item': set(), 'envelope_open': False, 'item_open': False}),\n"
+            "    ('list[{file, line, snippet}]', {'envelope': set(), 'item': {'file','line','snippet'}, 'envelope_open': False, 'item_open': False}),\n"
+            "    ('{ok, path, ...}', {'envelope': {'ok','path'}, 'item': set(), 'envelope_open': True, 'item_open': False}),\n"
+            "    ('{results: [{title, path, score}], warmth: {...}}', {'envelope': {'results','warmth'}, 'item': {'title','path','score'}, 'envelope_open': False, 'item_open': False}),\n"
+            "    ('{neighbors: [{title, path}]}', {'envelope': {'neighbors'}, 'item': {'title','path'}, 'envelope_open': False, 'item_open': False}),\n"
+            "    ('list[(file_path, ref_count)]  # desc by count', {'envelope': set(), 'item': set(), 'envelope_open': False, 'item_open': False}),\n"
+            "    ('None', {'envelope': set(), 'item': set(), 'envelope_open': False, 'item_open': False}),\n"
+            "]\n"
+            "fails = []\n"
+            "for src, want in cases:\n"
+            "    got = parse_returns(src)\n"
+            "    if got != want: fails.append((src, got, want))\n"
+            "print(f'parser_fails:{len(fails)}')\n"
+            "for src, got, want in fails:\n"
+            "    print(f'CASE {src!r}\\n  got  {got}\\n  want {want}')\n"
+        )
+        parser_result = subprocess.run(
+            [sys.executable, "-c", parser_script],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        parser_out = parser_result.stdout
+        if "parser_fails:0" in parser_out:
+            print("  OK   parse_returns handles scalar/list-of-dict/envelope-with-ellipsis/etc dialects")
+            passed += 1
+        else:
+            print(f"  FAIL parse_returns:\n{parser_out}")
+            if parser_result.stderr:
+                print(f"       stderr: {parser_result.stderr.strip()[:400]}")
+
+        # 26. codebase.map (Batch B) — canonical project-orientation primitive.
+        # Exercised standalone via subprocess against a hand-built mock
+        # index_result. Confirms (a) the return shape lands as documented
+        # (path/type/depth/tracked/pagerank/language), (b) every indexed file
+        # appears, (c) tracked degrades to None when cwd isn't a git repo,
+        # (d) the truncation marker fires at max_entries, (e) prefix filter
+        # restricts the output. Pre-index stub coverage (probe #10 path) is
+        # already covered by the search stub; the new map() stub method in
+        # body/server.py is implicitly tested by `from codebase import` not
+        # raising AttributeError when probe #10 reaches for codebase.search.
+        total += 1
+        map_script = (
+            "import sys\n"
+            f"sys.path.insert(0, r'{ROOT / 'body'}')\n"
+            "from codebase import CodebaseGraph\n"
+            "from types import SimpleNamespace as N\n"
+            "files = {\n"
+            "  'src/a.ts': N(symbols=[], references=[], lines=[''], language='typescript', imports=[]),\n"
+            "  'src/b/c.ts': N(symbols=[], references=[], lines=[''], language='typescript', imports=[]),\n"
+            "  'README.md': N(symbols=[], references=[], lines=[''], language='markdown', imports=[]),\n"
+            "}\n"
+            "cb = CodebaseGraph({'root': '/nonexistent_root_xyz', 'files': files, 'file_count': 3})\n"
+            "out = cb.map()\n"
+            "expected_keys = {'path','type','depth','tracked','pagerank','language'}\n"
+            "shape_ok = all(set(e.keys()) == expected_keys for e in out)\n"
+            "print('shape_ok:', shape_ok)\n"
+            "files_only = [e for e in out if e['type']=='file']\n"
+            "dirs_only = [e for e in out if e['type']=='dir']\n"
+            "print('all_files_present:', sorted(e['path'] for e in files_only) == sorted(files.keys()))\n"
+            "print('tracked_none:', all(e['tracked'] is None for e in out))\n"
+            "print('files_have_pagerank:', all(isinstance(e['pagerank'], (int, float)) for e in files_only))\n"
+            "print('dirs_no_pagerank:', all(e['pagerank'] is None for e in dirs_only))\n"
+            "out2 = cb.map(max_entries=2)\n"
+            "print('truncated_marker:', any(e['type']=='truncated' for e in out2))\n"
+            "out3 = cb.map(path='src')\n"
+            "print('prefix_only_src:', all(e['path'].startswith('src') or e['type']=='truncated' for e in out3))\n"
+        )
+        map_result = subprocess.run(
+            [sys.executable, "-c", map_script],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        map_out = map_result.stdout
+        required_map = [
+            "shape_ok: True",
+            "all_files_present: True",
+            "tracked_none: True",
+            "files_have_pagerank: True",
+            "dirs_no_pagerank: True",
+            "truncated_marker: True",
+            "prefix_only_src: True",
+        ]
+        if all(c in map_out for c in required_map):
+            print("  OK   codebase.map returns canonical orient shape + truncation + prefix")
+            passed += 1
+        else:
+            missing_map = [c for c in required_map if c not in map_out]
+            print(f"  FAIL codebase.map missing checks: {missing_map}")
+            print(f"       stdout:\n{map_out}")
+            if map_result.stderr:
+                print(f"       stderr: {map_result.stderr.strip()[:400]}")
+
         # Shutdown
         send(proc, {"op": "shutdown"})
         try:

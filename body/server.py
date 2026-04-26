@@ -100,6 +100,11 @@ class _CodebaseNotReady:
     def find_convention(self, *_args, **_kwargs): return self._err("find_convention")
     def stats(self, *_args, **_kwargs): return self._err("stats")
     def refresh_files(self, *_args, **_kwargs): return self._err("refresh_files")
+    # map is the canonical orient primitive; first thing the model usually
+    # reaches for, so it gets the same teaching-error treatment as search.
+    # Without this stub method, an early codebase.map() pre-index would
+    # AttributeError instead of returning the retry/fallback hint.
+    def map(self, *_args, **_kwargs): return self._err("map")
 
 _CODEBASE_STUB = _CodebaseNotReady()
 

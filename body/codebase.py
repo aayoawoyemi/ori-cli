@@ -531,6 +531,179 @@ class CodebaseGraph:
             })
         return out
 
+    # ────────────────────────────────────────────────────────────────────────
+    # map() — canonical project-orientation primitive
+    # ────────────────────────────────────────────────────────────────────────
+    # Designed to subsume the "where am I, what's tracked, what matters" reach
+    # the model would otherwise satisfy with three separate calls (list_files
+    # + top_files + shell.run('git status')). Returns one flat depth-first
+    # list with all the structural info the model usually needs in one shot.
+    #
+    # Iterates self.files (the indexed catalog) — same source of truth as
+    # list_files() and top_files(). NOT os.walk — that would re-discover
+    # files the indexer already filtered (binaries, oversize, gitignored).
+    # The indexed view is what the model's other primitives operate on, so
+    # surfacing the same view here keeps the mental model coherent.
+    #
+    # Tracked status is queried lazily via `git ls-files` (subprocess, cached
+    # per-instance). Failure modes (not a git repo, git not installed, hung
+    # subprocess) degrade to tracked=None rather than raising — the model
+    # learns "git unknown here" rather than failing the orient call.
+
+    def _get_tracked_set(self) -> Optional[set]:
+        """Cached set of git-tracked relative paths. None if unavailable.
+
+        Cached on the instance so multi-call orient flows (map() then
+        another map() at a deeper prefix) don't re-shell. Cache lives for
+        the lifetime of the CodebaseGraph; refresh_files() doesn't bust it
+        because tracked-status changes on commit/checkout, not edit, and
+        the next session rebuilds the graph anyway.
+        """
+        if hasattr(self, "_tracked_set_cache"):
+            return self._tracked_set_cache
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "ls-files"],
+                capture_output=True, text=True,
+                cwd=self.root, timeout=5,
+            )
+            if result.returncode == 0:
+                # Normalize: git uses forward slashes on every platform, which
+                # matches the indexer's path keys. No separator translation
+                # needed. Strip trailing newlines and skip blank lines.
+                self._tracked_set_cache: Optional[set] = {
+                    line.strip() for line in result.stdout.splitlines() if line.strip()
+                }
+                return self._tracked_set_cache
+        except Exception:
+            pass
+        self._tracked_set_cache = None
+        return None
+
+    def map(
+        self,
+        path: str = ".",
+        max_depth: int = 5,
+        max_entries: int = 500,
+    ) -> list[dict]:
+        """
+        Project structure orientation — flat depth-first list of every
+        indexed entry under `path`, with structural metadata in one shot.
+
+        This is the canonical "show me the project" primitive. Folds in
+        what would otherwise be three separate calls:
+          - list_files()         → covered by [e for e in tree if e['type']=='file']
+          - top_files()          → covered by sorting on e['pagerank']
+          - shell.run('git status') → covered by e['tracked']
+
+        Args:
+          path: prefix to filter by ('.' = everything indexed).
+                e.g., 'src' returns only files under 'src/'.
+          max_depth: tree depth cap; files deeper than this are skipped.
+                     Default 5 covers typical repo nesting without dumping
+                     vendored trees.
+          max_entries: hard cap on output size. When hit, a final
+                       {type:'truncated', path:'...'} marker is appended
+                       so the model sees that more existed.
+
+        Returns: list[{path, type, depth, tracked, pagerank, language}]
+          - path      : relative path (forward slashes)
+          - type      : 'file' | 'dir' | 'truncated'
+          - depth     : 0 for top-level; 1 for src/x; 2 for src/foo/x; etc.
+          - tracked   : True if in git, False if untracked, None if git
+                        unavailable (not a repo / git not installed /
+                        subprocess timeout). Always None for dirs.
+          - pagerank  : float for files (rounded to 4dp); None for dirs.
+          - language  : str for files (e.g. 'typescript'); None for dirs.
+
+        Example (orient: read top-pagerank untracked files):
+          tree = codebase.map()
+          untracked = sorted(
+              [e for e in tree if e['type']=='file' and e.get('tracked') is False],
+              key=lambda e: -(e.get('pagerank') or 0),
+          )
+          for e in untracked[:5]:
+              print(f"{e['path']} (pr={e['pagerank']}, lang={e['language']})")
+
+        Example (subtree-only orient):
+          for e in codebase.map('src/router'):
+              if e['type']=='file':
+                  print(e['path'])
+        """
+        # Normalize prefix. 'src/foo' / 'src/foo/' / './src/foo' all become 'src/foo/'.
+        # Empty / '.' means no filter — return everything.
+        p = (path or "").strip().rstrip("/")
+        if p in ("", "."):
+            prefix = ""
+        elif p.startswith("./"):
+            prefix = p[2:] + "/"
+        else:
+            prefix = p + "/"
+
+        tracked = self._get_tracked_set()
+        pr_all = self._ensure_pagerank()
+
+        entries: list[dict] = []
+        seen_dirs: set[str] = set()
+
+        # Sort for deterministic depth-first output. Files in the same dir
+        # appear together; ancestors get emitted on first visit.
+        files_sorted = sorted(self.files.keys())
+
+        def _truncate_and_return() -> list[dict]:
+            entries.append({
+                "path": "...",
+                "type": "truncated",
+                "depth": 0,
+                "tracked": None,
+                "pagerank": None,
+                "language": None,
+            })
+            return entries
+
+        for fpath in files_sorted:
+            if prefix and not fpath.startswith(prefix):
+                continue
+            rel = fpath[len(prefix):] if prefix else fpath
+            parts = rel.split("/")
+            depth = len(parts) - 1
+            if depth > max_depth:
+                continue
+
+            # Emit ancestor dirs lazily (one entry per dir, first visit only).
+            # Each ancestor's depth is its position in the parts list (0-indexed).
+            for i in range(depth):
+                dir_rel = "/".join(parts[:i + 1])
+                dir_path = (prefix + dir_rel) if prefix else dir_rel
+                if dir_path in seen_dirs:
+                    continue
+                seen_dirs.add(dir_path)
+                entries.append({
+                    "path": dir_path,
+                    "type": "dir",
+                    "depth": i,
+                    "tracked": None,
+                    "pagerank": None,
+                    "language": None,
+                })
+                if len(entries) >= max_entries:
+                    return _truncate_and_return()
+
+            rec = self.files[fpath]
+            entries.append({
+                "path": fpath,
+                "type": "file",
+                "depth": depth,
+                "tracked": (fpath in tracked) if tracked is not None else None,
+                "pagerank": round(pr_all.get(fpath, 0.0), 4),
+                "language": getattr(rec, "language", None),
+            })
+            if len(entries) >= max_entries:
+                return _truncate_and_return()
+
+        return entries
+
     # -------- Ambient Signature Compilation --------
 
     # Content density per level — controls what goes in the signature.
