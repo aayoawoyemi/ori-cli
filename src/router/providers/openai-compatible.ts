@@ -365,6 +365,18 @@ export class OpenAICompatibleProvider implements ModelProvider {
             }
             pendingToolCalls.clear();
           }
+
+          // Output hit token ceiling â€” emit cutoff_warning so the loop's
+          // max_tokens recovery path triggers (mirrors Anthropic provider).
+          // OpenAI-compatible APIs return finish_reason='length' when max_tokens
+          // is reached, equivalent to Anthropic's stop_reason='max_tokens'.
+          if (choice.finish_reason === 'length') {
+            yield {
+              type: 'cutoff_warning',
+              reason: 'max_tokens',
+              message: 'Output truncated by max_tokens. Continue from where you left off.',
+            };
+          }
         }
       }
     } finally {

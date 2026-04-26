@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type { ModelProvider, Message, ToolDefinition, StreamEvent, ContentBlock } from '../types.js';
-import type { ModelConfig } from '../../config/types.js';
+import type { ModelConfig, FeaturesConfig } from '../../config/types.js';
+import { resolveMaxTokens, resolveThinkingBudget } from '../model-capabilities.js';
 import {
   AnthropicLocalOAuthError,
   AnthropicLocalOAuthSource,
@@ -10,7 +11,6 @@ import { buildBillingHeader } from '../../auth/cch.js';
 import { getMessageText } from '../../utils/messages.js';
 import { CACHE_PREFIX_BREAK } from '../../prompt.js';
 
-/** Convert our Message format to Anthropic's format. */
 function toAnthropicMessages(messages: Message[]): Anthropic.MessageParam[] {
   const result: Anthropic.MessageParam[] = [];
 
@@ -64,14 +64,41 @@ function toAnthropicMessages(messages: Message[]): Anthropic.MessageParam[] {
     }
   }
 
+
+  // Cache breakpoint on the last user message (Pi pattern). Tells Anthropic
+  // to cache the entire conversation history up to this point. Next turn,
+  // only new messages after this point get charged as input. This is the
+  // single highest-leverage optimization for token cost.
+  for (let i = result.length - 1; i >= 0; i--) {
+    if (result[i].role === 'user') {
+      const msg = result[i];
+      if (Array.isArray(msg.content)) {
+        const lastBlock = msg.content[msg.content.length - 1];
+        if (lastBlock && typeof lastBlock === 'object') {
+          (lastBlock as any).cache_control = { type: 'ephemeral' };
+        }
+      } else if (typeof msg.content === 'string') {
+        result[i] = {
+          role: 'user',
+          content: [{ type: 'text', text: msg.content, cache_control: { type: 'ephemeral' } }] as any,
+        };
+      }
+      break;
+    }
+  }
+
   return result;
 }
 
+// Cache breakpoint on the last tool definition (Pi pattern). Tells Anthropic
+// to cache system prompt + all tool schemas as a prefix block. Without this,
+// ~5K tokens of tool schemas get re-read every turn.
 function toAnthropicTools(tools: ToolDefinition[]): Anthropic.Tool[] {
-  return tools.map(t => ({
+  return tools.map((t, i) => ({
     name: t.name,
     description: t.description,
     input_schema: t.input_schema as Anthropic.Tool.InputSchema,
+    ...(i === tools.length - 1 ? { cache_control: { type: 'ephemeral' as const } } : {}),
   }));
 }
 
@@ -121,6 +148,12 @@ interface AnthropicProviderOptions {
   maxRateLimitRetries?: number;
   defaultRateLimitBackoffMs?: number;
   sleepImpl?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  /** Batch 3 — when features.harnessCleanup is true, the constructor uses
+   *  the per-model capability table (model-capabilities.ts) instead of the
+   *  16K floor, and the stream emits cutoff_warning events on max_tokens
+   *  hits. Threaded from ModelRouter (router/index.ts) so the provider
+   *  doesn't have to reach into config itself. */
+  features?: FeaturesConfig;
 }
 
 export class AnthropicProvider implements ModelProvider {
@@ -138,11 +171,23 @@ export class AnthropicProvider implements ModelProvider {
   private readonly sleepImpl: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Extended thinking budget (tokens). 0 = no thinking. Set by ModelRouter before each stream call. */
   private _thinkingBudget = 0;
+  /** Batch 3 — captured at construction for the message_delta cutoff_warning
+   *  branch. Stored on the instance because the for-await closure inside
+   *  stream() can't see the original `options` arg without re-plumbing. */
+  private readonly features?: FeaturesConfig;
 
   constructor(config: ModelConfig, options: AnthropicProviderOptions = {}) {
     this.model = config.model;
     this.contextWindow = config.contextWindow ?? 200_000;
-    this.maxTokens = config.maxTokens ?? 16_384;
+    this.features = options.features;
+    // Batch 3 — under harnessCleanup, the model-capabilities table picks
+    // a per-model default (Opus 4.7 → 128K) and clamps explicit overrides
+    // to the model's API ceiling. Pre-flag behavior is the legacy 16K
+    // floor; one-line revert in src/config/defaults.ts:99 swaps back.
+    // setMaxTokens()/getMaxTokens() at :312-318 still override at-call.
+    this.maxTokens = this.features?.harnessCleanup
+      ? resolveMaxTokens(config.model, config.maxTokens)
+      : (config.maxTokens ?? 16_384);
     this.useOAuth = config.auth === 'oauth';
     this.baseUrl = config.baseUrl;
     this.maxRateLimitRetries = Math.max(0, options.maxRateLimitRetries ?? 1);
@@ -376,6 +421,8 @@ export class AnthropicProvider implements ModelProvider {
     //
     // Only set when tools are present — no effect on plain conversational
     // turns and avoids API validation errors on tool-less requests.
+    const thinkingBudget = resolveThinkingBudget(this.maxTokens, this._thinkingBudget);
+
     const requestParams = {
       model: this.model,
       max_tokens: this.maxTokens,
@@ -386,8 +433,8 @@ export class AnthropicProvider implements ModelProvider {
         tool_choice: { type: 'auto' as const, disable_parallel_tool_use: true },
       }),
       // Extended thinking: inject budget when > 0. budget_tokens counts toward max_tokens.
-      ...(this._thinkingBudget > 0 && {
-        thinking: { type: 'enabled' as const, budget_tokens: this._thinkingBudget },
+      ...(thinkingBudget > 0 && {
+        thinking: { type: 'enabled' as const, budget_tokens: thinkingBudget },
       }),
     } as Anthropic.MessageCreateParams;
 
@@ -424,7 +471,7 @@ export class AnthropicProvider implements ModelProvider {
         'user-agent': 'aries-cli/0.1.0 (external, cli)',
         'x-app': 'cli',
       };
-    } else if (this._thinkingBudget > 0) {
+    } else if (thinkingBudget > 0) {
       // API key mode: add extended thinking beta only when thinking is active
       streamOptions.headers = {
         'anthropic-beta': 'interleaved-thinking-2025-05-14',
@@ -448,6 +495,25 @@ export class AnthropicProvider implements ModelProvider {
         // Map stream index → tool_use id, so input_json_delta goes to the right buffer
         const indexToToolId = new Map<number, string>();
 
+        // Batch 3 — captured stop_reason from message_delta. CC's pattern
+        // (services/api/claude.ts:2242) records this on message_delta and
+        // surfaces a cutoff_warning before message_stop fires.
+        let observedStopReason: string | null = null;
+        // Batch 3 (close-out) — count completed content blocks (text or
+        // tool_use, NOT thinking). Used to detect the "200 OK, no body"
+        // proxy-failure pattern Claude Code guards against in
+        // services/api/claude.ts:2350: stream completes without a single
+        // content block AND without a stop_reason. We surface that as a
+        // cutoff_warning so the loop layer treats it the same way as a
+        // max_tokens cutoff (model continues from where it left off).
+        let completedContentBlocks = 0;
+
+        // Batch 3 — wrap the stream consumer in try/finally so the
+        // toolInputBuffers map is cleared even if the generator is aborted
+        // mid-stream (network drop, AbortSignal, downstream throw). Pre-fix
+        // the buffer entries leaked into the next request via the closure
+        // capture; defensive cleanup keeps memory + state honest.
+        try {
         for await (const event of stream) {
           if (event.type === 'content_block_start') {
             const cb = event.content_block as { type: string; id?: string; name?: string };
@@ -482,6 +548,10 @@ export class AnthropicProvider implements ModelProvider {
               thinkingBlockIndices.delete(event.index);
               continue;
             }
+            // Batch 3 close-out — count non-thinking blocks that completed
+            // cleanly. Used by the post-loop guard below to detect "200 OK
+            // empty body" proxy failures.
+            completedContentBlocks += 1;
             // Finalize only the tool buffer for this block index
             const toolId = indexToToolId.get(event.index);
             if (toolId) {
@@ -499,6 +569,42 @@ export class AnthropicProvider implements ModelProvider {
               }
               indexToToolId.delete(event.index);
             }
+          } else if (event.type === 'message_delta') {
+            // Batch 3 — capture stop_reason here so we can synthesize a
+            // cutoff_warning before the done event fires. Pre-fix the
+            // stream went silent on max_tokens hits and the model lost
+            // ~5-10K input tokens on the inevitable retry. Pattern from
+            // Claude Code services/api/claude.ts:2213-2293 — they inject
+            // a synthetic assistant message into the stream telling the
+            // model "you got cut off, continue from where you left off."
+            // The loop layer (src/loop.ts) handles the actual injection
+            // when this event arrives; provider just surfaces the signal.
+            // Same recovery path for model_context_window_exceeded per
+            // CC's note that both = "continue from cutoff" semantically.
+            const stopReason = (event as unknown as { delta?: { stop_reason?: string } })
+              .delta?.stop_reason;
+            if (stopReason) observedStopReason = stopReason;
+            if (this.features?.harnessCleanup && stopReason === 'max_tokens') {
+              emittedAnyOutput = true;
+              yield {
+                type: 'cutoff_warning',
+                reason: 'max_tokens',
+                message:
+                  `Response cut off at ${this.maxTokens} output token max. ` +
+                  `Continue from where you left off in the next turn.`,
+              };
+            } else if (
+              this.features?.harnessCleanup &&
+              stopReason === 'model_context_window_exceeded'
+            ) {
+              emittedAnyOutput = true;
+              yield {
+                type: 'cutoff_warning',
+                reason: 'context_window',
+                message:
+                  'Context window exceeded. Continue from where you left off.',
+              };
+            }
           } else if (event.type === 'message_stop') {
             const finalMessage = await stream.finalMessage();
             emittedAnyOutput = true;
@@ -511,9 +617,42 @@ export class AnthropicProvider implements ModelProvider {
               cacheReadTokens: usage.cache_read_input_tokens ?? 0,
               cacheWriteTokens: usage.cache_creation_input_tokens ?? 0,
             };
+            // Batch 3 close-out — stream-no-events guard. Mirrors Claude
+            // Code's check at services/api/claude.ts:2350: if the stream
+            // completed but produced no completed content blocks AND we
+            // didn't capture a stop_reason via message_delta, the proxy
+            // returned a 200 with no usable body. Surface as cutoff_warning
+            // so the loop layer treats it the same way as max_tokens —
+            // injects a continuation marker, model retries cleanly. Without
+            // this guard the model just sees an empty assistant turn and
+            // gets confused. The check fires AFTER usage is yielded so
+            // telemetry still records the cost of the empty response.
+            if (
+              this.features?.harnessCleanup
+              && completedContentBlocks === 0
+              && observedStopReason === null
+            ) {
+              yield {
+                type: 'cutoff_warning',
+                reason: 'context_window',
+                message:
+                  'Upstream returned no content blocks (proxy timeout or empty response). ' +
+                  'Continue from where you left off.',
+              };
+            }
             emittedAnyOutput = true;
             yield { type: 'done' };
           }
+        }
+        } finally {
+          // Batch 3 — defensive cleanup. Buffers should already be empty
+          // after content_block_stop fires for each tool_use, but stream
+          // aborts (network drop, AbortSignal, downstream throw) skip
+          // those events. Clearing here prevents partial JSON from
+          // re-appearing on the next request via captured closure refs.
+          toolInputBuffers.clear();
+          indexToToolId.clear();
+          thinkingBlockIndices.clear();
         }
 
         return;

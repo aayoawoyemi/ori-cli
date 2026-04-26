@@ -1,5 +1,5 @@
 import type { ModelProvider, Message, ToolDefinition, StreamEvent, ModelSlot, ContentBlock, ImageContent } from './types.js';
-import type { RouterConfig, ModelConfig, ExperimentalConfig } from '../config/types.js';
+import type { RouterConfig, ModelConfig, ExperimentalConfig, FeaturesConfig } from '../config/types.js';
 import { AnthropicProvider } from './providers/anthropic.js';
 import { GoogleProvider } from './providers/google.js';
 import { OpenAICompatibleProvider } from './providers/openai-compatible.js';
@@ -69,6 +69,7 @@ const VISION_MODEL_PREFIXES = [
   'glm-4.5v', 'glm-5.1v',
   // Kimi vision
   'kimi-vl',
+  'kimi-k2.6',
   // Llama vision
   'llama-3.2-vision', 'llama-4-vision',
 ];
@@ -151,6 +152,7 @@ const MODEL_SHORTCUTS: Record<string, ModelShortcut> = {
   'gemini-flash':  { provider: 'openrouter', model: 'google/gemini-3-flash-preview', contextWindow: 1_000_000 },
   'glm5':          { provider: 'openrouter', model: 'z-ai/glm-5.1',                 contextWindow: 202_752 },
   'glm5.1':        { provider: 'openrouter', model: 'z-ai/glm-5.1',                 contextWindow: 202_752 },
+  'kimi-k2.6':     { provider: 'openrouter', model: 'moonshotai/kimi-k2.6',         contextWindow: 262_144 },
   'gemma4':        { provider: 'openrouter', model: 'google/gemma-4-26b-a4b-it',    contextWindow: 262_144 },
 
   // â”€â”€ Local (llama.cpp via openai-compatible API on port 8080) â”€â”€â”€â”€â”€â”€
@@ -187,11 +189,12 @@ const PROVIDER_ENV_KEYS: Partial<Record<ModelConfig['provider'], string>> = {
 
 // â”€â”€ Provider Factory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-function createProvider(config: ModelConfig, experimental?: ExperimentalConfig): ModelProvider {
+function createProvider(config: ModelConfig, experimental?: ExperimentalConfig, features?: FeaturesConfig): ModelProvider {
   switch (config.provider) {
     case 'anthropic':
       return new AnthropicProvider(config, {
         allowExperimentalLocalOAuth: experimental?.localClaudeSubscription ?? false,
+        features,
       });
     case 'google':
       return new GoogleProvider(config);
@@ -224,17 +227,19 @@ export class ModelRouter {
   private _effort: EffortLevel = 'medium';
   private primaryConfig: ModelConfig;
   private experimental?: ExperimentalConfig;
+  private features?: FeaturesConfig;
 
-  constructor(config: RouterConfig, experimental?: ExperimentalConfig) {
+  constructor(config: RouterConfig, experimental?: ExperimentalConfig, features?: FeaturesConfig) {
     // Primary is optional at construction — a fresh install with no config
     // should be able to load the CLI and see an onboarding screen rather than
     // crash. The router throws a readable error at first call site below.
     this.primaryConfig = config.primary ?? ({} as ModelConfig);
     this.experimental = experimental;
-    if (config.primary) this.providers.set('primary', createProvider(config.primary, this.experimental));
-    if (config.reasoning) this.providers.set('reasoning', createProvider(config.reasoning, this.experimental));
-    if (config.cheap) this.providers.set('cheap', createProvider(config.cheap, this.experimental));
-    if (config.bulk) this.providers.set('bulk', createProvider(config.bulk, this.experimental));
+    this.features = features;
+    if (config.primary) this.providers.set('primary', createProvider(config.primary, this.experimental, this.features));
+    if (config.reasoning) this.providers.set('reasoning', createProvider(config.reasoning, this.experimental, this.features));
+    if (config.cheap) this.providers.set('cheap', createProvider(config.cheap, this.experimental, this.features));
+    if (config.bulk) this.providers.set('bulk', createProvider(config.bulk, this.experimental, this.features));
   }
 
   /** Readable error when a caller tries to use an unset primary slot. */

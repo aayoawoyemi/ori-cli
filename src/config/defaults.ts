@@ -21,7 +21,13 @@ export const DEFAULT_CONFIG: AriesConfig = {
     maxMemories: 200,
   },
   compact: {
-    auto: true,
+    // Auto-compaction is structurally disabled at the loop layer since the
+    // 2026-04-19 no-injection refactor (src/loop.ts: "Auto-compaction stays
+    // disabled — never compact mid-task"). The config flag was left at
+    // `true` as a leftover; Batch 1.8 aligns config with behavior so this
+    // surface stops lying. Microcompact (tool-result pruning over ~100k
+    // tokens) is the only pruning pass that still runs, and it's unconditional.
+    auto: false,
     threshold: 0.8,
     classifyTiers: true,
   },
@@ -90,7 +96,15 @@ export const DEFAULT_CONFIG: AriesConfig = {
   // Once a flag has held `true` across N sessions without regression,
   // graduate the behavior to unconditional and delete the flag.
   features: {
-    harnessCleanup: false,
+    // Batch 3 — flipped 2026-04-25. Walk-codemode test bisected: the
+    // 121s bridge-request timeouts reproduce with flag OFF too, so
+    // they're a pre-existing bridge-layer flake (Batch 1.6's standalone
+    // repro was 0/100 but bridge-callback variants still hang
+    // sometimes), NOT a Batch 3 regression. Walk still completes — the
+    // model retries through the timeouts and lands on the correct
+    // answer. Bridge stability is captured as a separate task; lifting
+    // the output cap doesn't depend on it.
+    harnessCleanup: true,
     contracts: false,
     craft: false,
     gotchas: false,
