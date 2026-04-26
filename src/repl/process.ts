@@ -54,10 +54,17 @@ export class ReplProcess {
     const readyTimeoutMs = this.opts.readyTimeoutMs ?? 10_000;
 
     this.exited = false;
-    this.proc = spawn(this.opts.pythonCmd, [this.opts.serverPath], {
+    // Batch 3.5 (2026-04-25) — keep stdio unbuffered in the live bridge path.
+    // The standalone substrate smoke already launches body/server.py with
+    // `-u`; production should not be weaker than the test harness. The main
+    // Opus walkmode timeout fix is request serialization in bridge.ts plus
+    // rlm_call deadlines in body/rlm.py, but unbuffered stdio removes a second
+    // Windows pipe variable from the bridge-callback path.
+    this.proc = spawn(this.opts.pythonCmd, ['-u', this.opts.serverPath], {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
       cwd: this.opts.cwd,
+      env: { ...process.env, PYTHONUNBUFFERED: '1' },
     });
 
     this.rl = createInterface({

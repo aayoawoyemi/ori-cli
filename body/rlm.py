@@ -52,6 +52,7 @@ _base_url: Optional[str] = None
 _model: str = "openai/gpt-oss-20b"
 _max_calls_per_exec: int = 15
 _max_parallel: int = 5  # concurrent calls in rlm_batch
+_per_call_timeout_s: float = 30.0
 
 # Per-exec state (reset before each exec)
 _call_count = 0
@@ -153,11 +154,31 @@ async def _call_single(slice_: Any, sub_question: str, budget: int) -> str:
     effective_max_tokens = max(budget, 250)
 
     try:
-        response = await _client.chat.completions.create(
-            model=_model,
-            max_tokens=effective_max_tokens,
-            messages=[{"role": "user", "content": prompt}],
+        # Batch 3.5 (2026-04-25): rlm_call must never be able to wedge the
+        # parent Repl. The outer Repl timeout injects an async exception into
+        # the worker thread, but if that thread is parked in an async HTTP
+        # client/network wait, cancellation may not land until the network
+        # stack returns. Opus learned from the Repl examples to use rlm_call
+        # for "walk vault -> summarize note"; when OpenRouter/Anthropic stalls,
+        # the whole Repl bridge times out at 120s. Put the hard deadline at the
+        # nested-call layer so the worker returns a normal string and the main
+        # model can continue without bridge failure.
+        response = await asyncio.wait_for(
+            _client.chat.completions.create(
+                model=_model,
+                max_tokens=effective_max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+                timeout=_per_call_timeout_s,
+            ),
+            timeout=_per_call_timeout_s + 2.0,
         )
+    except asyncio.TimeoutError:
+        _call_log.append({
+            "call_num": call_num,
+            "question": sub_question[:100],
+            "error": f"timeout after {_per_call_timeout_s:.0f}s",
+        })
+        return f"(rlm_call timeout after {_per_call_timeout_s:.0f}s)"
     except Exception as e:
         _call_log.append({
             "call_num": call_num,

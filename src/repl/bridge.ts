@@ -8,6 +8,7 @@
  *   await bridge.shutdown();
  */
 import { resolve, dirname, sep } from 'node:path';
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -238,6 +239,20 @@ export function projectVaultResult(
 export class ReplBridge {
   private process: ReplProcess | null = null;
   private pending: PendingResolver[] = [];
+  // Batch 3.5 (2026-04-25) — serialize top-level TS→body requests.
+  //
+  // The body can run `exec` in a worker while its main loop stays free to
+  // route callback responses (`vault_response`, `fs_response`, `ask_response`,
+  // etc.). That only works if the TS side does NOT send a second top-level
+  // request (ping/signature/status/index/another exec) while the first exec is
+  // still pending. If it does, body/server.py's FIFO-preserving join path can
+  // block the main loop, so callback responses sit unread and the Repl call
+  // eventually dies at `timeout + 30s` (the observed 120s walkmode failure).
+  //
+  // This promise chain is the narrow invariant: top-level request/response
+  // traffic remains FIFO, while callback responses continue to bypass the
+  // queue via direct process.write() calls in resolveAsk/handle*Callback.
+  private requestTail: Promise<void> = Promise.resolve();
   private restarting = false;
   private restartCount = 0;
   private vault: OriVault | null = null;
@@ -480,6 +495,21 @@ export class ReplBridge {
   }
 
   private async request(msg: object, timeoutMs: number, signal?: AbortSignal): Promise<any> {
+    const previous = this.requestTail;
+    let release!: () => void;
+    this.requestTail = new Promise<void>((resolveQueue) => {
+      release = resolveQueue;
+    });
+
+    await previous.catch(() => undefined);
+    try {
+      return await this.requestUnlocked(msg, timeoutMs, signal);
+    } finally {
+      release();
+    }
+  }
+
+  private async requestUnlocked(msg: object, timeoutMs: number, signal?: AbortSignal): Promise<any> {
     // Ensure process is alive
     if (!this.process?.isAlive()) {
       await this.restart('process not alive at request time');
@@ -671,7 +701,7 @@ export class ReplBridge {
   ): Promise<CodebaseSignature> {
     return this.request(
       { op: 'codebase_signature', level, max_tokens: maxTokens },
-      10_000,
+      30_000,
     );
   }
 
@@ -685,7 +715,7 @@ export class ReplBridge {
   ): Promise<VaultSignature> {
     return this.request(
       { op: 'vault_signature', level, max_tokens: maxTokens },
-      10_000,
+      30_000,
     );
   }
 
@@ -1883,7 +1913,10 @@ export class ReplBridge {
   private assertInsideWorkspace(absPath: string, op: string): void {
     const rootWithSep = this.cwd.endsWith(sep) ? this.cwd : this.cwd + sep;
     const targetWithSep = absPath + sep;
-    if (absPath !== this.cwd && !targetWithSep.startsWith(rootWithSep)) {
+    // Allow writes to ~/.aries/ â€” the agent's own config directory
+    const ariesDir = (homedir() ?? '') + sep + '.aries' + sep;
+    const isAriesConfig = targetWithSep.startsWith(ariesDir);
+    if (absPath !== this.cwd && !targetWithSep.startsWith(rootWithSep) && !isAriesConfig) {
       throw new Error(
         `${op}: path outside workspace (${absPath}). Only paths inside ${this.cwd} are allowed. For paths outside the workspace, call ask(question) to get explicit user approval first — per-call permission prompts are not wired for fs.* yet (A1 minimum-viable).`
       );
