@@ -65,9 +65,12 @@ check('unknown model falls back to conservative 16K default',
 check('unknown model upperLimit = 32K',
   unknown.upperLimit === 32_000);
 
-// Non-Claude IDs (e.g., openai-shaped) also fall back cleanly.
-const nonClaude = getModelCapability('gpt-5-turbo');
-check('non-Claude model id falls back to FALLBACK',
+// Genuinely unknown model IDs fall back cleanly. Don't pick a name that
+// substring-matches a needle in CAPABILITIES (e.g., 'gpt-5-turbo' would
+// match the 'gpt-5' entry now that GPT-5 is in the table) — that tests
+// the match path, not the fallback path.
+const nonClaude = getModelCapability('mystery-model-not-in-table');
+check('genuinely unknown model id falls back to FALLBACK',
   nonClaude.default === 16_384 && nonClaude.upperLimit === 32_000);
 
 // ── resolveMaxTokens ────────────────────────────────────────────────────
