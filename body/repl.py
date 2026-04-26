@@ -119,6 +119,25 @@ def _enrich_exception(tb: str, code: str) -> tuple[str, bool]:
             return tb, False
         last_line = tail_lines[-1]
         exc_class = last_line.split(":", 1)[0].strip()
+
+        # ── SyntaxError + TS-like code → hint that Repl is Python ──────
+        # When Python raises SyntaxError on code that contains TypeScript-like
+        # patterns (const, let, =>, interface, export), append a teaching hint.
+        # This replaces the removed client-side looksLikeTypeScriptOrJavaScript
+        # regex (repl.ts, deleted 2026-04-25) which false-positived on TS content
+        # inside Python string literals. The Python AST is authoritative.
+        # Output intentionally contains "TypeScript/JavaScript" so that
+        # classifyToolRejection in loop.ts triggers tsOrJsInPythonRepl path.
+        if exc_class == "SyntaxError":
+            ts_hints = ["const ", "let ", "function ", "=>", "interface ", "export ", "var "]
+            if any(h in code for h in ts_hints):
+                return (
+                    tb.rstrip()
+                    + "\nNOTE: This looks like TypeScript/JavaScript — Repl runs "
+                    + "Python. For TS file work, use fs.read/fs.edit/fs.write "
+                    + "from Python.\n"
+                ), True
+
         if exc_class not in _SHAPE_ERROR_CLASSES:
             return tb, False
 

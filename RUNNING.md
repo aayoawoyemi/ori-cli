@@ -477,3 +477,85 @@ Consolidated for reference. Some fixed by current plan, most applicable only whe
 ## Session Credits
 
 This document is the product of one long design session on 2026-04-19 between Aayo Awoyemi and the Aries instance running in Opus 4.7 (1M context). Research subagents contributed the agent-SDK landscape map and the Claude Code + oh-my-pi harness comparison. Vault notes queried: 14. Notes saved this session: 2 (convergence signal, naming lock).
+
+---
+
+## 2026-04-25 / 2026-04-26 — Honesty pass + Nous direction set
+
+Six follow-on sessions between Aayo + Aries (Opus 4.6 / 4.7) + Codex collaboration. Token-fix-pass arc closed; harness honesty arc opened and substantially shipped; codemode-rhetoric corrected against vault canon; Ori Nous design committed for the next major arc.
+
+### Shipped since the 2026-04-19 token-fix pass
+
+- **Batch 1.5** — `body/schema.py` as single source of truth for `NAMESPACE_SIGNATURES`; `_enrich_exception` appends `NOTE: <primitive> returns <shape>` so wrong-shape KeyErrors self-correct without a discovery turn.
+- **Batch 1.6** — `body/_protocol.py` atomic `os.write` helper; comprehensive `_stdout_lock` removal across `body/*.py`. Eliminated the `_async_raise`-mid-lock deadlock window. `bridge_callback_hang_repro.py` (50 trials) green post-fix.
+- **Batch 1.7** — input-repair shim in `src/tools/repl.ts` covers 5 broken-shape cases (pre-Stream-A `{code}`, plan+code at root, stringified ops, wrong key name, missing purpose) with `NOTE: harness repaired ...` teaching channel.
+- **Batch 1.8** — runtime calibration (`body/schema_calibrate.py` + `schema.calibrated.json`) catches phantom-key drift structurally; Agent tool output capture fix (subagent-mode now surfaces last Repl `output_full` when no assistant text emitted); `NAMESPACE_VERSION` blake2b hash of schema (A.9.1 pulled forward); audit pass killed `vault.top` snippet lie, `prompt.ts:46` filesystem-access lie, `compact.auto: true` config drift; `ori/ROADMAP.md` got Consumer Requests section documenting server-side snippet ask.
+- **Batch 3** — per-model `MAX_TOKENS` table in `src/router/model-capabilities.ts` (Opus 4.6/4.7 → 128K, Sonnet 4.6 → 64K default / 128K upper, Haiku 4.5 → 64K); pattern lifted from CC's `utils/context.ts:149-210` with deliberate divergence (default = upperLimit on Opus for codemode maximalism). `cutoff_warning` StreamEvent + `message_delta` handler (CC pattern from `services/api/claude.ts:2266-2292`); force-flush `toolInputBuffers` in `try/finally`; stream-no-events guard (CC's `claude.ts:2350` pattern); `resolveThinkingBudget` for thinking + tiny-cap interaction; 21/21 model-capability smoke.
+- **Batch 3.5 — bridge serialization fix (Codex root-cause)** — top-level TS→Python bridge requests could overlap with a running exec, causing the main loop to block on `exec_thread.join()` and starve callback responses. Pattern matched the 122s pre-existing bridge hang the standalone repros couldn't catch. Codex serialized the queue in `src/repl/bridge.ts`, kept callback responses bypassing it, added `bridge_request_serialization_smoke.ts` + `walkmode_live.ts`. Walk-codemode now clean: 1 Repl, 0 timeouts on Opus 4.6.
+- **Per-op Repl execution (Codex)** — each operation in a composed batch runs independently in the shared Python namespace via `bridge.exec()` per op. Variables persist op-to-op; if op 2 fails, ops 3-5 still run. Per-op timing, per-op `lintError` (TS-shape detection per op), per-op `[harness:cutoff]` survival. Replaces all-or-nothing batch failure semantics. Composition got cheaper to attempt aggressively because failures are contained.
+- **Max-tokens recovery loop (Codex/Aries)** — `MAX_OUTPUT_RECOVERY_LIMIT = 3` in `src/loop.ts`; when `[harness:cutoff` marker appears in `assistantText`, harness auto-injects a synthetic user "resume mid-thought" message and re-enters the loop. Telemetry: `max_output_recovery` + `max_output_recovery_exhausted` events. Pre-fix the model just stopped mid-sentence; user had to manually type "continue."
+- **Phase B/C of Batch 3 close-out** — TS-shape detector in `src/tools/repl.ts:looksLikeTypeScriptOrJavaScript` (5 anchored TS regex patterns + `=>` catch-all) → if matched, rejection prepends actionable Edit/Write/`shell.run("npx tsx ...")` guidance. Repeated-rejection guard in `src/loop.ts` (per-turn `Map<toolName, {count, reason}>`) injects `[harness:steering]` system-reminder after 2nd same-reason rejection; one-shot per turn. 12/12 input_repair smoke including 4 new TS rejection cases + 1 Python-with-TS-tokens negative case.
+- **Vault.read(None) guard** — wiki-link stubs (graph nodes without backing files) surface in `vault.explore` results with `path=None`. Pre-fix `vault.read(None)` died in `os.path.join` with cryptic TypeError; post-fix raises `VaultError` with teaching message ("Filter results with `if h['path']:` before reading").
+- **Shell.run unix-ism hint enrichment** — failure-time only (zero false positives on real Unix hosts). `_UNIX_HINTS` table maps `grep/ls/cat/find/sed/head/tail/wc` to harness primitives; when a command fails AND was a unix-ism, hint appended to stderr next to the actual error. 10/10 detector cases pass.
+- **Calibration fixture covers `vault.top` / `vault.neighbors` / `vault.backlinks`** — drift probe (`a10_substrate_smoke.py:#24`) verified to catch phantom keys via simulated snippet-lie test. Fixture is narrow on purpose; expands as primitives are audited live.
+
+### The codemode-honesty correction (2026-04-26)
+
+We are not "pure codemode" in the maximalist sense. We built a **composition surface over existing primitives**, with JSON-RPC bridge underneath. The vault already corrected this framing months ago — the rhetoric just hadn't caught up.
+
+- Honest framing: *"Not a different computer — a better way to drive the same one."* (vault note 2026-04-20, Sonnet-inside-Aries arrived at this independently)
+- "Every agent gets its own computer" = one body subprocess per `ori` launch (replicating); primitives are how the agent traverses inside it (per `replicating-and-traversing-are-nested-not-parallel`).
+- Python is the **driver**, target language is anything (per `codemode-is-python-as-driver`). Kills the "I don't use Python" objection.
+- The hybrid (Python REPL + JSON-RPC bridge + MCP backend) is the *intended* architecture for Aries-the-harness, not a thesis violation. The maximalist `codemode-paradigm` note (2026-04-14) was rhetorical north star; the April 19-20 notes are the corrected, vault-canonical framing.
+
+### Where we actually are in the three-layer story
+
+- **Mnemos (memory substrate)** — shipping. Nothing structurally missing for Aries' use today.
+- **Aries (harness)** — shipping, in active polish. Per-op execution, cutoff recovery, schema honesty, bridge serialization all landed. Friction inventory below is the last leg before "harness layer is honest and feels like one substrate."
+- **Nous (kernel)** — **NOT STARTED.** This is the missing piece for transformative-feeling sessions. Without it: context bloats, sub-tasks can't be cheaply forked, sessions degrade after ~hour 2 even with the polish work. With it: long sessions feel as fresh as turn 1.
+
+### Refined product vision: Jarvis-class assistants, not pure-codemode-with-sandboxes
+
+Sharpened by the realtor-Jarvis thought experiment (2026-04-26):
+
+- Bounded primitive set + composition surface + kernel-level memory management = transformative.
+- Sandbox-per-agent maximalism is NOT required for the personal-assistant case. The agent runs the user's tools on the user's machine — no untrusted code to isolate.
+- Pure codemode (agent creates persistent infrastructure, replaces MCP, makes APIs instead of calling them) is a v2.0 / Phase F decision. Not the immediate north star.
+- The unlock for Jarvis is **the kernel**, not more codemode-purity.
+
+### Ori Nous — Batch-1 sketch (next major arc)
+
+Three sub-batches because handle infrastructure is load-bearing for the rest:
+
+- **Nous-1: Handle infrastructure** — replace tool_result content >2KB with `<handle:abc123>` token; `expand(handle)` primitive for rehydration; eviction after N turns; telemetry on create/expand/evict. Single biggest unlock; replaces our crude microcompact band-aid with real continuous eviction. Reference: `oh-my-pi`'s `artifact://` pattern, Letta's recall storage. ~200-300 LOC over a few sessions.
+- **Nous-2: Cheap sub-agent orchestration** — `delegate(task, model='cheap')` primitive; sub-agents have restricted tool sets + own context; parent gets a synthesis handle (not full transcript); hard depth cap. Becomes cheap once handles work because parent doesn't accumulate sub-agent exhaust. Reference: Claude Code's `Task` tool + YAML subagents, OpenAI Agents SDK handoffs. ~400-500 LOC.
+- **Nous-3: Tiered router auto-wiring** — automatic model selection per task type (Haiku for parsing, Opus for reasoning, Flash for bulk); infrastructure exists (we have primary/cheap/bulk slots + `cheapCall`); just needs wiring + per-task routing rules. ~150 LOC + config.
+
+### Reference work to study before starting Nous
+
+- **Letta** (formerly MemGPT) — closest production agent kernel. CoALA hierarchy, continuous micro-eviction, memory tools that self-edit. Letta Code hit #1 model-agnostic on Terminal-Bench Dec 2025. **Read their memory module first.**
+- **oh-my-pi** — smallest production handle/artifact-spill example. Easiest reference impl to lift wholesale.
+- **OpenAI Agents SDK** (April 2026) — explicit "harness separate from compute" architecture. Sandbox swappable (E2B, Cloudflare, Vercel). Read the architectural split, not specific code.
+- **OpenFang** — most kernel-shaped of all in design. Verify production-grade vs. ambitious-vapor before betting on it.
+- **Claude Code source** at `C:\Users\aayoa\Downloads\cc-src-2\out\src` — already mined for max_tokens table + cutoff recovery. More to steal: 5-layer compaction, `Task` subagents, tool-result disk spillover (`tengu` patterns).
+- **pi-mono** (`packages/ai/src/models.generated.ts`) — confirmed our static-table approach over SDK runtime introspection.
+
+### Decided NOT to do
+
+- **TsRepl as second runtime** — codemode thesis violation; doubles harness maintenance forever; cognitive routing tax on the model. Aries already edits TS files via `fs.edit` + `codebase.search` and validates with `shell.run("npm run typecheck")`. Defer indefinitely; revisit only if metrics show ≥10 sessions where TsRepl would have saved >2 turns each.
+- **Whole-substrate TS rewrite** — opportunity cost too high mid-thesis; throws away the empirical 2.14× on a counterfactual; loses Python training prior. Maximalist v2.0 story at best.
+- **C from the friction inventory (fs.write plan-mode workspace boundary)** — research disproved the "circular" framing. Plan mode swaps tool set; uses top-level Write (no boundary check); Repl absent from active tools. Not a bug. Document the layering instead of fixing.
+
+### Active friction inventory (next ship — Batch 1.9)
+
+- **B — `codebase.map(path)`** — single primitive returning `[{path, type, depth}]` flat list, capped at depth 5 / 500 entries. Saves 4-5 round trips per exploration session. ~50 LOC. Plan in `notes/plan-batch-1.9-research.md`.
+- **A — TS detector string-literal pre-pass** — pure-TS regex-based stripper that scrubs Python strings (`'...'`, `"..."`, `'''...'''`, `"""..."""`) and `#` comments before applying TS-shape regexes. Eliminates 3 confirmed false-positive classes (regular, triple-quoted, raw strings). ~70 LOC.
+- **D — `vault.read(None)` guard** — already shipped this session.
+
+### Open meta-question
+
+After B + A ship, do we close out the harness polish arc (Batch 4 contracts, Batch 5 craft) before starting Nous, or jump to Nous-1 directly? Contracts/craft are high-value but harness-layer; Nous-1 is the unlock that changes session feel. Probable answer: ship B + A as Batch 1.9, then start Nous-1 immediately, let contracts/craft sit until Nous-1 lands and shows what primitive-shape changes the kernel actually wants.
+
+### Memory notes added this period
+
+- `project_aries_self_reflection_2026_04_25` — Aries-self's mid-session reflection on harness maturity + remaining friction. Captures the meta-insight that "the agent running on the harness now contributes R&D to its own environment" — treat such signals as first-class roadmap input.

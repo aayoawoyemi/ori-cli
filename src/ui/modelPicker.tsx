@@ -98,6 +98,7 @@ const MODEL_FAMILIES: ModelFamily[] = [
     models: [
       { value: 'qwen3.6-or', label: 'Qwen3.6-Plus', description: '131K', supportsEffort: false, defaultEffort: 'medium' },
       { value: 'glm5', label: 'GLM 5.1', description: '203K', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'kimi-k2.6', label: 'Kimi K2.6', description: '262K - Agent-optimized', supportsEffort: false, defaultEffort: 'medium' },
       { value: 'gemma4', label: 'Gemma 4 26B', description: '262K', supportsEffort: false, defaultEffort: 'medium' },
       { value: 'deepseek-v3', label: 'DeepSeek V3.2', description: '131K', supportsEffort: false, defaultEffort: 'medium' },
       { value: 'minimax', label: 'MiniMax M2.7', description: '1M', supportsEffort: false, defaultEffort: 'medium' },

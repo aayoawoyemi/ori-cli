@@ -43,7 +43,14 @@ export function buildSystemPrompt(ctx: PromptContext): string {
   if (ctx.vaultIdentity?.identity) {
     sections.push(ctx.vaultIdentity.identity);
   } else {
-    sections.push(`You are ${agentName}, a memory-native coding agent running in the terminal. You have full filesystem access and can execute any shell command.`);
+    // Under codemode (current default), filesystem and shell access are
+    // scoped to the Repl namespace — `fs.read`, `fs.write`, `shell.run`,
+    // etc. There is no top-level Bash or Edit tool. Teaching the model it
+    // has "full filesystem access and can execute any shell command" was
+    // the pre-codemode reality; leaving it in sends the model looking for
+    // primitives that don't exist in its tool list (RUNNING.md flagged
+    // 2026-04-19; fixed in Batch 1.8 alongside the vault.top snippet lie).
+    sections.push(`You are ${agentName}, a memory-native coding agent running in the terminal. Filesystem and shell access are scoped to the Repl namespace (fs.*, shell.*); compose multi-step work inside a single Repl call.`);
   }
 
   // ── Warm Context (always-present, survives compaction) ──────────────────

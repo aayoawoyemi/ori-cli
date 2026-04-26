@@ -43,6 +43,89 @@ class ShellError(Exception):
     pass
 
 
+# 2026-04-25 — unix-ism table for failure-time hint enrichment.
+# Aries-self surfaced this friction in a live session: model reaches for
+# grep / ls / cat / find / sed / awk / && reflexively (Unix training prior),
+# they fail on cmd.exe with cryptic errors that don't suggest the harness
+# alternative. We don't BLOCK these (they're legitimate on a real Unix host;
+# Windows users with Git Bash on PATH may also have them working) — we only
+# nudge AFTER a failure. The hint shows up in the model's view of stderr,
+# next to the actual failure, so the next batch reaches for the right
+# primitive without losing a turn to discovery.
+#
+# Format: command-name → (replacement primitive, one-line why).
+# Entries here should be conservative — only commands where the harness
+# primitive is a real drop-in. Don't add `awk` here just because it failed
+# once; only add it when codebase.* / fs.* covers the common use case.
+_UNIX_HINTS: dict[str, tuple[str, str]] = {
+    "grep":  ("codebase.search(query)",
+              "structured search across the indexed codebase, no shell"),
+    "ls":    ("fs.listdir(path)",
+              "Python list of names; faster than spawning a shell"),
+    "cat":   ("fs.read(path)",
+              "returns file contents as str; bounded to 2MB"),
+    "find":  ("fs.glob(pattern, path)",
+              "glob-style file search; capped at 200 results"),
+    "sed":   ("fs.edit(path, old, new) or fs.patch(path, edits)",
+              "structured fuzzy-match edits, no regex escaping"),
+    "head":  ("fs.read(path, limit=N)",
+              "limit kwarg returns first N lines"),
+    "tail":  ("fs.read(path, offset=-N)",
+              "negative offset returns last N lines"),
+    "wc":    ("len(fs.read(path).splitlines())",
+              "Python len + splitlines; cheaper than a shell call"),
+}
+
+
+def _detect_unix_isms(cmd: str) -> list[str]:
+    """Return the list of unix-ism names found in the command string.
+
+    Cheap regex-free scan: split on whitespace, &&, ||, |, ;, then check
+    each token against _UNIX_HINTS keys. Catches the common cases
+    (`grep foo bar`, `ls | cat`, `cd x && grep y`) without touching the
+    expensive regex engine.
+
+    False-positive safe: only matches the FIRST token of each command
+    segment (the actual program name), so `--grep` flags and filenames
+    containing 'grep' don't trigger.
+    """
+    import re
+    # Split on shell separators. Keep order so we report hits left-to-right.
+    segments = re.split(r"\s*(?:&&|\|\||\||;)\s*", cmd)
+    found: list[str] = []
+    seen: set[str] = set()
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+        first = seg.split(None, 1)[0]
+        # Strip path prefix (e.g., "/usr/bin/grep" → "grep") so the table
+        # match works regardless of whether the model reached for the
+        # bare name or a full path.
+        bare = first.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if bare in _UNIX_HINTS and bare not in seen:
+            found.append(bare)
+            seen.add(bare)
+    return found
+
+
+def _format_unix_hint(detected: list[str]) -> str:
+    """Render the unix-ism hint as a stderr-appended block. Multi-line so
+    the model can scan it visually and pick the right replacement. Format
+    mirrors the [harness:cutoff] marker style for consistency — `[harness:`
+    prefix + dotted detail tag tells the model "this came from the harness,
+    not the underlying tool."""
+    lines = [
+        "",
+        "[harness:shell-hint] Unix command(s) failed on this platform. "
+        "Prefer the harness primitive for these:"
+    ]
+    for name in detected:
+        replacement, why = _UNIX_HINTS[name]
+        lines.append(f"  {name} → {replacement}  ({why})")
+    return "\n".join(lines)
+
+
 class Shell:
     """
     Shell execution primitive. Proxies shell commands through the TS bridge.
@@ -162,4 +245,22 @@ class Shell:
         # Bridge-side timeout = command timeout + 10s slack. If the command
         # takes 30s, we wait 40s for a response (gives TS time to kill a
         # stuck process and send back partial output).
-        return self._call("run", args, timeout=timeout + 10.0)
+        result = self._call("run", args, timeout=timeout + 10.0)
+
+        # 2026-04-25 — failure-time unix-ism hint. Only fires when the
+        # command FAILED (non-zero exit) AND a unix-ism was detected in
+        # the command string. Two-AND because:
+        #   - On a Unix host (or Windows + Git Bash), `grep` etc. work
+        #     fine and we shouldn't nag.
+        #   - On Windows cmd.exe, the failure is the signal that the
+        #     model reached for a Unix idiom that doesn't exist here.
+        # Surfacing the hint via stderr keeps it next to the actual error
+        # the model is parsing — they read both in the same glance and
+        # the next batch reaches for the harness primitive instead.
+        if isinstance(result, dict) and result.get("code", 0) != 0:
+            detected = _detect_unix_isms(cmd)
+            if detected:
+                hint = _format_unix_hint(detected)
+                existing_stderr = result.get("stderr", "") or ""
+                result["stderr"] = existing_stderr.rstrip() + hint
+        return result
