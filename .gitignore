@@ -17,6 +17,14 @@ bash.exe.stackdump
 __pycache__/
 *.pyc
 
+# Ori vault runtime — sqlite + logs only. Keep the source-of-truth dirs
+# (research/, self/, templates/, inbox/.gitkeep, ops/daily.md, ops/reminders.md)
+# tracked so the vault scaffold survives a fresh clone; ignore the live runtime.
+.ori/
+ops/access.jsonl
+ops/observations/
+ops/sessions/
+
 # Benchmark results (keep bench/ code, drop results)
 bench/results/
 
