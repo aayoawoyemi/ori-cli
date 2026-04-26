@@ -68,8 +68,15 @@ NAMESPACE_SIGNATURES: dict[str, dict[str, str]] = {
     # string keys. The NOTE enrichment fired with the return shape; this
     # hint makes the correct access pattern visible in the banner + NOTE
     # output so Opus's training prior doesn't fill in the wrong shape.
+    # vault.top is ranking-only: no snippet. ScoredNote from ori-memory is
+    # {title, score, signals, spaces?, metadata?}; `path` is injected client-side
+    # by Vault._inject_paths (A.6.1). For snippet-bearing hits, reach for
+    # vault.explore — its PPR walk slices context around query terms. Keeping
+    # top cheap and explore rich preserves the reason to distinguish the two.
+    # (If ori-memory later exposes server-side snippets, add the field here
+    # and to the bridge projection in the same commit — see ori/ROADMAP.md.)
     "vault.top":             {"sig": "(query, n=3, scope='both')",
-                              "returns": "{results: [{title, path, score, snippet}], ...}  # iterate as result['results']"},
+                              "returns": "{results: [{title, path, score}], ...}  # iterate as result['results']; for snippets use vault.explore"},
     "vault.query_ranked":    {"sig": "(query, limit=10, include_archived=False, scope='both')",
                               "returns": "{results: [{title, path, score}], warmth: {...}}  # iterate as result['results']"},
     "vault.query_similar":   {"sig": "(query, limit=10, include_archived=False, scope='both')",
@@ -126,6 +133,8 @@ NAMESPACE_SIGNATURES: dict[str, dict[str, str]] = {
                                      "returns": "list[{path, pagerank, symbols, references}]"},
     "codebase.list_files":          {"sig": "()",
                                      "returns": "list[str]  # sorted"},
+    "codebase.map":                 {"sig": "(path='.', max_depth=5, max_entries=500)",
+                                     "returns": "list[{path, type, depth, tracked, pagerank, language}]  # type in {'file','dir','truncated'}; tracked None for dirs/no-git; canonical orient primitive — subsumes list_files+top_files+git status"},
     "codebase.get_file_summary":    {"sig": "(file_path)",
                                      "returns": "{path, language, line_count, symbols: [...], reference_count, import_count}  # or {error: ...}"},
     "codebase.find_similar_patterns": {"sig": "(pattern, limit=10, mode='name')",
@@ -227,3 +236,25 @@ def get(primitive: str) -> dict[str, str] | None:
     import surface small and makes future refactors (e.g., lazy loading
     from a JSON file) a single-callsite change."""
     return NAMESPACE_SIGNATURES.get(primitive)
+
+
+# Namespace version hash — pulled forward from A.9.1 (gotcha invalidation).
+# Deterministic hash over the full schema table. When any primitive's sig or
+# returns changes, the hash changes; gotchas keyed by this version become
+# invalid and get pruned automatically. Cheap to compute now; load-bearing
+# for Batch 6-7's gotcha layer without requiring a follow-up migration.
+#
+# Uses blake2b (stdlib, fast, cryptographically strong — overkill for drift
+# detection but avoids bikeshedding on algorithm choice). 16-char digest is
+# plenty for collision resistance across the ~50 primitives we'll ever have.
+def _compute_namespace_version() -> str:
+    import hashlib
+    import json as _json
+
+    canonical = _json.dumps(NAMESPACE_SIGNATURES, sort_keys=True,
+                            separators=(",", ":"))
+    return hashlib.blake2b(canonical.encode("utf-8"),
+                           digest_size=8).hexdigest()
+
+
+NAMESPACE_VERSION: str = _compute_namespace_version()

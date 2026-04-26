@@ -562,6 +562,22 @@ class Vault:
             if hits['results']:
                 print(vault.read(hits['results'][0]['path']))
         """
+        # 2026-04-25 — explicit None guard. vault.explore/top can return
+        # results where `path` is None: those are wiki-link stubs that
+        # exist in the graph (some other note has a [[link]] to them) but
+        # have no backing markdown file yet. Aries-self caught itself
+        # passing such a None into vault.read in a live session — without
+        # this guard the call dies in os.path.join with a cryptic TypeError
+        # that the enrichment system can't structurally map back to "you
+        # tried to read a stub." This message tells the model exactly
+        # what happened and what to do — `if h['path']:` filter or
+        # try/except VaultError around the read.
+        if path is None:
+            raise VaultError(
+                "path is None — wiki-link stub without a backing file. "
+                "Filter results with `if h['path']:` before reading, or "
+                "wrap vault.read in try/except VaultError."
+            )
         import os
         full = os.path.normpath(os.path.join(self._path, path))
         if not full.startswith(os.path.normpath(self._path)):

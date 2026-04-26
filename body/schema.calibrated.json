@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "captured_at": "2026-04-24",
+  "notes": "Hand-curated observed shapes for primitives whose returns we can verify by reading body/ source (pure-Python returns) or by inspecting the bridge projection path (src/repl/bridge.ts:projectVaultResult). Scope is deliberately narrow — only entries we are HIGH CONFIDENCE about. Expand as primitives are audited live. Regenerate whenever primitives change shape; the smoke probe fails CI when schema.py drifts from this fixture. See body/schema_calibrate.py for the comparator contract.",
+  "primitives": {
+    "vault.top": {
+      "envelope": ["results"],
+      "item": ["title", "path", "score"]
+    },
+    "vault.neighbors": {
+      "envelope": ["neighbors"],
+      "item": ["title", "path"]
+    },
+    "vault.backlinks": {
+      "envelope": ["backlinks"],
+      "item": ["title", "path"]
+    },
+    "codebase.map": {
+      "envelope": [],
+      "item": ["path", "type", "depth", "tracked", "pagerank", "language"]
+    }
+  }
+}

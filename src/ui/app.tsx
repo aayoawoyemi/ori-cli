@@ -768,6 +768,12 @@ export function App(props: AppProps): React.ReactElement {
       // (dead plumbing from preflight era); event type also removed from
       // loop.ts. No producer means the case was unreachable.
 
+      case 'max_output_recovery':
+        // Max-tokens recovery: model was cut off, harness is auto-continuing.
+        // Brief inline indicator so the user knows the pause is intentional.
+        appendText(`\n\n*(Continuing... ${event.attempt}/${event.maxAttempts})*\n\n`);
+        break;
+
       case 'compact':
         setDisplayMessages(prev => [...prev, {
           role: 'system',

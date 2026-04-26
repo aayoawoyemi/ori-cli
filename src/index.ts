@@ -379,7 +379,7 @@ if (continueSession) {
   }
 }
 
-const router = new ModelRouter(config.models, config.experimental);
+const router = new ModelRouter(config.models, config.experimental, config.features);
 let replHandleRef: ReplHandle | null = null;
 
 // Resolve 'auto': enable REPL only if the active model is capable
@@ -470,6 +470,16 @@ if (isSubagent) {
   const { agentLoop } = await import('./loop.js');
   const messages: Message[] = [{ role: 'user', content: promptArg }];
   let finalText = '';
+  // Capture the last successful Repl output as a fallback channel. A subagent
+  // that does all its work via Repl + done(value) emits zero assistant-text
+  // events — finalText stays empty and the parent would see "(no output)."
+  // The Repl tool_result's output_full contains say() narration (Batch 1.6
+  // dual-write echoes say() into the exec-captured stdout) plus any print()
+  // output, so surfacing the last non-error Repl output gives the parent
+  // the subagent's actual work. See Batch 1.8 — this is the structural
+  // companion to fixing vault.top's snippet lie: both are "the harness
+  // isn't surfacing what it claims to surface" bugs.
+  let lastReplOutputFull = '';
 
   for await (const event of agentLoop({
     messages,
@@ -485,13 +495,21 @@ if (isSubagent) {
     maxTurns,
   })) {
     if (event.type === 'text') finalText += event.content;
+    if (event.type === 'tool_result' && event.name === 'Repl' && !event.isError) {
+      const full = event.output_full ?? event.output;
+      if (full && full.trim()) lastReplOutputFull = full;
+    }
     if (event.type === 'error') {
       const msg = event.error instanceof Error ? event.error.message : String(event.error);
       process.stderr.write(`Subagent error: ${msg}\n`);
     }
   }
 
-  process.stdout.write(finalText);
+  // Prefer assistant-text as the summary channel when present; fall back to
+  // the last Repl output so codemode-native subagents (all work in Repl,
+  // final commit via done()) still surface their work to the parent.
+  const subagentOutput = finalText.trim() ? finalText : lastReplOutputFull;
+  process.stdout.write(subagentOutput);
   vault?.disconnect();
   process.exit(0);
 }

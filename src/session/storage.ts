@@ -18,7 +18,8 @@ export type SessionEntry =
   // Correlates with tool_call/tool_result via tool_use_id. See body/shape.py
   // for the source metrics and the plan-file risk register for the
   // hypothesis being measured.
-  | { type: 'repl_shape'; tool_use_id: string; stmt_count: number; distinct_primitive_count: number; total_primitive_call_count: number; has_for_or_while: boolean; has_if: boolean; has_def: boolean; has_try: boolean; has_comprehension: boolean; is_micro_repl: boolean; is_composed: boolean; primitives_called: string[]; parse_error?: string; timestamp: number }
+  | { type: 'repl_shape';
+    ops_count: number; tool_use_id: string; stmt_count: number; distinct_primitive_count: number; total_primitive_call_count: number; has_for_or_while: boolean; has_if: boolean; has_def: boolean; has_try: boolean; has_comprehension: boolean; is_micro_repl: boolean; is_composed: boolean; primitives_called: string[]; parse_error?: string; timestamp: number }
   // End-of-turn aggregate. Added 2026-04-22 alongside repl_shape. Captures
   // per-turn counts: Repl-call count, whether any call this turn was
   // composed / micro, whether done() fired. This is the turn-level signal
@@ -40,6 +41,18 @@ export type SessionEntry =
   | { type: 'postflight'; importance: number; reflected: boolean; timestamp: number }
   | { type: 'compact_boundary'; summary: string; insightsSaved: number; pruneOnly: boolean; timestamp: number }
   | { type: 'interrupted'; reason: string; timestamp: number }
+  // Batch 3 — telemetry for the per-model max_tokens lift. Logged when
+  // the provider observes stop_reason=max_tokens (or context_window).
+  // Surfaces cutoff frequency post-cap-lift so we can tell whether
+  // 128K is enough or composed batches still saturate. Partial tool
+  // inputs are intentionally not logged — CC's pattern doesn't surface
+  // them and the model recovers naturally without partial state.
+  | { type: 'cutoff_warning'; reason: 'max_tokens' | 'context_window'; message: string; timestamp: number }
+  // Max-tokens recovery loop (CC query.ts:1185-1257). Logged on each
+  // auto-continuation attempt and when recovery exhausts. Telemetry for
+  // how often truncation requires multi-turn recovery vs. single-turn.
+  | { type: 'max_output_recovery'; attempt: number; timestamp: number }
+  | { type: 'max_output_recovery_exhausted'; attempts: number; timestamp: number }
   | { type: 'error'; message: string; timestamp: number };
 
 export interface SessionMeta {

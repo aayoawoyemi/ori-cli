@@ -100,6 +100,13 @@ export type StreamEvent =
   | { type: 'tool_use_delta'; id: string; delta: string }
   | { type: 'tool_use_end'; id: string; input: Record<string, unknown> }
   | { type: 'usage'; inputTokens: number; outputTokens: number; totalTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
+  // Batch 3 — surfaced when the API stops generation early (max_tokens hit,
+  // context window exceeded). The `message` is the human-readable cue the
+  // loop injects into conversation as a synthetic continuation marker so
+  // the model sees "you got cut off — continue" naturally on the next turn.
+  // Pattern lifted from Claude Code's services/api/claude.ts:2266-2292.
+  // Behind features.harnessCleanup; legacy code path never emits this.
+  | { type: 'cutoff_warning'; reason: 'max_tokens' | 'context_window'; message: string }
   | { type: 'done' };
 
 // ── Provider interface ──────────────────────────────────────────────────────

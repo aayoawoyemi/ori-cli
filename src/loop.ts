@@ -35,13 +35,36 @@ export type LoopEvent =
   | { type: 'model_start'; turn: number; model: string }
   | { type: 'text'; content: string }
   | { type: 'tool_call'; toolCall: ToolCall }
-  | { type: 'tool_result'; id: string; name: string; output: string; isError: boolean }
+  // `output` is truncated for UI streaming (500 chars); `output_full` carries
+  // the complete tool output for consumers that need the whole thing —
+  // primarily the subagent branch in src/index.ts, which folds Repl outputs
+  // (containing say() narration + stdout) into the child process stdout so
+  // the parent Agent tool sees the subagent's actual work. Before Batch 1.8,
+  // the subagent only captured assistant-text events; a subagent that did
+  // all its work via Repl + done(value) emitted zero text and the parent
+  // saw "(no output)." Keeping both fields avoids churning every existing
+  // UI consumer while giving capture-oriented consumers the full picture.
+  | { type: 'tool_result'; id: string; name: string; output: string; output_full?: string; isError: boolean }
   | { type: 'tool_denied'; id: string; name: string }
   | { type: 'plan_step'; toolCall: ToolCall }
   | { type: 'plan_complete'; steps: ToolCall[]; explanation: string }
   | { type: 'usage'; inputTokens: number; outputTokens: number; totalTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
   | { type: 'compact'; summary: string; savedCount: number; pruneOnly: boolean }
   | { type: 'turn_complete'; turn: number; tokenEstimate: number }
+  // Batch 3 — surfaced when the provider observed stop_reason=max_tokens
+  // (or context_window). The handler in the stream consumer below appends
+  // a [harness:cutoff] marker to the assistant message so the next turn's
+  // context shows the model "you got cut off, continue from where you
+  // left off." Pattern lifted from Claude Code's services/api/claude.ts:
+  // they inject the cue INTO the current stream as an assistant API
+  // error message rather than queuing a next-turn reminder, because the
+  // model handles continuation more naturally when the cue lives in its
+  // own most-recent output.
+  | { type: 'cutoff_warning'; reason: 'max_tokens' | 'context_window'; message: string }
+  // Batch 3 addendum — surfaced when the recovery loop auto-continues after
+  // a max_tokens cutoff. Mirrors Claude Code's max_output_tokens_recovery
+  // transition in query.ts. The UI can show a brief "continuing..." indicator.
+  | { type: 'max_output_recovery'; attempt: number; maxAttempts: number }
   | { type: 'error'; error: unknown };
 
 // ── Loop Parameters ─────────────────────────────────────────────────────────
@@ -138,6 +161,58 @@ function applyResultBudget(messages: Message[], maxChars: number): Message[] {
 
 // ── The Agent Loop ──────────────────────────────────────────────────────────
 
+type ToolExecutionResult = {
+  id: string;
+  name: string;
+  output: string;
+  isError: boolean;
+};
+
+type ToolRejectionState = {
+  count: number;
+  lastOutput: string;
+  tsOrJsInPythonRepl: boolean;
+};
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function classifyToolRejection(result: ToolExecutionResult): { tsOrJsInPythonRepl: boolean } | null {
+  if (!result.isError) return null;
+
+  const output = result.output.trim();
+  const toolPrefix = new RegExp(`^${escapeRegExp(result.name)} rejected:`, 'i');
+  const isRejected =
+    /^Repl rejected:/i.test(output) ||
+    /^Vault rejected:/i.test(output) ||
+    /^AST guard rejected:/i.test(output) ||
+    toolPrefix.test(output);
+  if (!isRejected) return null;
+
+  return {
+    tsOrJsInPythonRepl:
+      result.name === 'Repl' &&
+      /TypeScript\/JavaScript|TypeScript|JavaScript|Python runtime/i.test(output),
+  };
+}
+
+function buildRepeatedRejectionReminder(toolName: string, state: ToolRejectionState): string {
+  const base =
+    `You've been rejected by ${toolName} ${state.count} times in this user request. ` +
+    `Stop retrying the same shape. Last rejection: ${state.lastOutput.slice(0, 500)}`;
+
+  if (state.tsOrJsInPythonRepl) {
+    return `<system-reminder>${base}\n\n` +
+      `Specific correction: Repl is Python only. For TypeScript harness/source-code work, use Python Repl to ` +
+      `read/edit files via fs.* and validate with shell.run("npm run typecheck") or shell.run("npx tsx <file>"). ` +
+      `Do not submit TypeScript syntax to Repl again.</system-reminder>`;
+  }
+
+  return `<system-reminder>${base}\n\n` +
+    `Switch approach before calling ${toolName} again: use a different tool, inspect the expected shape, or simplify ` +
+    `the call. Do not repeat the same failing payload.</system-reminder>`;
+}
 export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> {
   const {
     messages,
@@ -174,6 +249,17 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
   // nudges a vault.explore(error_text) to check if we've hit this before
   // (memory-first recovery — not in CC/oh-my-pi's version).
   let consecutiveFailureTurns = 0;
+  // Max-tokens recovery counter â€” when the model's output is truncated by
+  // max_tokens, the harness injects a synthetic user message and loops back.
+  // Capped at 3 to prevent infinite loops on genuinely oversized responses.
+  // Pattern from Claude Code query.ts:1185-1257.
+  let maxOutputRecoveryCount = 0;
+  // Same-tool rejection steering. If the model keeps hitting the same
+  // validation wall (for example TypeScript in the Python Repl), inject a
+  // targeted reminder into the next model call instead of letting it hammer
+  // the identical bad shape for another turn.
+  const toolRejectionStates = new Map<string, ToolRejectionState>();
+  let repeatedToolRejectionReminder: string | null = null;
 
   // Reset doom loop tracking on new user input
   resetDoomLoop();
@@ -203,19 +289,22 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     // takes effect immediately (not stale from agentLoop call-site).
     const permissionMode: PermissionMode = permissionModeRef?.current ?? params.permissionMode ?? 'default';
 
-    // ── IDEMPOTENCE: strip any prior-turn synthetic injections ──────
-    // Without this, each turn's preflight/current-state/proprio STACKS on
-    // top of every previous turn's, linearly accumulating stale context.
-    // Fix 2 + Fix 4 from orientation audit.
-    stripSyntheticFromMessages(messages);
-
-    // ── HEAL orphaned tool_use blocks ────────────────────────────────
-    // If a prior turn was interrupted (Ctrl+C mid-tool, executeTools threw,
-    // permission flow abandoned), an assistant message with tool_use blocks
-    // may be sitting in history without matching tool_result entries. The
-    // Anthropic API rejects this with a 400. Inject synthetic error results
-    // so the conversation stays valid.
-    healOrphanedToolUses(messages);
+    // ── CACHE-PRESERVING COPY (Pi/CC pattern, 2026-04-26) ───────────
+    // The canonical `messages` array is append-only between turns. All
+    // pre-LLM-call transforms (strip synthetics, heal orphans, prune tool
+    // outputs) operate on a COPY so the Anthropic cache prefix is never
+    // broken. Without this, pruneToolOutputs' `block.content = "[output
+    // pruned]"` mutates shared objects, invalidating the cache and forcing
+    // the entire 130K+ conversation to re-send at full price.
+    // See Pi anthropic.ts and CC query.ts:365 for the same pattern.
+    const queryMessages = messages.map(m => ({
+      ...m,
+      content: Array.isArray(m.content)
+        ? (m.content as ContentBlock[]).map(b => ({ ...b }))
+        : m.content,
+    }));
+    stripSyntheticFromMessages(queryMessages);
+    healOrphanedToolUses(queryMessages);
 
     // Reset per-turn nudge counters (sequential read tracking, etc.)
     resetNudgeCounters();
@@ -234,13 +323,13 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     // model knows what tools were used). Protects the most recent 40k tokens
     // of tool output. Non-LLM, pure bookkeeping. STOPGAP — the final form is
     // kernel-level handle-based rehydration (see RUNNING.md deferred work).
-    const preCompactTokens = estimateTokens(messages);
+    const preCompactTokens = estimateTokens(queryMessages);
     if (preCompactTokens > 100_000) {
-      pruneToolOutputs(messages);
+      pruneToolOutputs(queryMessages);
     }
 
-    // ── RESULT BUDGET ────────────────────────────────────────────────
-    const budgetedMessages = applyResultBudget(messages, maxResultChars);
+    // ── RESULT BUDGET ──────────────────────────────────────
+    const budgetedMessages = applyResultBudget(queryMessages, maxResultChars);
 
     // ── TOOL FILTERING (structural enforcement) ────────────────────
     // Explore mode (highest priority): Repl + VaultAdd + ProjectSave only.
@@ -379,6 +468,27 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       }
     }
 
+    // Same-tool repeated-rejection steering. classifyToolRejection (above)
+    // runs after each tool execution and bumps a per-tool counter; when the
+    // model has been rejected by the same tool 2+ times in this user
+    // request, we prepend a targeted reminder. One-shot per turn — the
+    // reminder fires once, then clears so we don't spam every subsequent
+    // turn with the same nag if the model has already routed elsewhere.
+    if (repeatedToolRejectionReminder) {
+      let lastUserIdx = -1;
+      for (let i = budgetedMessages.length - 1; i >= 0; i--) {
+        if (budgetedMessages[i]!.role === 'user') { lastUserIdx = i; break; }
+      }
+      if (lastUserIdx >= 0 && typeof budgetedMessages[lastUserIdx]!.content === 'string') {
+        const content = budgetedMessages[lastUserIdx]!.content as string;
+        budgetedMessages[lastUserIdx] = {
+          ...budgetedMessages[lastUserIdx]!,
+          content: `${wrapSynthetic('rejection-steering', repeatedToolRejectionReminder)}\n\n${content}`,
+        };
+      }
+      repeatedToolRejectionReminder = null;
+    }
+
     // ── MODEL CALL ───────────────────────────────────────────────────
     yield { type: 'model_start', turn: turnCount, model: router.info.model };
 
@@ -416,6 +526,29 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
           case 'usage':
             yield { type: 'usage', inputTokens: event.inputTokens, outputTokens: event.outputTokens, totalTokens: event.totalTokens, cacheReadTokens: event.cacheReadTokens, cacheWriteTokens: event.cacheWriteTokens };
             break;
+
+          case 'cutoff_warning': {
+            // Batch 3 — append a clearly-tagged marker to the assistant
+            // text so the next turn's context shows the model "you got
+            // cut off, continue from where you left off." The tag prefix
+            // [harness:cutoff ...] is recognizable noise the model can
+            // distinguish from its own writing — matches CC's synthetic
+            // assistant message pattern (services/api/claude.ts:2270).
+            // Yield to UI for surfacing; log for cutoff-frequency
+            // telemetry (we want to know if max_tokens hits become
+            // common after the cap lift, which would suggest re-tuning).
+            const marker =
+              `\n\n[harness:cutoff reason="${event.reason}"] ${event.message}`;
+            assistantText += marker;
+            yield { type: 'cutoff_warning', reason: event.reason, message: event.message };
+            session?.log({
+              type: 'cutoff_warning',
+              reason: event.reason,
+              message: event.message,
+              timestamp: Date.now(),
+            });
+            break;
+          }
 
           case 'done':
             break;
@@ -555,6 +688,35 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       // Apply contextual REPL nudges to tool results
       applyNudges(executedResults, replEnabled);
 
+      // ── Same-tool rejection tracking (Phase B) ────────────────────────
+      // For every executed result, classify whether it's a structural
+      // rejection (Repl/Vault/AST guard rejected the input shape). If so,
+      // bump the per-tool counter and capture the latest rejection text.
+      // Once a tool has been rejected ≥2 times in this user request,
+      // arm `repeatedToolRejectionReminder` for injection on the NEXT
+      // turn's pre-stream block (above). The reminder is one-shot —
+      // fires once, clears itself, doesn't keep firing for the rest of
+      // the request even if the counter stays high. Substrate also
+      // useful for Batch 6-7 gotchas (per-turn synthetic reminders).
+      for (const result of executedResults) {
+        const cls = classifyToolRejection(result);
+        if (!cls) continue;
+        const prev = toolRejectionStates.get(result.name) ?? {
+          count: 0,
+          lastOutput: '',
+          tsOrJsInPythonRepl: false,
+        };
+        const next: ToolRejectionState = {
+          count: prev.count + 1,
+          lastOutput: result.output,
+          tsOrJsInPythonRepl: prev.tsOrJsInPythonRepl || cls.tsOrJsInPythonRepl,
+        };
+        toolRejectionStates.set(result.name, next);
+        if (next.count >= 2) {
+          repeatedToolRejectionReminder = buildRepeatedRejectionReminder(result.name, next);
+        }
+      }
+
       // Combine ALL results into ONE user message (Anthropic requires all
       // tool_results for one assistant turn in a single message).
       const allResults = [...deniedResults, ...executedResults];
@@ -573,6 +735,9 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
             id: result.id,
             name: result.name,
             output: result.output.slice(0, 500),
+            // Full output for subagent capture / anyone who needs the complete
+            // tool result. UI consumers should keep reading `output` (short).
+            output_full: result.output,
             isError: result.isError,
           };
           session?.log({
@@ -706,6 +871,45 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
         type: 'postflight',
         importance: importanceAccumulator,
         reflected: false,
+        timestamp: Date.now(),
+      });
+    }
+
+    // ── MAX_TOKENS RECOVERY (Claude Code query.ts:1185-1257) ─────────
+    // When the model's output was truncated by max_tokens, inject a
+    // synthetic user message telling it to continue, then loop back.
+    // The [harness:cutoff] marker was appended by the stream consumer
+    // above (L443-459). Recovery message is CC's prod-proven phrasing:
+    // terse, no-recap, mid-thought pickup. Capped at 3 attempts.
+    const MAX_OUTPUT_RECOVERY_LIMIT = 3;
+    if (assistantText.includes('[harness:cutoff')) {
+      maxOutputRecoveryCount++;
+      if (maxOutputRecoveryCount <= MAX_OUTPUT_RECOVERY_LIMIT) {
+        messages.push({
+          role: 'user',
+          content:
+            'Output token limit hit. Resume directly — no apology, ' +
+            'no recap of what you were doing. Pick up mid-thought ' +
+            'if that is where the cut happened. Break remaining ' +
+            'work into smaller pieces.',
+        });
+        session?.log({
+          type: 'max_output_recovery',
+          attempt: maxOutputRecoveryCount,
+          timestamp: Date.now(),
+        });
+        yield { type: 'max_output_recovery', attempt: maxOutputRecoveryCount, maxAttempts: MAX_OUTPUT_RECOVERY_LIMIT };
+        yield {
+          type: 'turn_complete',
+          turn: turnCount,
+          tokenEstimate: estimateTokens(messages),
+        };
+        continue;
+      }
+      // Recovery exhausted after 3 attempts — fall through to normal return.
+      session?.log({
+        type: 'max_output_recovery_exhausted',
+        attempts: maxOutputRecoveryCount,
         timestamp: Date.now(),
       });
     }
