@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/aayoawoyemi-ori-cli-badge.png)](https://mseep.ai/app/aayoawoyemi-ori-cli)
+
 # Ori CLI
 
 **Agentic coding harness with persistent memory and a REPL body. Open source. Multi-model. Local-first.**
