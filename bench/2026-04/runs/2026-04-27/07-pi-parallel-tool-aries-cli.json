@@ -1,0 +1,39 @@
+{
+  "taskId": "07-pi-parallel-tool",
+  "cli": "aries-cli",
+  "model": "claude-sonnet-4-6",
+  "startedAt": "2026-04-27T06:21:05.500Z",
+  "wallMs": 300034,
+  "metrics": {
+    "tokens": {
+      "input": 0,
+      "cached": 0,
+      "output": 0,
+      "total": 0
+    },
+    "toolCalls": {
+      "total": 0,
+      "byTool": {}
+    },
+    "finalAnswer": "",
+    "transcript": "{\"type\":\"meta\",\"model\":\"claude-sonnet-4-6\",\"vault\":\"C:\\\\Users\\\\aayoa\\\\brain\",\"cwd\":\"C:\\\\Users\\\\aayoa\\\\Desktop\\\\aries-cli\",\"agentName\":\"Ori\",\"timestamp\":1777271148626}\n"
+  },
+  "fragmentation": {
+    "targetToolCalls": 2,
+    "actualToolCalls": 0,
+    "ratio": 0
+  },
+  "success": false,
+  "successDetails": {
+    "passed": false,
+    "missing": [
+      "mustContainAll: executeToolCalls",
+      "mustContainAll: sequential",
+      "mustContainAll: executionMode|toolExecution",
+      "mustContainAtLeast(1): only matched 0 of 2"
+    ],
+    "reasons": []
+  },
+  "notes": "",
+  "exitCode": null
+}

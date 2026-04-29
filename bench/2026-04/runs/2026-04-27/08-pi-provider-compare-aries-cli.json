@@ -1,0 +1,41 @@
+{
+  "taskId": "08-pi-provider-compare",
+  "cli": "aries-cli",
+  "model": "claude-sonnet-4-6",
+  "startedAt": "2026-04-27T06:27:16.312Z",
+  "wallMs": 42705,
+  "metrics": {
+    "tokens": {
+      "input": 12,
+      "cached": 9991,
+      "output": 475,
+      "total": 10478
+    },
+    "toolCalls": {
+      "total": 2,
+      "byTool": {
+        "Repl": 1,
+        "Agent": 1
+      }
+    },
+    "finalAnswer": "Where does pi-mono live on your machine? Share the path and I'll pull both files directly.",
+    "transcript": "{\"type\":\"meta\",\"model\":\"claude-sonnet-4-6\",\"vault\":\"C:\\\\Users\\\\aayoa\\\\brain\",\"cwd\":\"C:\\\\Users\\\\aayoa\\\\Desktop\\\\aries-cli\",\"agentName\":\"Ori\",\"timestamp\":1777271240529}\n{\"type\":\"usage\",\"inputTokens\":10,\"outputTokens\":290,\"totalTokens\":300,\"cacheReadTokens\":0,\"cacheWriteTokens\":9720,\"timestamp\":1777271247177}\n{\"type\":\"assistant\",\"content\":\"\",\"timestamp\":1777271247180}\n{\"type\":\"tool_call\",\"id\":\"toolu_01S6BFzZVCq4yAET6LSEa6Yx\",\"name\":\"Repl\",\"input\":{\"plan\":\"Read both OpenAI provider files from pi-mono to understand the implementation differences between the Completions and Responses API providers, then surface the key structural differences.\",\"operations\":[{\"purpose\":\"read completions provider\",\"code\":\"completions = fs.read('C:/Users/aayoa/Desktop/pi-mono/packages/ai/src/providers/openai-completions.ts')\"},{\"purpose\":\"read responses provider\",\"code\":\"responses = fs.read('C:/Users/aayoa/Desktop/pi-mono/packages/ai/src/providers/openai-responses.ts')\"},{\"purpose\":\"emit both for analysis\",\"code\":\"say('=== COMPLETIONS ===\\\\n' + completions + '\\\\n\\\\n=== RESPONSES ===\\\\n' + responses)\"}]},\"timestamp\":1777271247184}\n{\"type\":\"tool_result\",\"id\":\"toolu_01S6BFzZVCq4yAET6LSEa6Yx\",\"name\":\"Repl\",\"output\":\"REPL not available. Set `repl.enabled: true` in config and restart.\",\"isError\":true,\"timestamp\":1777271247189}\n{\"type\":\"turn_metrics\",\"turn_index\":1,\"repl_calls\":0,\"any_composed\":false,\"any_micro\":false,\"committed\":false,\"timestamp\":1777271247192}\n{\"type\":\"usage\",\"inputTokens\":1,\"outputTokens\":161,\"totalTokens\":162,\"cacheReadTokens\":0,\"cacheWriteTokens\":9991,\"timestamp\":1777271250375}\n{\"type\":\"assistant\",\"content\":\"\",\"timestamp\":1777271250375}\n{\"type\":\"tool_call\",\"id\":\"toolu_01XqyLznp4gFvTdRUf4F9tXZ\",\"name\":\"Agent\",\"input\":{\"task\":\"Read both of these files and return their full contents:\\n1. C:/Users/aayoa/Desktop/pi-mono/packages/ai/src/providers/openai-completions.ts\\n2. C:/Users/aayoa/Desktop/pi-mono/packages/ai/src/providers/openai-responses.ts\\n\\nReturn the complete file contents verbatim.\",\"model\":\"haiku\",\"max_turns\":5},\"timestamp\":1777271250376}\n{\"type\":\"tool_result\",\"id\":\"toolu_01XqyLznp4gFvTdRUf4F9tXZ\",\"name\":\"Agent\",\"output\":\"I need to use a different approach. Let me spawn an agent to read these files:The files don't exist at the path you specified. The pi-mono directory is not present at `C:/Users/aayoa/Desktop/pi-mono/`. \\n\\nDo you have these files elsewhere, or should I search for them in a different location?\",\"isError\":false,\"timestamp\":1777271276850}\n{\"type\":\"turn_metrics\",\"turn_index\":2,\"repl_calls\":0,\"any_composed\":false,\"any_micro\":false,\"committed\":false,\"timestamp\":1777271276851}\n{\"type\":\"usage\",\"inputTokens\":1,\"outputTokens\":24,\"totalTokens\":25,\"cacheReadTokens\":9991,\"cacheWriteTokens\":256,\"timestamp\":1777271278985}\n{\"type\":\"assistant\",\"content\":\"Where does pi-mono live on your machine? Share the path and I'll pull both files directly.\",\"timestamp\":1777271278986}\n{\"type\":\"turn_metrics\",\"turn_index\":3,\"repl_calls\":0,\"any_composed\":false,\"any_micro\":false,\"committed\":false,\"timestamp\":1777271278986}\n{\"type\":\"postflight\",\"importance\":3,\"reflected\":false,\"timestamp\":1777271278987}\n"
+  },
+  "fragmentation": {
+    "targetToolCalls": 3,
+    "actualToolCalls": 2,
+    "ratio": 0.6666666666666666
+  },
+  "success": false,
+  "successDetails": {
+    "passed": false,
+    "missing": [
+      "mustContainAll: completions",
+      "mustContainAll: responses",
+      "mustContainAtLeast(1): only matched 0 of 4"
+    ],
+    "reasons": []
+  },
+  "notes": "",
+  "exitCode": 0
+}

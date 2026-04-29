@@ -1,0 +1,38 @@
+{
+  "taskId": "05-vault-warmth-trace",
+  "cli": "aries-cli",
+  "model": "claude-sonnet-4-6",
+  "startedAt": "2026-04-27T06:13:49.334Z",
+  "wallMs": 300145,
+  "metrics": {
+    "tokens": {
+      "input": 0,
+      "cached": 0,
+      "output": 0,
+      "total": 0
+    },
+    "toolCalls": {
+      "total": 0,
+      "byTool": {}
+    },
+    "finalAnswer": "",
+    "transcript": "{\"type\":\"meta\",\"model\":\"claude-sonnet-4-6\",\"vault\":\"C:\\\\Users\\\\aayoa\\\\brain\",\"cwd\":\"C:\\\\Users\\\\aayoa\\\\Desktop\\\\aries-cli\",\"agentName\":\"Ori\",\"timestamp\":1777270722694}\n"
+  },
+  "fragmentation": {
+    "targetToolCalls": 4,
+    "actualToolCalls": 0,
+    "ratio": 0
+  },
+  "success": false,
+  "successDetails": {
+    "passed": false,
+    "missing": [
+      "mustContainAll: body/vault\\.py|vault\\.py",
+      "mustContainAll: bridge|JSON.RPC|json-rpc|repl/bridge",
+      "mustContainAll: ori_warmth|warmth|Ori|MCP"
+    ],
+    "reasons": []
+  },
+  "notes": "",
+  "exitCode": null
+}

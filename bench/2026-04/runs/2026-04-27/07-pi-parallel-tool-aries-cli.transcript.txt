@@ -1,0 +1,1 @@
+{"type":"meta","model":"claude-sonnet-4-6","vault":"C:\\Users\\aayoa\\brain","cwd":"C:\\Users\\aayoa\\Desktop\\aries-cli","agentName":"Ori","timestamp":1777271148626}

@@ -1,0 +1,44 @@
+Run directory: C:\Users\aayoa\Desktop\aries-cli\bench\2026-04\runs\2026-04-27
+
+▶ 01-cache-break-trace on aries-cli
+  ✓ tokens=29894 (cached=29117) tools=2 wall=69.6s
+▶ 01-cache-break-trace on claude-code
+  ✓ tokens=61962 (cached=61184) tools=3 wall=26.9s
+▶ 02-repl-failure-audit on aries-cli
+  ✗ tokens=10733 (cached=9475) tools=1 wall=300.1s missing=4
+▶ 02-repl-failure-audit on claude-code
+  ✗ tokens=254220 (cached=249429) tools=10 wall=173.8s missing=3
+▶ 03-mode-reminder-inventory on aries-cli
+  ✓ tokens=11278 (cached=10082) tools=2 wall=101.2s
+▶ 03-mode-reminder-inventory on claude-code
+  ✓ tokens=21561 (cached=20863) tools=1 wall=26.6s
+▶ 04-postflight-gate on aries-cli
+  ✓ tokens=30065 (cached=29110) tools=2 wall=34.9s
+▶ 04-postflight-gate on claude-code
+  ✓ tokens=56420 (cached=55946) tools=2 wall=21.9s
+▶ 05-vault-warmth-trace on aries-cli
+  ✗ tokens=0 (cached=0) tools=0 wall=300.1s missing=3
+▶ 05-vault-warmth-trace on claude-code
+  ✗ tokens=112678 (cached=111135) tools=8 wall=45.1s missing=1
+▶ 06-pi-system-prompt on aries-cli
+  ✓ tokens=20851 (cached=20007) tools=3 wall=70.3s
+▶ 06-pi-system-prompt on claude-code
+  ✓ tokens=35037 (cached=34585) tools=1 wall=18.2s
+▶ 07-pi-parallel-tool on aries-cli
+  ✗ tokens=0 (cached=0) tools=0 wall=300.0s missing=4
+▶ 07-pi-parallel-tool on claude-code
+  ✓ tokens=21331 (cached=20867) tools=3 wall=69.9s
+▶ 08-pi-provider-compare on aries-cli
+  ✗ tokens=10478 (cached=9991) tools=2 wall=42.7s missing=3
+▶ 08-pi-provider-compare on claude-code
+  ✓ tokens=14176 (cached=13698) tools=0 wall=22.3s
+▶ 09-pi-tool-count on aries-cli
+  ✗ tokens=50846 (cached=49658) tools=4 wall=27.7s missing=6
+▶ 09-pi-tool-count on claude-code
+  ✓ tokens=34798 (cached=34349) tools=8 wall=96.9s
+▶ 10-pi-agent-loop on aries-cli
+  ✗ tokens=61559 (cached=60333) tools=5 wall=148.4s missing=3
+▶ 10-pi-agent-loop on claude-code
+  ✓ tokens=34662 (cached=34299) tools=3 wall=90.8s
+
+Summary: C:\Users\aayoa\Desktop\aries-cli\bench\2026-04\runs\2026-04-27\SUMMARY.md
