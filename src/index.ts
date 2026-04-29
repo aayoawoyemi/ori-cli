@@ -27,6 +27,12 @@ import { registerReplTool } from './tools/registry.js';
 import { checkForUpdate, getLocalVersion } from './update/check.js';
 import { printUpdateNotification } from './update/notify.js';
 import type { UpdateResult } from './update/check.js';
+import {
+  registerLifecycleHandlers,
+  onCleanupAsync,
+  onCleanupSync,
+  reapOrphans,
+} from './lifecycle.js';
 
 // ── Parchment Terminal ──────────────────────────────────────────────────
 // Set warm walnut background + cream foreground via OSC escape sequences.
@@ -46,10 +52,25 @@ function exitParchment(): void {
   process.stdout.write(RESET_FG + RESET_BG);
 }
 
-// Register cleanup for all exit paths
-process.on('exit', exitParchment);
-process.on('SIGINT', () => { exitParchment(); process.exit(0); });
-process.on('SIGTERM', () => { exitParchment(); process.exit(0); });
+// Lifecycle handlers wire EVERY exit path (signals, crashes, normal exit) to
+// a centralized cleanup registry. The 2026-04-29 diagnosis confirmed that
+// pre-this, only the happy-path Ink exit (waitUntilExit() → vault.disconnect
+// + replHandle.shutdown at line ~775) ran cleanup. Ctrl+C during startup,
+// uncaught exceptions, and hard kills all orphaned ori-memory subprocesses,
+// leaving 11 zombies on the user's machine that pinned WAL read marks and
+// held ~3GB of embedding model weights hostage.
+//
+// `logCrash` is defined further down (line ~785). Forward-declared via let so
+// registerLifecycleHandlers can capture it now and use it later. The crash
+// log file path stays in sync with the existing CRASH_LOG constant below.
+let logCrashRef: ((label: string, err: unknown) => void) | null = null;
+registerLifecycleHandlers({
+  logCrash: (label, err) => logCrashRef?.(label, err),
+});
+
+// Sync cleanup: terminal restore. Always safe, fast — runs first on every
+// exit path including the synchronous-only 'exit' event.
+onCleanupSync(exitParchment);
 
 interface AmbientSignatures {
   codebaseSignatureMd?: string;
@@ -298,8 +319,31 @@ let vaultIdentity: VaultIdentity | null = null;
 let vaultNoteCount: number | undefined;
 
 const vaultPath = config.vault.path || findVault();
+
+// Orphan reaper: kill ori-memory subprocesses left over from previous aries
+// sessions that exited hard. Runs once per startup, BEFORE we spawn our own
+// MCP subprocess so we don't accidentally kill it. Only kills processes
+// matching the fingerprint AND whose parent PID is dead — never touches
+// subprocesses owned by other live sessions (Claude Desktop, sibling aries,
+// etc.). The 2026-04-29 diagnosis found 11 zombies on the user's machine,
+// each holding ~270MB of embedding model weights. Without the reaper, every
+// crash compounds the leak.
+if (!isSubagent) {
+  const reaped = reapOrphans(['ori-memory', 'serve --mcp']);
+  if (reaped > 0) {
+    console.log(chalk.dim(`  reaped ${reaped} orphaned ori-memory subprocess${reaped === 1 ? '' : 'es'}`));
+  }
+}
+
 if (vaultPath) {
   vault = new OriVault(vaultPath);
+  // Register cleanup BEFORE connect — if connect fails partway and leaves a
+  // child subprocess running, the cleanup handler still fires on shutdown
+  // and disconnects it. Registering after connect would leak on the failure
+  // path.
+  onCleanupAsync(async () => {
+    try { vault?.disconnect(); } catch { /* swallow */ }
+  });
   try {
     await vault.connect();
     vaultIdentity = await vault.loadIdentity();
@@ -416,14 +460,40 @@ if (isSubagent) {
 
   let subCodebaseSignatureMd: string | undefined;
   let subVaultSignatureMd: string | undefined;
+  let subRepl: ReplHandle | null = null;
   // Use shouldIndexCodebase so the subagent's mini-bridge respects the same
   // vault-only collision rule as the main bridge. Without this, a subagent
   // launched while cwd == vault would re-trigger markdown-as-code indexing
   // on every fork.
   const isProject = shouldIndexCodebase(cwd, vaultPath ?? undefined);
 
-  if (config.signature.includeInSubagents && replEnabled) {
-    let subRepl: ReplHandle | null = null;
+  // ── Subagent Repl bridge lifecycle (2026-04-27) ─────────────────────────
+  // Pre-fix this block was double-broken:
+  //   1. Gated on `config.signature.includeInSubagents` — so when signatures
+  //      were off, the bridge was never created at all, but the Repl tool
+  //      stayed registered and codemode's default filter (loop.ts:384-388)
+  //      still exposed it to the model.
+  //   2. When the bridge WAS created, it was shut down inside the finally
+  //      block immediately after signature compile, BEFORE the agent loop
+  //      ran. Plus the local `subRepl` was never assigned to the module-
+  //      level `replHandleRef` that ReplTool.getHandle() closes over —
+  //      so even during signature compile the tool registry couldn't see
+  //      it. End result: every subagent Repl call hit the "REPL not
+  //      available" rejection at src/tools/repl.ts:386, and the system
+  //      prompt was hardcoded to claim replEnabled=false (line 466 below).
+  //
+  // The bench (bench/2026-04/runs/2026-04-27/02-repl-failure-audit-aries-cli)
+  // surfaced this as the smoking gun: model authored a correct Python error-
+  // categorizer script, harness rejected it on the no-handle path, model had
+  // no usable fallback in codemode default, runner SIGKILL'd at 5-min timeout.
+  //
+  // Fix: bridge creation now gated only on `replEnabled` (the resolved-from-
+  // config decision the rest of the harness already made), bridge is wired
+  // into `replHandleRef` so the tool registry sees it, and shutdown is
+  // deferred until AFTER the agent loop drains. Signature compile is now an
+  // independent inner gate — its absence no longer kills bridge availability.
+  // The system prompt's `replEnabled` reflects bridge reality, not a guess.
+  if (replEnabled) {
     try {
       const rlm = resolveRlmConfig(config.repl.rlmModel);
       subRepl = await setupReplBridge({
@@ -438,18 +508,38 @@ if (isSubagent) {
         trimVaultReturns: config.signature.trimVaultReturns,
       });
       if (subRepl) {
-        const sigs = await compileAmbientSignatures(subRepl, {
-          cwd,
-          vaultPath: vaultPath ?? undefined,
-          signature: config.signature,
-        });
-        subCodebaseSignatureMd = sigs.codebaseSignatureMd;
-        subVaultSignatureMd = sigs.vaultSignatureMd;
+        // Wire into the module-level ref so ReplTool.getHandle() (closure
+        // over replHandleRef at line 390/394) returns this bridge during
+        // the agent loop. This is the line whose absence pre-fix turned
+        // every Repl call into "REPL not available" even when the bridge
+        // was momentarily alive for signature compile.
+        replHandleRef = subRepl;
+        if (config.signature.includeInSubagents) {
+          try {
+            const sigs = await compileAmbientSignatures(subRepl, {
+              cwd,
+              vaultPath: vaultPath ?? undefined,
+              signature: config.signature,
+            });
+            subCodebaseSignatureMd = sigs.codebaseSignatureMd;
+            subVaultSignatureMd = sigs.vaultSignatureMd;
+          } catch {
+            // Signature compile is best-effort. Failure here just means the
+            // subagent enters the loop without ambient signatures — the
+            // bridge stays up and the Repl tool keeps working.
+          }
+        }
       }
     } catch {
-      // Fresh-context fallback is intentional.
-    } finally {
-      if (subRepl) await subRepl.shutdown();
+      // Fresh-context fallback is intentional. If bridge setup throws, the
+      // subagent runs without Repl: replEnabled in the system prompt becomes
+      // false (computed below from `!!subRepl`) and the model will skip Repl
+      // composition. Better than crashing on a transient body-spawn glitch.
+      if (subRepl) {
+        try { await subRepl.shutdown(); } catch { /* best effort */ }
+        subRepl = null;
+      }
+      replHandleRef = null;
     }
   }
 
@@ -463,7 +553,7 @@ if (isSubagent) {
     warmContext,
     codebaseSignature: subCodebaseSignatureMd,
     vaultSignature: subVaultSignatureMd,
-    replEnabled: false,
+    replEnabled: !!subRepl,
     experienceLog: readExperienceLog(cwd),
   });
 
@@ -510,6 +600,15 @@ if (isSubagent) {
   // final commit via done()) still surface their work to the parent.
   const subagentOutput = finalText.trim() ? finalText : lastReplOutputFull;
   process.stdout.write(subagentOutput);
+
+  // Bridge shutdown happens AFTER the agent loop has fully drained — earlier
+  // shutdown is what made pre-fix subagents Repl-blind (see lifecycle
+  // comment above). Best-effort: if the body subprocess is already gone or
+  // hanging, swallow the error and let the explicit process.exit reap it.
+  if (subRepl) {
+    try { await subRepl.shutdown(); } catch { /* best effort */ }
+    replHandleRef = null;
+  }
   vault?.disconnect();
   process.exit(0);
 }
@@ -683,7 +782,31 @@ async function main(): Promise<void> {
         replHandleRef = handle;
 
         if (handle) {
-          const parts: string[] = [config.repl.sandbox];
+          // Register replHandle cleanup as soon as it exists. Like vault, this
+          // owns a child subprocess (the Python body, plus its descendants for
+          // shell.run et al). Without registration, signal-based exits would
+          // orphan the body. handle.shutdown() is idempotent and safe to call
+          // even if the happy-path explicit shutdown at line ~830 also fires
+          // — runCleanup gates on cleanupRunning so double-fire is a no-op.
+          // Inside the truthy branch so TS narrows handle from `ReplHandle |
+          // null` to `ReplHandle`.
+          const liveHandle = handle;
+          onCleanupAsync(async () => {
+            try { await liveHandle.shutdown(); } catch { /* swallow */ }
+          });
+
+
+          // User-facing sandbox label. The internal config values
+          // (`same_process` / `docker` / `firecracker`) are correct
+          // identifiers but read like leaked dev output to a user trying
+          // to understand their startup banner — `same_process` in
+          // particular is verbose and only meaningful if you know the
+          // codebase's sandbox-strategy enum. Translate to short, neutral
+          // labels here. Keep the config enum unchanged.
+          const sandboxLabel = config.repl.sandbox === 'same_process'
+            ? 'inproc'
+            : config.repl.sandbox;
+          const parts: string[] = [sandboxLabel];
           if (vaultPath) parts.push('vault');
           if (process.env.OPENROUTER_API_KEY ?? process.env.ANTHROPIC_API_KEY) parts.push('rlm');
           console.log(chalk.dim(`  repl: body ready (${parts.join(' + ')})`));
@@ -708,6 +831,11 @@ async function main(): Promise<void> {
   }
 
   await waitUntilExit();
+  // Happy-path explicit cleanup. The lifecycle registry would also fire on
+  // 'exit', but that path is sync-only — running the async tail here means
+  // vault.disconnect's stdin EOF + bridge.shutdown's graceful op get their
+  // full window. Idempotent: runCleanup gates on cleanupRunning so a second
+  // invocation from the 'exit' handler is a no-op.
   vault?.disconnect();
   if (replHandleRef) await replHandleRef.shutdown();
   process.exit(0);
@@ -723,15 +851,12 @@ function logCrash(label: string, err: unknown): void {
   try { writeFileSync(CRASH_LOG, entry, { flag: 'a' }); } catch { /* ignore */ }
 }
 
-process.on('uncaughtException', (err) => {
-  logCrash('uncaughtException', err);
-  exitParchment();
-  process.exit(1);
-});
-
-process.on('unhandledRejection', (reason) => {
-  logCrash('unhandledRejection', reason);
-});
+// Wire logCrash into the lifecycle module's forward-declared ref. The
+// lifecycle handlers were registered above (line ~57) before logCrash was
+// defined; this binding completes the connection so uncaughtException +
+// unhandledRejection events inside lifecycle.ts get logged with the same
+// CRASH_LOG path the rest of the system uses.
+logCrashRef = logCrash;
 
 main().catch((err) => {
   logCrash('main.catch', err);

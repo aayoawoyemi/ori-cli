@@ -528,8 +528,228 @@ Sharpened by the realtor-Jarvis thought experiment (2026-04-26):
 Three sub-batches because handle infrastructure is load-bearing for the rest:
 
 - **Nous-1: Handle infrastructure** — replace tool_result content >2KB with `<handle:abc123>` token; `expand(handle)` primitive for rehydration; eviction after N turns; telemetry on create/expand/evict. Single biggest unlock; replaces our crude microcompact band-aid with real continuous eviction. Reference: `oh-my-pi`'s `artifact://` pattern, Letta's recall storage. ~200-300 LOC over a few sessions.
-- **Nous-2: Cheap sub-agent orchestration** — `delegate(task, model='cheap')` primitive; sub-agents have restricted tool sets + own context; parent gets a synthesis handle (not full transcript); hard depth cap. Becomes cheap once handles work because parent doesn't accumulate sub-agent exhaust. Reference: Claude Code's `Task` tool + YAML subagents, OpenAI Agents SDK handoffs. ~400-500 LOC.
+- **Nous-2: Cheap sub-agent orchestration** — `delegate(task, model='cheap')` primitive; sub-agents have restricted tool sets + own context; parent gets a synthesis handle (not full transcript); hard depth cap. Becomes cheap once handles work because parent doesn't accumulate sub-agent exhaust. Reference: Claude Code's `Task` tool + YAML subagents, OpenAI Agents SDK handoffs, **`alexzhang13/rlm` (pip `rlms`) — cleanest existing impl of recursive-call pattern; lift the design, do not import (would conflict with Aries' router + REPL substrate, see vault note `mismanaged-geniuses-hypothesis...` for analysis)**, **Isaac Flath's Pi RLM extension — blog at https://isaacflath.com/writing/rlm, Pi harness MIT-licensed at https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent. Closest production impl of the Aries architecture in a different problem domain (retrieval/doc QA). Substrate decisions match Aries line-for-line (persistent Python REPL subprocess, dual-channel TS bridge, prose+code per turn, no sandbox). Use as primary reference for both Nous-2 implementation AND the upcoming dev-note/paper.**. ~400-500 LOC.
+  - **Design constraint surfaced 2026-04-26 (Alex Zhang LongCoT-mini analysis):** the contract must include a **verification handle** alongside the synthesis handle. Zhang's trace analysis on RLM(GPT-5.2) found the dominant failure mode was "model launches sub-agents but rarely checks whether the sub-agent actually got the sub-problem correct" — sub-agent exhaust silently corrupts the parent's synthesis and the recursion compounds errors instead of decomposing them. Cheap implementation: `delegate(...)` returns `(result_handle, verification_handle)`; the verification handle is a follow-up cheap-model call that re-runs the result against the original task statement and returns a confidence score. One extra cheap-model call per delegation. Catches the failure mode before Nous-2 ships. See vault note `mismanaged-geniuses-hypothesis...` for the source.
+  - **Four API design decisions to lift from Isaac Flath's Pi RLM (2026-04-26):** Flath's Pi extension is the closest shipped impl of the Aries architecture; his concrete API surface answers four design questions cleanly. (1) **Two delegation primitives, not one:** `delegate(task)` and `delegate_batched(tasks)` with a hard concurrency cap (~4). The batched version is what makes fanout cheap. (2) **Model stratification by recursion depth:** depth 0 (root) uses primary model; depth ≥1 and all flat sub-LLM calls use cheap. Single rule, predictable cost, no per-call routing decisions needed. (3) **Shared budget across the delegation tree:** a `max_budget` variable tracks total LM spend across the recursion; children inherit the parent's remainder; investigation ends when budget hits zero. Cleaner than per-call timeouts. (4) **Graceful recursion-limit downgrade:** when the depth cap is hit, `delegate` downgrades to a flat cheap-LLM call rather than failing — model gets *some* answer instead of an error. Aries advantage Flath doesn't have: Mnemos vault gives memory persistence across sessions; Flath's namespace dies at end of each `rlm_query` call. Post-Nous-2, Aries is strictly more (his sub-agent fanout + our cross-session memory).
 - **Nous-3: Tiered router auto-wiring** — automatic model selection per task type (Haiku for parsing, Opus for reasoning, Flash for bulk); infrastructure exists (we have primary/cheap/bulk slots + `cheapCall`); just needs wiring + per-task routing rules. ~150 LOC + config.
+
+### Debug primitive — frame-as-namespace REPL switch (Batch 5 or post-Nous-1)
+
+**Surfaced 2026-04-26 from the Parakhin debugger thread + BLANPLAN's pretraining-priors diagnosis.** Agents printf-debug like it's 1957 because GitHub ships diffs (the *result* of debugging) but never breakpoint state with variable inspection (the *process*). Pretraining shapes the priors — the model has never seen a debugger session and so doesn't reach for one.
+
+**Core architectural insight (not "build a debugger primitive"):** a debugger is a REPL for paused execution. `pdb` is literally a Python REPL where global scope = the frozen frame's locals. Aries is already a REPL substrate. So the elite move is **not to bolt on a debugger as a separate modality with `start/step/eval/continue` RPC calls — it is to make the debug session BE the REPL by switching what scope the REPL currently runs in.** The model already knows how to write Python in a REPL; we just change what scope the REPL is running in. The pretraining gap is bypassed by reusing a prior the model already has.
+
+**Concrete usage shape:**
+```python
+# Op 1 — start, pause at breakpoint
+debug.start('buggy.py', break_at=[('foo.py', 42)])
+# Op 2 — code here runs IN THE PAUSED FRAME's scope, not Aries' global namespace
+print(x); print(type(items)); test = x.foo()  # x, items, test are frame locals
+# Op 3 — Aries primitives still work alongside frame state
+related = vault.query_ranked('payment processing edge cases')
+related_funcs = codebase.find('processPayment')
+# Op 4 — step
+debug.step('over')  # Op 5 now runs in the new frame
+```
+
+**The bridge wiring detail that determines whether this works.** `body/server.py`'s op execution needs a mode flag: when a debug session is paused, `exec(code, ...)` routes to the frame's `f_globals` + `f_locals` instead of the body's persistent namespace. Pause/resume coordination via `threading.Event` — same pattern Codex used in Batch 3.5's bridge serialization fix.
+
+**Five capabilities that drop out of "debug = scope switch on existing REPL," each independently shippable:**
+
+1. **Phase 1 — Frame-as-namespace REPL switch (load-bearing).** ~400-500 LOC. Bdb subclass + worker thread + bridge mode flag. Surface: `debug.start`, `debug.step`, `debug.continue_`, `debug.stop`, `debug.frame`, `debug.stack`.
+2. **Phase 2 — Codebase-graph symbol breakpoints.** ~50 LOC. `debug.start(script, break_at=[codebase.find('foo').entry])`. Agent thinks in symbols, not file:line. No other tool gives the agent symbol-shaped breakpoints driven by a graph.
+3. **Phase 3 — Programmable break handlers (the underutilized `bdb` feature).** ~100 LOC. `debug.on_break((file, line), do=callable)` — Python code runs at every break hit. Agent writes its own programmable observation logic. Substrate for instrumenting running code with arbitrary Python.
+4. **Phase 4 — Snapshot-replay (cheap pseudo-time-travel).** ~150 LOC. Capture frame locals at every breakpoint hit; `debug.history()` + `debug.rewind(step=N)` lets the agent inspect any past frame state. Not real time-travel (rr/Pernosco kernel-level) but 80% of the value at 5% of the cost. **Frame snapshots are exactly what Nous-1 handles are for** — depends on Nous-1.
+5. **Phase 5 — Mnemos auto-capture on session end.** ~100 LOC. On `debug.stop` (or auto-detect debug-followed-by-resolving-edit), emit a vault note summarizing what got learned: "bug at foo.py:42 — root cause was X — diagnosed by inspecting buffer state at frame[3]". Six months later, retrieval surfaces the prior diagnosis. **This is the Aries-only capability — Pi RLM has no memory continuity, IDE debuggers have no agent-shaped retrieval. Only Aries (REPL substrate + Mnemos underneath) makes debugger sessions institutional memory.**
+6. **Phase 6 (much later) — DAP for multi-language.** ~600-800 LOC. Same agent-facing surface, swap implementation to Microsoft's Debug Adapter Protocol so it works for Node/Go/Rust/C++. Don't do this first — the surface is the value, not the language coverage.
+
+**Honest failure modes that the design accounts for:**
+- Sessions don't survive Aries process death (frame state isn't fully picklable). Don't promise persistence.
+- Async/threaded code v1: raise teaching error pointing at `shell.run` + logging fallback.
+- Debugged scripts do real I/O — same trust posture as `shell.run`. No fake sandboxing.
+- Frame-scope leakage (mid-debug `import foo` sticks until frame exits): mirror pdb's permissive behavior; documentation problem, not design problem.
+
+**Where it fits:** NOT Nous-arc (Nous is kernel: handles, sub-agents, routing). Debug is a **craft-layer primitive** that integrates with Nous-1 handles when those land. Best slot: Batch 5 (craft) or its own dedicated batch immediately after Nous-1.
+
+**One-line architectural thesis (quotable for the dev note/paper):** *A debugger isn't a tool the agent uses. It's a temporary scope switch on the substrate the agent already lives in.*
+
+**Empirical justification (Microsoft debug-gym, arxiv 2503.21557, March 2025):** Claude 3.7 Sonnet **37.2 → 48.4 → 52.1** on SWE-bench Lite when given a debugger (raw → with-debugger → debug-after-5-rewrites). **o1 relative +182%. o3-mini +160%.** They released FrogBoss (32B) and FrogMini (14B) — trained models that natively use debuggers. Half the SWE-bench Lite gap closes when the agent has a debugger access. This is the number to cite when justifying the work.
+
+**Confirmed via 2026-04-26 deep research: nobody has shipped frame-as-namespace REPL scope-switch for an LLM agent.** Every existing project (Augur, mcp-debugger, Microsoft DebugMCP, ChatDBG, Debug2Fix, debug-gym) exposes DAP verbs as N discrete tools. The closest precedent is Pharo's Sindarin (DLS 2019) — but it's a debugger script API for humans, not for agents. The architectural insight is genuine novelty in the agent space; Aries would be first.
+
+**Critical implementation sharp edge — `f_locals` mutation in CPython.** Before Python 3.13, `frame.f_locals` is a snapshot dict; writing `frame.f_locals['x'] = 5` does NOT persist back to actual fast-locals slots. Reliable persistence: call `ctypes.pythonapi.PyFrame_LocalsToFast(frame, c_int(1))` after mutation. In 3.13+, **PEP 667** changes this so writes pass through naturally. **Spec must detect Python version, use PEP 667 path for 3.13+, fall back to ctypes call for older. Test both.**
+
+**Six elite design moves to fold into the spec (not in original sketch — surfaced 2026-04-26 research):**
+1. **Tracepoints-first, stops-by-exception.** `bp(file, line, do=callable)` returning None continues, returning truthy stops. Steals from gdb's `Breakpoint.stop()` pattern. Bias the agent toward "instrument and re-run" not stop-the-world.
+2. **Vault-backed cross-session breakpoints.** `bp_when_seen(symptom)` matches against learned failure signatures from prior Mnemos retrieval. Aries-only capability — Pi RLM has no memory continuity, IDE debuggers have no agent-shaped retrieval.
+3. **Snapshot-replay tier (no rr).** Capture (frame snapshot via dill, source-hash, traceback, ts) at every paused breakpoint to vault under `debug/<session>/<bp_id>/<hit_n>`. `revisit(snapshot_id)` rehydrates a paused REPL at that captured state. 90% of TTD value at 1% of engineering cost.
+4. **Auto-narrated stops.** Cheap LLM 1-line summary per stop event written to vault. Saves orientation token-burn next turn.
+5. **Codebase-graph-aware stepping.** `step_to(symbol)` jumps to next time control reaches a graph-resolved symbol, not just lines. Aries already has the graph; debugger consumes it.
+6. **Moldable inspector returns (Pharo idea).** When agent inspects `frame.f_locals['model']`, return typed summaries (shape if tensor, head/tail if df, source link if function, vault-key if previously inspected) not just `repr`.
+
+**Reference vault note for full design space + 17-item spec checklist:** `debugger-as-primitive-for-llm-agents-deep-research...` (added 2026-04-26).
+
+**Side benefit not in original framing:** a well-instrumented Aries debugger *generates* the trajectory data the field is starving for as a byproduct (BLANPLAN's pretraining-gap diagnosis is well-attested; Toloka × Parakhin pipeline forming; debug-gym → FrogBoss/FrogMini is first public artifact of someone filling that gap via training data). Aries' debug sessions become a private training corpus that may eventually be worth more than the debugger code itself.
+
+**What it eliminates:** the Parakhin "2 hours on a bug I found in 5 minutes" gap. Today the agent's loop is `fs.read` + `shell.run("python script.py")` + add `print(...)` + re-run + scan logs + repeat. With Phase 1 the loop becomes `debug.start` paused at the suspect line + `debug.eval(sess, "the suspect expression")` returning actual value + step into the failing function + form the fix from frame state, not log inference. This is the regime change.
+
+### Patterns to port from oh-my-pi (code-level dive 2026-04-26)
+
+oh-my-pi (`github.com/can1357/oh-my-pi`, 3.5k stars, MIT, v14.5.2 2026-04-26) is the most production-mature CodeAct-style coding agent that exists publicly. Code-level deep dive surfaced four subsystems worth porting, in priority order. Full details in vault note `oh-my-pi-code-level-deep-dive...`. The internal URL protocol pattern (`memory://`, `rule://`, `skill://` routed through one `InternalUrlRouter`) is the single highest-leverage architectural idea in the whole codebase — Aries should retrofit `mnemos://` to collapse N future tools into 1 (~200 LOC).
+
+#### Port 1 — TTSR (Time-Traveling Streamed Rules) — ~1 day, ~400 LOC
+
+**The cheapest big win.** Currently CLAUDE.md / ~/.aries rules are soft prose the model can ignore under pressure. TTSR makes them hard rails — the model literally can't produce the bad output because it gets interrupted mid-stream.
+
+**Mechanism.** `TtsrManager` holds compiled regex+scope rules in memory (NOT in system prompt — "zero cost" baseline). On every stream chunk (text/thinking/tool-arg deltas), `manager.checkDelta(delta, context)` matches against rules. On match: `agent.abort()` → 50ms → inject `<system-interrupt reason="rule_violation" rule="{{name}}">...</system-interrupt>` template as next user message → `agent.continue()`. Rules sourced from `~/.aries/rules/*.md` + `<cwd>/.aries/rules/*.md`.
+
+**Rule frontmatter shape** (verbatim from oh-my-pi):
+```yaml
+description: ...
+condition: "// TODO|placeholder|simplified for"   # regex; can be array
+scope: "tool:edit(*.ts), tool:write(*.ts)"        # text|thinking|tool[:<name>][(<glob>)]
+interruptMode: "always"                            # never|prose-only|tool-only|always
+```
+Shorthand: `condition: "*.rs"` (looks like glob) auto-rewrites to `scope: "tool:edit(*.rs), tool:write(*.rs)"` + catch-all `.*` regex.
+
+**Concrete Aries rules to ship on day 1:** "no // TODO or placeholder", "comments required on non-trivial blocks", "no abstraction without 3+ usage points", "no try/catch wrapping for scenarios that can't happen". Each becomes 5-line markdown file with a regex.
+
+**Implementation:** new `body/ttsr.py` (or `src/router/ttsr.ts`). Hook into provider stream callback. Reuse frontmatter parser from `body/schema.py`. ~400 LOC, self-contained.
+
+#### Port 2 — Autonomous Memory Phase 1 (THE recursive-learning unlock) — ~2 days
+
+**The unlock for "agent learns within session, loses it on restart."** Today: Mnemos vault stores manually-captured insights, but session-level failure modes (tool-call mistakes, primitive misuse, surprising findings) evaporate at session end unless the user manually emits an `ori_add`. With this, every session auto-distills its lessons into a per-project agent-memory the next session orients on.
+
+**Honest framing: this is advanced context injection, not "learning."** No magic, no model improvement. The agent writes down what it noticed; next session reads its own notes. The intelligence is in the distillation prompt + the choice of what to inject. The unlock is bounded but real: cuts repeat-mistake loops on operational lore (commands, primitives, conventions); builds project-specific institutional knowledge over months; gives Nous-2 sub-agents free institutional knowledge when they spawn.
+
+**Architecture decision: separate agent-memory vault at `~/.aries/memory/`, NOT mixed into brain vault.** Five reasons established in 2026-04-26 design discussion:
+1. Different curation discipline (high-trust human-curated vs. medium-trust LLM-extracted)
+2. Different scope (cross-project brain vs. per-project agent-memory)
+3. Different growth rate (agent-memory grows ~5-10/day at active pace; would dominate brain vault note count within months)
+4. Different lifecycle (brain notes age slowly; agent-memory ages fast — aggressive auto-prune appropriate)
+5. Different retrieval intent (user-directed vs. agent-internal)
+
+**Storage layout:**
+```
+~/.aries/memory/
+  projects/
+    aries-cli/                   # per-project, slug from cwd
+      MEMORY.md                  # consolidated long-form (Phase 2, optional)
+      memory_summary.md          # 5K-token startup injection
+      raw_memories.md            # cumulative dump (Phase 2 input)
+      rollout_summaries/<thread_id>-<slug>.md
+      skills/<name>/SKILL.md     # auto-extracted procedural playbooks (optional)
+    jubilee-agent/
+    court-coin/
+  global/                        # rare cross-project patterns
+  index.db                       # SQLite for jobs + lightweight retrieval
+```
+
+**Sizing math (designed-in, not assumed):**
+- Per session: ~5-15 KB markdown (one `{rollout_summary, rollout_slug, raw_memory}` triple)
+- 6 months daily use: ~750 sessions × 10KB = ~7.5 MB raw
+- 2 years daily use: ~30 MB raw
+- After Phase 2 consolidation (if shipped): MEMORY.md bounded ~50-100 KB, summary capped at 5K tokens
+- Context burn at session start: ~5.5K tokens (memory_summary.md + read-path wrapper)
+- For comparison: current orient bundle is ~3-5K tokens; doubling that is fine on Opus 1M context
+
+**Pipeline.** After session close, `body/memory_pipeline.py` runs in background:
+1. Parse session JSONL.
+2. Filter: keep `system/developer/user/assistant` + `toolResult` from `repl|fs|shell|vault|web|codebase` only when output ≤ 32KB.
+3. Truncate to `min(4_000, contextWindow * 0.7)` tokens.
+4. Hit Anthropic with the verbatim oh-my-pi Phase 1 prompt (below). **Default to Haiku 4.5** (cheap; revisit if extraction quality is poor — oh-my-pi runs the session's main model, possibly oversight).
+5. Returns `{rollout_summary, rollout_slug, raw_memory}`.
+6. Run `redactSecrets()` on each field.
+7. Write to `~/.aries/memory/projects/<cwd-slug>/rollout_summaries/<thread_id>-<slug>.md` and append raw_memory to `raw_memories.md`.
+
+**Phase 2 (optional, deferred to post-MVP).** Consolidation into `MEMORY.md` + `memory_summary.md`. Skip in v1 — directly use `raw_memories.md` + the most recent N rollout summaries as the injection source. Add Phase 2 consolidation if `raw_memories.md` gets large enough that injection has to be lossy.
+
+**Concurrency / crash safety.** Single-user simplification: `flock` on `~/.aries/memory/.lock` (skip oh-my-pi's SQLite job-leasing machinery — overkill for one user). One extractor process at a time, retry on crash via lock release.
+
+**Integration: at the orient layer, NOT the storage layer.**
+- Mnemos stays focused on brain vault — no secondary index needed for v1
+- Session-start hook reads `~/.aries/memory/projects/<current-cwd-slug>/memory_summary.md` directly and prepends to system prompt
+- Orient bundle pulls BOTH: brain vault (daily/goals/identity/warmth) + agent-memory (current-project lessons)
+- Default scope: only auto-load agent-memory for the current `cwd`'s project — no cross-project bleed
+
+**Cross-project promotion path.** When an agent-memory note is actually cross-project worthy (e.g., "Windows shell needs forward-slash guards"), user (or future auto-detection) promotes from `~/.aries/memory/projects/<X>/` into `~/.aries/memory/global/` OR into `~/brain/notes/` as a `feedback_*` memory. Mnemos's existing promote workflow with agent-memory as another input source. **Personal-preference items (heavy comments, no amend) belong in brain vault as feedback memories — they live there today and should stay.**
+
+**Verbatim Phase 1 system prompt** (oh-my-pi MIT, can copy):
+```
+You are memory-stage-one extractor.
+You **MUST** return strict JSON only — no markdown, no commentary.
+Extraction goals:
+- You **MUST** distill reusable durable knowledge from rollout history.
+- You **MUST** keep concrete technical signal (constraints, decisions, workflows, pitfalls, resolved failures).
+- You **MUST NOT** include transient chatter and low-signal noise.
+Output contract: { "rollout_summary": "string", "rollout_slug": "string | null", "raw_memory": "string" }
+Rules:
+- rollout_summary: compact synopsis of what future runs should remember.
+- rollout_slug: short lowercase slug (letters/numbers/_), or null.
+- raw_memory: detailed durable memory blocks with enough context to reuse.
+- If no durable signal exists, return empty strings.
+```
+
+**Three open decisions to nail before coding:**
+1. **Vault root location.** `~/.aries/memory/` (proposed) vs. `<brain_root>/agent-memory/` (sub-vault). Going separate root for clean isolation; revisit if Mnemos retrieval becomes valuable enough to need indexing.
+2. **Auto-promote threshold.** What confidence triggers auto-promotion from rollout_summaries to MEMORY.md? Manual-only in v1; revisit when raw_memories.md gets big.
+3. **Skill files.** Auto-extracted procedural playbooks (oh-my-pi's pattern) — ship in v1 or wait for demand? Probably wait — adds complexity, marginal value until volume of memories justifies it.
+
+**What it doesn't change:** RUNNING.md stays project state (different concern from MEMORY.md which is auto-extracted lessons). Identity (self/) stays manual. Cross-project insights still need explicit `ori_add` for now.
+
+**The bigger workflow shift.** Today user carries institutional knowledge — has to remember "we don't amend commits," "heavy comments," "Windows quirks" each session. With AM, agent carries its own institutional knowledge. **Sessions compound.** By session 50 the agent knows the codebase the way a long-tenured engineer knows it — not because the model got smarter, but because the harness stopped throwing away its own learning. Direct realization of the `agents-shouldnt-die` thesis from `ops/twitter/ideas.md`: identity reads on every start; AM is the missing "writes back to the vault on every run" half.
+
+**Ships as Batch 5 candidate** (or its own dedicated batch). Slot timing: after Nous-1 lands so handle infrastructure is available for storing larger raw_memories if needed.
+
+#### Port 3 — Persistent IPython kernel via Jupyter Kernel Gateway — ~2 days
+
+Aries already runs Python in `body/`. Adding persistent kernel state across REPL turns (not just within a batch's composed ops) + structured TUI tool feedback is a quality-of-life regime change.
+
+**Architecture (oh-my-pi pattern).** `pip install jupyter_kernel_gateway ipykernel`. Spawn gateway as child process at startup. Talk via HTTP REST (`POST /api/kernels` to create) + WebSocket (`ws://.../api/kernels/<id>/channels` for messages). Use standard Jupyter `serializeWebSocketMessage` / `deserializeWebSocketMessage`. Interrupt: `POST /api/kernels/<id>/interrupt`. Way simpler than raw ZMQ multi-channel pubsub.
+
+**Free win: `application/x-omp-status` MIME pattern for structured tool feedback.** Helper functions in the prelude emit `display({"application/x-omp-status": {"op": "search", "matches": 42}}, raw=True)`. TS side intercepts that MIME type and renders custom TUI (file diffs, hit counts, progress bars) instead of dumping raw JSON. **Aries' TUI in `src/ui/` can use this for structured tool events at zero cost.**
+
+**Prelude.** Take oh-my-pi's `prelude.py` (35KB, MIT licensed) wholesale. ~30 categorized helpers (Shell, File I/O, Search, Find/Replace, Text, Navigation, Batch, Line ops). `__omp_prelude_docs__()` returns a typed catalog the agent sees at startup. Most overlap with existing `body/fs.py` / `body/shell.py` — but the structured emit pattern is the value-add.
+
+**Shared gateway across sessions.** Skip in v1 (per-session is fine). The mechanism (oh-my-pi's `gateway-coordinator.ts`) reference-counts a single gateway via `acquireSharedGateway()` / `releaseSharedGateway()` with `PI_PYTHON_GATEWAY_URL` + `PI_PYTHON_GATEWAY_TOKEN` env vars for remote gateway. Useful later if multi-session warm-state matters.
+
+#### Port 4 — Subagents (worktree mode only) — ~3-4 days, defer until 1-3 land
+
+This is Nous-2 territory but with concrete oh-my-pi mechanisms to lift. Lower urgency for solo-builder workflow.
+
+**Key insights from oh-my-pi:**
+- **Subagents are in-process, not subprocess.** They share the Node runtime via `createAgentSession({...})`. Aries doesn't have a single-process agent runtime to fork — so spawn subprocess via `python -m body.repl --system <prompt> --task <assignment> --output-file <path>`. Keep parent/child schema-pinned.
+- **Three isolation backends:** worktree (default), fuse-overlay (Linux/Mac), ProjFS (Windows). **Aries should ship worktree-only.** Skip fuse/ProjFS — too heavy for first pass.
+- **Worktree captures parent dirty state.** `git worktree add --detach` then baseline+patch logic merges parent's staged/unstaged/untracked changes into the child worktree. Patches merge back via `git diff` extraction at job end.
+- **`yield` tool with structured JTD output schema = required exit.** Sub-agent MUST call yield exactly once with data conforming to parent-defined output schema. No prose substitution allowed. **This is the verification + structured-handoff combined — better design than just "return synthesis handle."**
+- **Concurrency reality check.** README claims 100 concurrent jobs; actual default is 15 (`DEFAULT_MAX_RUNNING_JOBS = 15`). The 100 is prompt theater told to the model. Aries should pick a real number (8-16) and not lie about it.
+- **YAML frontmatter agent definitions:**
+```yaml
+---
+name: explore
+description: Fast read-only codebase scout
+tools: read, grep, find, web_search
+model: pi/smol
+output:
+  properties:
+    summary: { type: string }
+    files: { ... elements: { properties: { ref, description } } }
+---
+[system prompt body]
+```
+- **Three-tier discovery:** bundled, user (`~/.aries/agents/`), project (`<cwd>/.aries/agents/`).
+
+**IRC tool for inter-agent peer messaging** is a surprising design choice — sibling subagents in a parallel batch can ask each other quick questions instead of round-tripping through the parent. Probably premature for Aries; note it for later.
+
+#### Skip entirely
+
+fuse-overlay/ProjFS isolation, IRC peer messaging, the 100-job async system, brush-core vendored shell. Big Org features; don't fit Aries' shape.
+
+#### Architectural pattern to adopt globally: internal URL protocols
+
+oh-my-pi routes 9 protocols (`memory://`, `agent://`, `artifact://`, `jobs://`, `local://`, `mcp://`, `pi://`, `rule://`, `skill://`) through one `InternalUrlRouter`. Agent sees one `read` tool, behavior switches on protocol prefix. **Massively cleaner than 9 separate tools — fewer tool descriptions in system prompt, easier for the model to compose.**
+
+For Aries: retrofit `mnemos://` (vault notes), `repl://` (Repl session state), `bridge://` (bridge primitive metadata), `debug://` (debug session snapshots when that ships). All through one `InternalUrlRouter` consumed by `fs.read` (or a dedicated `read` primitive). ~200 LOC, replaces several future primitives. Worth doing alongside Nous-1 handle infrastructure since handles are URL-shaped naturally.
 
 ### Reference work to study before starting Nous
 

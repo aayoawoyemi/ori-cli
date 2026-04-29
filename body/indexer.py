@@ -303,11 +303,74 @@ def index_file(path: Path, rel_path: str) -> Optional[FileRecord]:
     return record
 
 
-def _walk_files(root: Path, include_exts: set[str], exclude_dirs: set[str]):
-    """Yield (full_path, rel_path) for each source file."""
+def _is_nested_foreign_project(dir_path: Path, walk_root: Path) -> bool:
+    """
+    True if dir_path is a nested foreign project — a subdirectory inside
+    walk_root that is itself an independent git repository. We refuse to
+    descend into these because they're not part of "the project we're
+    indexing": they're vendored fixtures, SWE-Bench workspaces, sample
+    repos, or similar — code that lives inside our tree but conceptually
+    belongs to someone else.
+
+    Heuristic: subdir contains its own `.git` directory. We require it
+    to be a directory specifically (not a file) — submodule .git files
+    point back to the parent's modules dir and DO belong to the outer
+    project; we don't want to skip submodules.
+
+    Always returns False for walk_root itself: the project we were asked
+    to index always has its OWN .git, and skipping it would mean indexing
+    nothing.
+
+    Diagnosed 2026-04-29: aries-cli running on itself burned 100%+ CPU
+    for 3+ minutes indexing 6,742 Python files in bench/swe-lite/
+    workspaces/ — copies of django, requests, sympy etc. with their own
+    .git directories. The user's mental model is "aries should only read
+    from the project it's in unless I tell it to look elsewhere." This
+    heuristic makes the implementation match.
+    """
+    if dir_path.resolve() == walk_root.resolve():
+        return False
+    git_path = dir_path / ".git"
+    return git_path.is_dir()
+
+
+def _walk_files(
+    root: Path,
+    include_exts: set[str],
+    exclude_dirs: set[str],
+    include_nested_repos: bool = False,
+):
+    """Yield (full_path, rel_path) for each source file.
+
+    When include_nested_repos is False (the default), subdirectories that
+    are themselves git repositories (e.g., vendored fixtures, SWE-Bench
+    workspaces) are skipped — they're not part of "this project." When
+    True, every subdirectory is walked regardless of its own .git status.
+    Use the True case when you explicitly want the foreign code in your
+    symbol graph (e.g., debugging a vendored library you're patching).
+    """
+    root_resolved = root.resolve()
     for dirpath, dirnames, filenames in os.walk(root):
-        # prune excluded dirs in-place
-        dirnames[:] = [d for d in dirnames if d not in exclude_dirs and not d.startswith(".")]
+        # Prune excluded dirs in-place. Two layers of skipping here:
+        #   1. Name-based exclude (DEFAULT_EXCLUDE_DIRS + dotfiles) —
+        #      catches build artifacts, caches, vendor, etc.
+        #   2. Nested-foreign-project detection — catches subdirectories
+        #      that are independent git repos (vendored fixtures, swe-
+        #      bench workspaces). Computed by inspecting each candidate
+        #      child for its own .git directory.
+        # The two-layer order matters for performance: name-based filter
+        # is O(1) per dir; foreign-project filter does an os.stat on each
+        # surviving dir. Doing names first keeps stat calls bounded.
+        # When include_nested_repos=True, layer 2 is bypassed entirely.
+        kept = []
+        for d in dirnames:
+            if d in exclude_dirs or d.startswith("."):
+                continue
+            child = Path(dirpath) / d
+            if not include_nested_repos and _is_nested_foreign_project(child, root_resolved):
+                continue
+            kept.append(d)
+        dirnames[:] = kept
         for fname in filenames:
             if not any(fname.endswith(ext) for ext in include_exts):
                 continue
@@ -320,6 +383,7 @@ def index_repo(
     repo_path: str | Path,
     include_exts: Optional[list[str]] = None,
     exclude_dirs: Optional[list[str]] = None,
+    include_nested_repos: bool = False,
 ) -> dict:
     """
     Index a repository. Returns dict with:
@@ -327,6 +391,13 @@ def index_repo(
       file_count: int
       symbol_count: int
       elapsed_ms: int
+
+    By default, subdirectories with their own `.git/` (vendored libraries,
+    SWE-Bench fixtures, sample repos) are treated as nested foreign
+    projects and skipped. Pass include_nested_repos=True to walk every
+    subdirectory regardless — useful when you're debugging a vendored
+    library you're actively patching, or you really do want the full
+    tree.
     """
     start = time.time()
     root = Path(repo_path).resolve()
@@ -339,7 +410,7 @@ def index_repo(
     files: dict[str, FileRecord] = {}
     symbol_count = 0
 
-    for full_path, rel_path in _walk_files(root, exts, skip):
+    for full_path, rel_path in _walk_files(root, exts, skip, include_nested_repos):
         record = index_file(full_path, rel_path)
         if record:
             files[rel_path] = record

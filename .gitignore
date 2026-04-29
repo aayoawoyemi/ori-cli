@@ -28,6 +28,16 @@ ops/sessions/
 # Benchmark results (keep bench/ code, drop results)
 bench/results/
 
+# Benchmark workspaces — nested foreign git repos (django, flask, requests,
+# pylint, pytest, etc.) cloned for SWE-Bench Lite + pi-mono fixture. ~300MB
+# of someone else's code; NOT part of aries source. The bench harness
+# (run.ts, tasks.json, fetch-tasks.ts) clones these on demand.
+bench/swe-lite/workspaces/
+bench/2026-04/fixtures/pi-mono/
+
+# Scratch output from ad-hoc shell runs
+bench_output.txt
+
 # Spike (superseded by body/)
 spike/
 

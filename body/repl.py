@@ -55,6 +55,37 @@ def _async_raise(thread_id: int, exc_type) -> None:
         raise SystemError("PyThreadState_SetAsyncExc failed to inject exception")
 
 
+# Registry of the currently-running worker thread id, set by execute()
+# below and cleared in its finally. Used by cancel_current() so the
+# body's cancel_exec handler can inject KeyboardInterrupt directly into
+# the WORKER thread (not the outer thread that's just waiting in t.join).
+# Single-slot because repl.execute is serialized at the body level —
+# only one exec runs at a time. Cross-thread reads are safe because
+# Python int assignments are GIL-atomic.
+_CURRENT_WORKER_TID = None
+
+
+def cancel_current() -> bool:
+    """Inject KeyboardInterrupt into the currently-running worker thread.
+
+    Returns True if an inject was attempted (worker was registered and
+    PyThreadState_SetAsyncExc didn't error), False if no worker is
+    running. A True return does NOT guarantee the worker unwound — on
+    Windows, an OS-level wait (WaitForSingleObject under threading.Event)
+    holds the GIL release indefinitely, so the async exception sits in
+    PyThreadState until the wait returns to Python. Caller should
+    join the outer exec thread with a short budget to confirm.
+    """
+    tid = _CURRENT_WORKER_TID
+    if tid is None:
+        return False
+    try:
+        _async_raise(tid, KeyboardInterrupt)
+        return True
+    except Exception:
+        return False
+
+
 def _find_primitive_in_line(line: str) -> str | None:
     """Return the rightmost primitive name present in `line`, or None.
 
@@ -250,7 +281,15 @@ def execute(code: str, namespace: dict, timeout_ms: int = 30000) -> dict:
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
-    t.join(timeout=timeout_ms / 1000.0)
+    # Register the worker tid so the body's cancel_exec handler can target
+    # it via cancel_current(). Cleared in the finally below regardless of
+    # how we exit (timeout, exception, normal completion).
+    global _CURRENT_WORKER_TID
+    _CURRENT_WORKER_TID = t.ident
+    try:
+        t.join(timeout=timeout_ms / 1000.0)
+    finally:
+        _CURRENT_WORKER_TID = None
 
     timed_out = False
     if not state["done"]:

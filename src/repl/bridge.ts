@@ -7,10 +7,10 @@
  *   const result = await bridge.exec({ code: "print('hello')" });
  *   await bridge.shutdown();
  */
-import { resolve, dirname, sep } from 'node:path';
+import { resolve, dirname, sep, join } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { writeFileSync, mkdirSync, readFileSync, appendFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { ReplProcess } from './process.js';
 import { fuzzyFind, generateDiff } from '../tools/edit.js';
@@ -59,6 +59,36 @@ const DEFAULT_SERVER = resolve(__dirname, '../../body/server.py');
 const DEFAULT_PYTHON = process.platform === 'win32' ? 'python' : 'python3';
 
 type PendingResolver = (result: any) => void;
+
+/**
+ * Thrown by `bridge.request()` (and therefore `bridge.exec()`) when the body
+ * was restarted while the request was in flight. Catchable distinctly from
+ * generic timeout / process-exit errors so the Repl tool can emit a friendly
+ * "[harness:restart] body became unresponsive, restarted with state preserved"
+ * tool_result instead of surfacing a raw error to the model. The model then
+ * re-runs the same Repl batch on the freshly-restarted body, which has had
+ * its bindings (project, vault, rlm config, codebase index) replayed.
+ *
+ * The Python namespace state from the prior body is GONE — that's the
+ * unavoidable cost of a body restart. Codemode batches are typically self-
+ * contained (compose-then-commit via `done()`), so this rarely matters in
+ * practice. The tool_result message tells the model to re-run, which is the
+ * right action since the prior batch's namespace effects didn't survive.
+ */
+export class BodyRestartedError extends Error {
+  readonly restartReason: string;
+  constructor(restartReason: string) {
+    super(`body restarted: ${restartReason}`);
+    this.name = 'BodyRestartedError';
+    this.restartReason = restartReason;
+  }
+}
+
+// Sentinel object used internally to signal "body was restarted" through the
+// pending-resolver pipeline. The resolver in requestUnlocked() converts this
+// sentinel into a thrown BodyRestartedError. Not exported — callers see the
+// thrown error, not the sentinel.
+const BODY_RESTARTED_SENTINEL = Symbol('aries.bridge.body_restarted');
 
 // ── Web search output parser ─────────────────────────────────────────────────
 // WebSearchTool produces a flat string (one block per result, separated by
@@ -255,6 +285,146 @@ export class ReplBridge {
   private requestTail: Promise<void> = Promise.resolve();
   private restarting = false;
   private restartCount = 0;
+  // (Removed 2026-04-28: consecutiveTimeouts wedge-recovery heuristic.
+  // Replaced by the heartbeat-driven restart trigger below — heartbeat
+  // detects in ~5s instead of ~180s, doesn't false-positive on legitimate
+  // slow ops, and survives the Windows _async_raise limitation.)
+
+  // ── Heartbeat watchdog (P1 of bridge-with-invisible-recovery) ─────────
+  // Replaces the per-request 90s/120s timeout as the body's health detector.
+  // Why heartbeat instead of per-request timeouts:
+  //   - Per-request ceiling kills legitimate slow ops (long pytest, slow
+  //     rlm_call, big web search) just because they take longer than the
+  //     ceiling. Heartbeat says "body is alive" independent of how long any
+  //     individual op takes — so legitimate slow work runs as long as it
+  //     needs.
+  //   - Per-request ceiling detects wedge slowly (>= 90s). Heartbeat detects
+  //     wedge in ~5s (3 misses × 1.5s deadline + 3s interval).
+  //   - On Windows, _async_raise inside the body cannot unwind a worker
+  //     thread that's stuck in an OS-level Event.wait. A self-timeout in
+  //     the body therefore can't reliably break a wedge. Heartbeat detects
+  //     from outside the wedged subprocess; SIGKILL-and-respawn is the
+  //     only thing that breaks an OS wait.
+  // Pings BYPASS requestTail — they're written directly to stdin via
+  // process.write(). The body's main loop has a fast-path that responds to
+  // pings BEFORE the exec_thread.join() branch (server.py:~1024), so a
+  // wedged exec doesn't silence the heartbeat.
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private lastPongAt: number = 0;
+  // Dual-clock baselines for suspend detection (added 2026-04-29). On every
+  // tick we compare wall-clock delta (Date.now) against monotonic delta
+  // (performance.now). Large skew = host paused. See SUSPEND_SKEW_MS const.
+  private lastTickWallMs: number = 0;
+  private lastTickPerfMs: number = 0;
+  // Verify-before-restart latch (2026-04-29). When the staleness check trips
+  // the first time, we set this and fire one fresh ping then return — the
+  // NEXT tick's check is the actual unhealthy declaration. Costs ~1s of
+  // detection latency on real wedges (~3.5s → ~4.5s) but eliminates a class
+  // of false-positives from clock weirdness we didn't classify (NTP slew,
+  // signed-time jumps, debugger pauses, GC stalls coincident with body
+  // wedge). Cleared on any healthy tick or after the restart fires.
+  private verificationPending: boolean = false;
+  // One-shot resolver for cancel_exec ack. Set by cancelExec() before it
+  // writes the cancel op; cleared by onLine when the ack arrives or by
+  // the deadline timer on miss. Single resolver because cancelExec is
+  // serialized at the caller level (loop.ts only fires one cancel per
+  // user interrupt).
+  private cancelAckResolver: ((result: { cancel_acked?: boolean; joined?: boolean }) => void) | null = null;
+  // Suspended during shutdown / restart to avoid spurious unhealthy events
+  // while the body is intentionally absent. Re-armed by startHeartbeat().
+  private heartbeatSuspended: boolean = false;
+
+  // Heartbeat model (revised 2026-04-28): a single interval timer that, on
+  // each tick, fires a ping AND checks "how long since the last pong?" If
+  // it exceeds STALENESS_MS, declare unhealthy. This is simpler and more
+  // robust than the prior per-ping deadline approach (which had a real bug
+  // where interval < deadline meant the deadline never fired because every
+  // new ping reset its predecessor's timer).
+  //
+  // Tuning: INTERVAL_MS = how often we ping; STALENESS_MS = how long we
+  // tolerate silence before declaring dead. Worst-case detection time is
+  // approximately STALENESS_MS + INTERVAL_MS — the wedge starts, then up
+  // to one more interval passes before the next staleness check fires
+  // and trips the threshold.
+  //
+  //   INTERVAL=1000, STALENESS=2500 → ~3.5s detection
+  //
+  // STALENESS=2500 tolerates up to one missed ping (1s of silence is
+  // expected normal; > 1s means the body didn't respond on time; > 2.5s
+  // means a second ping also didn't get through, which essentially can't
+  // happen on a healthy body — pong RTT in the healthy case is < 1ms).
+  private static HEARTBEAT_INTERVAL_MS = 1_000;
+  private static HEARTBEAT_STALENESS_MS = 2_500;
+
+  // Host-pause detection threshold. If the wall clock advances far more
+  // than one heartbeat interval between two consecutive ticks, the JS event
+  // loop didn't run during that gap — laptop suspend, modern standby,
+  // debugger break, or a long synchronous JS stall. In every case the
+  // correct response is the same: reset lastPongAt (the body has been
+  // silent because WE were silent, not because it wedged) and resume.
+  //
+  // First implementation (2026-04-29 morning) compared wall clock against
+  // performance.now() to distinguish suspend from wedge — assuming perf
+  // freezes during suspend. Telemetry at recovery.jsonl line ~17:26:51
+  // proved this assumption wrong on Windows: a real 36-min sleep produced
+  // wall_delta ≈ perf_delta ≈ 36 min, skew ≈ 0. QueryPerformanceCounter
+  // (the underlying clock) on modern Windows with invariant TSC continues
+  // running through suspend, so perf-based detection silently fails.
+  //
+  // Revised: drop perf gating. Use wallDelta alone. Threshold is 10×
+  // INTERVAL_MS — anything beyond that is unambiguously a pause, not
+  // legitimate event-loop lag. perfDelta is still recorded in the
+  // diagnostic event for forensics but doesn't gate the decision.
+  //
+  // 10s threshold rationale: healthy ticks fire every 1000ms; even a heavy
+  // V8 GC pause or a sync JSON.parse on a multi-MB buffer is bounded to
+  // 1-3 seconds. 10s is a generous floor that doesn't false-fire on real
+  // workloads but catches every laptop suspend (which produces seconds-
+  // to-hours of wallDelta).
+  private static SUSPEND_WALL_MS = 10_000;
+
+  // Replay budget for restart-with-replay (added 2026-04-29). Caps the time
+  // onRestart() can spend re-binding state before we declare partial recovery
+  // and let the body run unbound. See restart() for full rationale.
+  private static REPLAY_TIMEOUT_MS = 60_000;
+
+  // ── Bindings cache (P2 of bridge-with-invisible-recovery) ─────────────
+  // Snapshot of every bind op the bridge has applied to the body, so that
+  // a restart-with-replay can recreate the body's state without involving
+  // setup.ts. Updated only on successful bind ops; failures don't poison
+  // the cache. The cache is single-source-of-truth for replay — if a
+  // field is null, the corresponding op is skipped on restart, mirroring
+  // the original startup path's "configure → index → vault → rlm →
+  // research" sequence with each step gated on the user actually having
+  // requested it.
+  //
+  // Worth being explicit: this cache holds INPUTS (the args we passed
+  // to each bind op), not OUTPUTS (the body's responses). Replay re-
+  // runs the bind op with the same inputs against a fresh body. This
+  // means a future P7 (codebase index snapshot) would slot in here as
+  // an additional output cache (`indexSnapshot: string | null`) — the
+  // current shape doesn't preclude that.
+  private bindings: {
+    project: string | null;
+    vaultGlobal: string | null;
+    vaultProject: string | null;
+    mode: 'project+vault' | 'vault-only' | null;
+    shell: string | null;
+    indexRequest: IndexRequest | null;
+    vaultConnect: VaultConnectRequest | null;
+    rlmConfig: RlmConfigRequest | null;
+    researchConnected: boolean;
+  } = {
+    project: null,
+    vaultGlobal: null,
+    vaultProject: null,
+    mode: null,
+    shell: null,
+    indexRequest: null,
+    vaultConnect: null,
+    rlmConfig: null,
+    researchConnected: false,
+  };
   private vault: OriVault | null = null;
   // Project-local vault (Fix 1B — project-layered). Independent OriVault
   // pointed at <project>/.ori/. null when no project vault exists yet or
@@ -265,6 +435,22 @@ export class ReplBridge {
   // warmth, Q-value, graph signals all live per-vault. Federation happens
   // at the bridge layer on retrieval (see routeVaultMethod).
   private projectVault: OriVault | null = null;
+  // Path to a project vault that was DISCOVERED on disk but not yet connected
+  // (Phase 4, lazy project vault, 2026-04-29). Pre-this, setup.ts eagerly
+  // instantiated + connect()ed an OriVault for any project-local .ori/ found
+  // by findProjectVault — spawning a SECOND ori-memory MCP subprocess at
+  // session start. With aries-cli scaffolded as its own project vault
+  // (commit 484ca80), every aries session run from this directory paid the
+  // ~270MB-RAM + 1-2s startup cost twice. Most sessions never touch project-
+  // scope vault ops, so 100% of those sessions paid for nothing.
+  //
+  // Now: setup.ts records the path here; routeVaultMethod connects lazily on
+  // the first project-scope op (read OR write). Sessions that never use
+  // project vault never spawn the subprocess. The auto-create path
+  // (ensureProjectVault, called when path is null AND on ori_add) still
+  // works for "no vault on disk yet, scaffold it" — that's a separate
+  // semantic from "vault on disk, connect when needed."
+  private projectVaultPath: string | null = null;
   private router: ModelRouter | null = null;
   private researchOutputDir: string | null = null;
   // Workspace root used by fs.* callbacks to scope writes. Defaults to the
@@ -328,12 +514,215 @@ export class ReplBridge {
     this.opts.onEvent?.(e);
   }
 
+  // ── Recovery telemetry (P6) ──────────────────────────────────────────
+  // Appends one JSONL record per recovery-relevant event to
+  // ~/.aries/diagnostics/recovery.jsonl. Used to confirm (after a few
+  // real failures) that the heartbeat-driven recovery is firing as
+  // designed and that the actual cause distribution matches our
+  // diagnosis (Windows OS-wait blocking _async_raise, slow primitives,
+  // body crashes, etc.). Best-effort: any IO failure is swallowed —
+  // diagnostics must never affect runtime behavior.
+  private appendDiagnostic(record: Record<string, unknown>): void {
+    try {
+      const dir = join(homedir(), '.aries', 'diagnostics');
+      mkdirSync(dir, { recursive: true });
+      const line = JSON.stringify({ ts: new Date().toISOString(), ...record }) + '\n';
+      appendFileSync(join(dir, 'recovery.jsonl'), line, 'utf8');
+    } catch {
+      // Diagnostics are best-effort; never let an IO failure affect
+      // the recovery flow itself.
+    }
+  }
+
   private drainPendingAsError(reason: string, code: number | null): void {
     const queue = this.pending;
     this.pending = [];
     for (const r of queue) {
       r({ error: reason, exit_code: code });
     }
+  }
+
+  // Same as drainPendingAsError but tags each drain payload with the
+  // BODY_RESTARTED_SENTINEL so the resolver in requestUnlocked converts it
+  // into a thrown BodyRestartedError instead of resolving the promise with
+  // an error-shaped object. The distinction matters for callers like the
+  // Repl tool, which need to distinguish "body restarted, retry" from
+  // "body died, give up" — restart is recoverable; exit is not.
+  private drainPendingAsRestart(reason: string): void {
+    const queue = this.pending;
+    this.pending = [];
+    for (const r of queue) {
+      r({ [BODY_RESTARTED_SENTINEL]: true, restart_reason: reason });
+    }
+  }
+
+  // ── Heartbeat lifecycle ──────────────────────────────────────────────
+  // startHeartbeat is idempotent — calling it while one is already running
+  // restarts the cadence (used after restart-with-replay completes).
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeatSuspended = false;
+    this.lastPongAt = Date.now();
+    // Reset suspend-detection baselines. Setting both to 0 also doubles as
+    // a "first tick after start, skip the skew check" sentinel — the tick
+    // explicitly guards on `lastTickWallMs > 0` to avoid a spurious skew
+    // alarm on the very first tick (where the previous baseline is from
+    // the prior heartbeat lifetime or zero).
+    this.lastTickWallMs = 0;
+    this.lastTickPerfMs = 0;
+    this.verificationPending = false;
+
+    this.heartbeatTimer = setInterval(() => {
+      if (this.heartbeatSuspended) return;
+      this.tickHeartbeat();
+    }, ReplBridge.HEARTBEAT_INTERVAL_MS);
+    // Fire one immediate ping so the first liveness signal arrives in
+    // <STALENESS_MS rather than after the first interval. Important for
+    // the start-up path where a sick body would otherwise look healthy
+    // until the first tick.
+    this.firePing();
+  }
+
+  private stopHeartbeat(): void {
+    this.heartbeatSuspended = true;
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  /**
+   * Heartbeat tick. Three-stage logic (revised 2026-04-29):
+   *
+   *   1. Host-pause detection. If wall-clock advanced > SUSPEND_WALL_MS
+   *      (10× the heartbeat interval) in a single tick, the JS event loop
+   *      wasn't running during that gap — laptop suspend, modern standby,
+   *      debugger break, or a long sync stall on the parent process. In
+   *      every case the correct response is the same: reset lastPongAt
+   *      (the body went silent because WE went silent, not because it
+   *      wedged) and resume.
+   *
+   *   2. Verify-before-restart. If staleness threshold tripped and
+   *      verificationPending is false, set the latch, fire a fresh ping,
+   *      and return. This costs ~1s of detection latency on real wedges
+   *      but eliminates false-positives from any clock weirdness we
+   *      didn't classify above (NTP slew, GC stalls coincident with body
+   *      wedge, etc.).
+   *
+   *   3. Real wedge. If verificationPending is true and we're STILL stale
+   *      after one extra tick, the body really is unresponsive. Trigger
+   *      restart and clear the latch.
+   *
+   * Pre-2026-04-29 this was just stage 3 with no pause awareness, which
+   * caused the user's "417s for orient" symptom — laptop wake → tick saw
+   * 7.6 hours since last pong → restart → replay-while-paging-from-swap
+   * → 35-58 minute hang (telemetry: recovery.jsonl lines 36-41). Diagnosed
+   * 2026-04-29 morning.
+   *
+   * First fix attempt used dual-clock skew (wall vs perf) to distinguish
+   * suspend from wedge, but Windows' QueryPerformanceCounter doesn't
+   * actually freeze during sleep on modern hardware (telemetry showed
+   * skew ≈ 0 on a real 36-min suspend). Revised same-day to use wall
+   * delta alone — simpler, platform-agnostic, captures every host-pause
+   * shape.
+   */
+  private tickHeartbeat(): void {
+    if (!this.process?.isAlive()) return;
+
+    const nowWall = Date.now();
+    const nowPerf = performance.now();
+
+    // Stage 1: host-pause detection. Skip on the very first tick (no prior
+    // baseline). Compare wall delta against the threshold; the perf delta
+    // is recorded for forensics but doesn't gate the decision.
+    if (this.lastTickWallMs > 0) {
+      const wallDelta = nowWall - this.lastTickWallMs;
+      if (wallDelta > ReplBridge.SUSPEND_WALL_MS) {
+        // Event loop was paused. Reset everything that depends on wall-
+        // clock continuity:
+        //   - lastPongAt: stale by the entire pause duration; reset to now
+        //     so the next staleness check is relative to a fresh mark.
+        //   - lastTickWallMs/PerfMs: rebase so the next tick measures only
+        //     the post-resume interval.
+        //   - verificationPending: clear so a wake during a verify window
+        //     doesn't carry forward a stale verification state.
+        this.appendDiagnostic({
+          event: 'heartbeat_host_pause_detected',
+          wall_delta_ms: wallDelta,
+          perf_delta_ms: nowPerf - this.lastTickPerfMs,
+        });
+        this.lastPongAt = nowWall;
+        this.lastTickWallMs = nowWall;
+        this.lastTickPerfMs = nowPerf;
+        this.verificationPending = false;
+        // Fire a fresh ping so the post-resume body has an immediate liveness
+        // probe rather than waiting for the next tick.
+        this.firePing();
+        return;
+      }
+    }
+    this.lastTickWallMs = nowWall;
+    this.lastTickPerfMs = nowPerf;
+
+    const sinceLastPong = nowWall - this.lastPongAt;
+    if (sinceLastPong > ReplBridge.HEARTBEAT_STALENESS_MS) {
+      if (!this.verificationPending) {
+        // Stage 2: first staleness trip. Set latch, fire fresh ping, give
+        // the body one more interval to respond before declaring unhealthy.
+        this.verificationPending = true;
+        this.appendDiagnostic({
+          event: 'heartbeat_staleness_verify',
+          ms_since_last_pong: sinceLastPong,
+        });
+        this.firePing();
+        return;
+      }
+      // Stage 3: still stale after verification. This is a real wedge.
+      this.verificationPending = false;
+      // Body has gone silent for longer than tolerated — declare unhealthy
+      // and trigger silent restart-with-replay. Suspend the heartbeat so
+      // we don't fire repeated unhealthy events during the restart window.
+      this.heartbeatSuspended = true;
+      const consecutiveMisses = Math.floor(sinceLastPong / ReplBridge.HEARTBEAT_INTERVAL_MS);
+      this.emit({
+        type: 'bridge_unhealthy',
+        // `consecutiveMisses` is preserved in the event shape for back-
+        // compat; it's now derived (number of intervals since last pong)
+        // rather than a separate counter.
+        consecutiveMisses,
+        msSinceLastPong: sinceLastPong,
+      });
+      this.appendDiagnostic({
+        event: 'heartbeat_unhealthy',
+        ms_since_last_pong: sinceLastPong,
+        consecutive_misses: consecutiveMisses,
+        in_flight_pending: this.pending.length,
+      });
+      // Fire-and-forget restart; restart() emits bridge_error if it fails
+      // (e.g., maxRestarts exceeded) — catching here prevents that becoming
+      // an unhandled promise rejection. Pending requests are drained as
+      // BodyRestartedError inside restart() before the body is killed.
+      void this.restart('heartbeat: body unresponsive').catch(() => {
+        // restart() already emitted bridge_error on failure.
+      });
+      return;
+    }
+    // Body has been responsive within STALENESS_MS — clear any stale
+    // verification latch and fire next ping.
+    this.verificationPending = false;
+    this.firePing();
+  }
+
+  private firePing(): void {
+    if (!this.process?.isAlive()) return;
+    // Pings bypass requestTail (would queue behind the very wedge we're
+    // trying to detect) and don't push a resolver onto pending (the pong
+    // is routed by onLine's `msg.pong === true` branch to handlePong()).
+    this.process.write(JSON.stringify({ op: 'ping' }));
+  }
+
+  private handlePong(): void {
+    this.lastPongAt = Date.now();
   }
 
   private createProcess(): ReplProcess {
@@ -352,6 +741,35 @@ export class ReplBridge {
       onLine: (line) => {
         try {
           const msg = JSON.parse(line);
+
+          // ── Heartbeat pong: route to handlePong, NEVER to pending ───
+          // Pings are written directly to body stdin via process.write()
+          // (bypassing requestTail) and do not push a resolver onto
+          // `this.pending`. So the pong response carries no pending
+          // resolver to satisfy — we route it to the heartbeat handler
+          // and return early before any other branch tries to consume
+          // it. The discriminator `msg.pong === true` is unique to
+          // heartbeat responses; no other op produces a top-level
+          // `pong` field. Must be first so it can't be mis-routed by
+          // any future onLine branch that grew its own pong-shaped
+          // message.
+          if (msg.pong === true) {
+            this.handlePong();
+            return;
+          }
+
+          // ── Cancel-exec ack: route to one-shot resolver ─────────────
+          // cancelExec() bypasses requestTail and stores its resolver in
+          // cancelAckResolver. The body's response carries cancel_acked,
+          // which routes here without touching the pending queue.
+          if (msg.cancel_acked !== undefined) {
+            const r = this.cancelAckResolver;
+            if (r) {
+              this.cancelAckResolver = null;
+              r(msg);
+            }
+            return;
+          }
 
           // Vault callback: Python proxy needs vault data during exec
           if (msg.vault_request) {
@@ -418,7 +836,21 @@ export class ReplBridge {
           // buffer in _run_exec), so the bridge emission here is purely a
           // real-time observability channel for UI / telemetry subscribers.
           // Same non-resolving pattern as say / ask_request.
-          if (msg.done) {
+          //
+          // CRITICAL: only treat as a fire-and-forget callback when the
+          // message is JUST a done notification — i.e. it carries no
+          // exec-result keys. The exec result envelope (server.py:923-926)
+          // includes `done` alongside `stdout`/`stderr`/`duration_ms`/`shape`
+          // when the batch called done(). Without this guard, every batch
+          // that committed via done() would misroute its FINAL result as a
+          // callback and the pending exec promise would never resolve —
+          // which is exactly the 120s timeout pattern observed in the SWE-
+          // Lite bench (2026-04-27): 9/9 observed timeouts had done() in
+          // the batch. Diagnosis via bench/swe-lite/bridge-repro.cjs.
+          if (msg.done
+              && msg.stdout === undefined
+              && msg.duration_ms === undefined
+              && msg.exception === undefined) {
             this.dispatchDone(msg.done);
             return;
           }
@@ -455,6 +887,11 @@ export class ReplBridge {
     this.process = this.createProcess();
     await this.process.start();
     this.emit({ type: 'bridge_ready' });
+    // Heartbeat starts immediately after bridge_ready. The first ping
+    // fires synchronously inside startHeartbeat() so an initial-launch
+    // dead body is detected within HEARTBEAT_DEADLINE_MS rather than
+    // after the first interval tick.
+    this.startHeartbeat();
   }
 
   private async restart(reason: string): Promise<void> {
@@ -470,6 +907,25 @@ export class ReplBridge {
     this.restarting = true;
     this.restartCount++;
     this.emit({ type: 'bridge_restart', reason, attempt: this.restartCount });
+    this.appendDiagnostic({
+      event: 'restart_start',
+      reason,
+      attempt: this.restartCount,
+      pending_drained: this.pending.length,
+    });
+    const restartStartTs = Date.now();
+
+    // Suspend heartbeat for the duration of the restart — we don't want
+    // the watchdog firing unhealthy events while the body is intentionally
+    // absent. Re-armed at the end via startHeartbeat().
+    this.stopHeartbeat();
+
+    // Drain pending requests as BodyRestartedError BEFORE we kill the body,
+    // so callers see the typed error (recoverable) rather than the generic
+    // "python body exited" they'd get from onExit when SIGKILL fires.
+    // Important for loop.ts which converts BodyRestartedError into a
+    // friendly tool_result the model can act on by retrying.
+    this.drainPendingAsRestart(reason);
 
     try {
       if (this.process?.isAlive()) {
@@ -479,22 +935,79 @@ export class ReplBridge {
       await this.process.start();
       this.emit({ type: 'bridge_ready' });
       // Re-initialize: re-index codebase, reconnect vault, reconfigure rlm
+      const replayStart = Date.now();
       if (this.opts.onRestart) {
+        // Replay budget (added 2026-04-29). Telemetry showed real replays of
+        // 35 and 58 minutes after laptop wake (recovery.jsonl lines 38, 41:
+        // replay_ms=2,120,957 and 3,448,864) because the OS was paging
+        // everything back from swap during replay. Without a budget, exec
+        // ops sit silently behind replay (per P4 — no per-request bridge
+        // timeouts), giving "417s for orient" pathology.
+        //
+        // 60s is a defensible ceiling: cold configure+index of an aries-cli-
+        // sized repo is ~5s warm / ~30s cold per the existing restart-test.
+        // 60s = 2× cold-case. Anything beyond is paging from swap, not
+        // legitimate work.
+        //
+        // On timeout: emit bridge_error, log diagnostic, continue. The body
+        // process is alive but unbound (no codebase index, no vault, no
+        // rlm). The next user op will hit the existing teaching errors at
+        // the bind-checks (e.g., "vault not connected") and surface a
+        // clean recovery suggestion. Better than a silent 35-minute hang.
+        let timedOut = false;
         try {
-          await this.opts.onRestart();
+          await Promise.race([
+            this.opts.onRestart(),
+            new Promise<void>((_, reject) => setTimeout(() => {
+              timedOut = true;
+              reject(new Error('replay budget exceeded (60s)'));
+            }, ReplBridge.REPLAY_TIMEOUT_MS)),
+          ]);
         } catch (err) {
+          this.appendDiagnostic({
+            event: timedOut ? 'replay_timeout' : 'replay_error',
+            reason,
+            attempt: this.restartCount,
+            error: (err as Error).message,
+            elapsed_ms: Date.now() - replayStart,
+          });
           this.emit({
             type: 'bridge_error',
-            error: `post-restart re-init failed: ${(err as Error).message}`,
+            error: timedOut
+              ? `post-restart replay exceeded ${ReplBridge.REPLAY_TIMEOUT_MS / 1000}s budget — body running but state-replay incomplete (codebase/vault/rlm bindings may be missing until next session)`
+              : `post-restart re-init failed: ${(err as Error).message}`,
           });
         }
       }
+      const replayMs = Date.now() - replayStart;
+      // Heartbeat resumes only AFTER replay completes — the bound state
+      // (project, vault, rlm, index) is needed for the body to be
+      // genuinely useful, not just alive. bridge_recovered fires after
+      // both process spawn AND state replay are done.
+      this.startHeartbeat();
+      this.emit({ type: 'bridge_recovered', replayMs });
+      this.appendDiagnostic({
+        event: 'restart_complete',
+        reason,
+        attempt: this.restartCount,
+        total_ms: Date.now() - restartStartTs,
+        replay_ms: replayMs,
+      });
     } finally {
       this.restarting = false;
     }
   }
 
-  private async request(msg: object, timeoutMs: number, signal?: AbortSignal): Promise<any> {
+  // P4 (2026-04-28): timeoutMs is now `number | null`. Health-check ops
+  // that must complete fast (configure, reset, ping, shutdown, configureRlm,
+  // disconnectVault) keep a small numeric budget. Long-running ops
+  // (exec, index, codebase/vault signature, connectVault, connectResearch)
+  // pass `null` — they wait indefinitely; death detection is the
+  // heartbeat's job, not the per-request timer's. This deletes the bridge-
+  // ceiling failure mode where a legitimate slow op (long pytest, slow
+  // rlm_call, big web search) tripped the bridge timeout while the body
+  // was healthy and still working.
+  private async request(msg: object, timeoutMs: number | null, signal?: AbortSignal): Promise<any> {
     const previous = this.requestTail;
     let release!: () => void;
     this.requestTail = new Promise<void>((resolveQueue) => {
@@ -509,7 +1022,7 @@ export class ReplBridge {
     }
   }
 
-  private async requestUnlocked(msg: object, timeoutMs: number, signal?: AbortSignal): Promise<any> {
+  private async requestUnlocked(msg: object, timeoutMs: number | null, signal?: AbortSignal): Promise<any> {
     // Ensure process is alive
     if (!this.process?.isAlive()) {
       await this.restart('process not alive at request time');
@@ -521,28 +1034,49 @@ export class ReplBridge {
       const resolver: PendingResolver = (result) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         signal?.removeEventListener('abort', onAbort);
+        // BODY_RESTARTED_SENTINEL — drainPendingAsRestart marks each drain
+        // payload with this symbol so resolvers can convert "body restarted"
+        // into a typed thrown error rather than resolving with an error-
+        // shaped object. Distinguishes recoverable restart from terminal
+        // exit; the Repl tool catches BodyRestartedError specifically.
+        if (result && typeof result === 'object' && (result as Record<symbol, unknown>)[BODY_RESTARTED_SENTINEL]) {
+          rejectReq(new BodyRestartedError(result.restart_reason ?? 'unknown'));
+          return;
+        }
         resolveReq(result);
       };
 
       const onAbort = () => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         const idx = this.pending.indexOf(resolver);
         if (idx >= 0) this.pending.splice(idx, 1);
         rejectReq(new DOMException('The operation was aborted.', 'AbortError'));
       };
 
-      const timer = setTimeout(() => {
+      // Per-request timeout is OPTIONAL. When timeoutMs is null, no timer
+      // is armed — the request waits indefinitely on either the body's
+      // response, an abort signal, or a heartbeat-triggered restart drain.
+      // Health-check ops (configure, reset, configureRlm, etc.) still pass
+      // numeric budgets because for those a long delay genuinely means
+      // something is wrong; long-running ops (exec, index, signature)
+      // pass null because their wall-clock is bounded by their workload,
+      // not by an arbitrary bridge ceiling.
+      const timer: NodeJS.Timeout | null = timeoutMs === null ? null : setTimeout(() => {
         if (settled) return;
         settled = true;
         signal?.removeEventListener('abort', onAbort);
         // Remove from pending queue if still there
         const idx = this.pending.indexOf(resolver);
         if (idx >= 0) this.pending.splice(idx, 1);
-        rejectReq(new Error(`bridge request timed out after ${timeoutMs}ms`));
+        // Format ms as `Ns` for the user-facing message. Keep the raw ms
+        // out of the error string — `30000ms` reads as dev output to a
+        // user trying to figure out why their CLI just logged an error.
+        const human = timeoutMs >= 1000 ? `${Math.round(timeoutMs / 1000)}s` : `${timeoutMs}ms`;
+        rejectReq(new Error(`bridge request timed out after ${human}`));
       }, timeoutMs);
 
       // Listen for abort before pushing to queue
@@ -556,7 +1090,7 @@ export class ReplBridge {
       const ok = this.process!.write(JSON.stringify(msg));
       if (!ok) {
         settled = true;
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         signal?.removeEventListener('abort', onAbort);
         const idx = this.pending.indexOf(resolver);
         if (idx >= 0) this.pending.splice(idx, 1);
@@ -609,6 +1143,14 @@ export class ReplBridge {
       mode: cfg.mode ?? null,
       shell: cfg.shell ?? null,
     }, 5_000);
+    // Update bindings cache only after successful configure. Each field
+    // overwrites the previous value — `configure` is the canonical setter
+    // for these five display globals, so the most recent call wins.
+    this.bindings.project = cfg.project ?? null;
+    this.bindings.vaultGlobal = cfg.vaultGlobal ?? null;
+    this.bindings.vaultProject = cfg.vaultProject ?? null;
+    this.bindings.mode = cfg.mode ?? null;
+    this.bindings.shell = cfg.shell ?? null;
   }
 
   /**
@@ -621,6 +1163,14 @@ export class ReplBridge {
       turn_id: execution.turn_id,
     });
 
+    // P4 (2026-04-28): bridge no longer enforces a wall-clock ceiling on
+    // exec. The body has its own per-exec timeout (timeout_ms in the request
+    // payload, defaults to body's DEFAULT_TIMEOUT_MS) which fires _async_raise
+    // on the worker thread. Bridge waits indefinitely (`null`) for the body
+    // to respond — death detection is the heartbeat's job. Legitimate slow
+    // ops (long pytest, slow rlm_call, big web search) now run as long as
+    // they need; the prior `timeout + 30_000` ceiling killed them at the
+    // bridge layer even when the body was healthy and still working.
     const timeout = execution.timeout_ms ?? this.opts.timeoutMs;
     const result = (await this.request(
       {
@@ -628,20 +1178,7 @@ export class ReplBridge {
         code: execution.code,
         timeout_ms: timeout,
       },
-      // Give the body extra wall-clock slack beyond its own timeout.
-      //
-      // Bumped 5s → 30s in Batch 2 (A.6.6, 2026-04). The walk-codemode
-      // trace surfaced a 95s bridge timeout; Batch 2's 100-trial repro
-      // (scripts/done_hang_repro.py) failed to reproduce the stdout-lock
-      // deadlock hypothesis (0 hangs), which makes slow body-side cleanup
-      // the more plausible cause — `repl.execute` already does a best-
-      // effort `t.join(timeout=1.0)` after `_async_raise(TimeoutError)`,
-      // but a daemon thread lingering past that join for a few seconds
-      // while finishing a stdout.flush() is still possible and would
-      // blow the 5s slack budget. 30s is defensive without sacrificing
-      // fail-fast on a genuinely wedged body (still far below wall-clock
-      // patience for any real task).
-      timeout + 30_000,
+      null,
       signal,
     )) as ReplResult;
 
@@ -662,15 +1199,27 @@ export class ReplBridge {
    * After this call, `codebase` is available in the REPL namespace.
    */
   async index(req: IndexRequest): Promise<IndexResult> {
-    return this.request(
+    // P4: indexing on a real repo can be 5-30s; on monorepo-scale work it
+    // can be longer. No bridge ceiling — heartbeat detects body death if
+    // something genuinely goes wrong. Body's index op is itself bounded by
+    // file-walk time, which is naturally finite.
+    const result = await this.request(
       {
         op: 'index',
         repo_path: req.repoPath,
         include_exts: req.includeExts,
         exclude_dirs: req.excludeDirs,
       },
-      60_000, // indexing can take a while for large repos
+      null,
     );
+    // Cache only on success. The body's index op returns {error: ...} on
+    // failure (vault-only mode rejection, missing repo, etc.); skipping
+    // the cache update on those means replay won't re-attempt a known-bad
+    // index against the new body.
+    if (!result.error) {
+      this.bindings.indexRequest = req;
+    }
+    return result;
   }
 
   /**
@@ -699,9 +1248,11 @@ export class ReplBridge {
     level: SignatureLevel = 'standard',
     maxTokens: number = 1500,
   ): Promise<CodebaseSignature> {
+    // P4: signature compile is naturally bounded by repo walk; if the body
+    // dies during compile, heartbeat detects it. No artificial ceiling.
     return this.request(
       { op: 'codebase_signature', level, max_tokens: maxTokens },
-      30_000,
+      null,
     );
   }
 
@@ -713,9 +1264,11 @@ export class ReplBridge {
     level: SignatureLevel = 'standard',
     maxTokens: number = 1500,
   ): Promise<VaultSignature> {
+    // P4: vault signature walks warmth + identity; bounded naturally by
+    // vault size. Heartbeat detects death; no bridge ceiling.
     return this.request(
       { op: 'vault_signature', level, max_tokens: maxTokens },
-      30_000,
+      null,
     );
   }
 
@@ -724,17 +1277,28 @@ export class ReplBridge {
    * in the REPL namespace.
    */
   async connectVault(req: VaultConnectRequest): Promise<VaultConnectResult> {
-    return this.request(
+    // P4: vault connect spawns an MCP subprocess; cold-launch can spike on
+    // large vaults. Heartbeat detects death; no bridge ceiling.
+    const result = await this.request(
       { op: 'connect_vault', vault_path: req.vaultPath },
-      20_000,
+      null,
     );
+    if (!result.error) {
+      this.bindings.vaultConnect = req;
+    }
+    return result;
   }
 
   /**
    * Disconnect the vault from the body.
    */
   async disconnectVault(): Promise<{ ok: boolean }> {
-    return this.request({ op: 'disconnect_vault' }, 5_000);
+    const r = await this.request({ op: 'disconnect_vault' }, 5_000);
+    // Clear the binding so replay doesn't reconnect after the user
+    // explicitly disconnected. The request itself succeeds even when
+    // there's no vault to disconnect, so we clear unconditionally.
+    this.bindings.vaultConnect = null;
+    return r;
   }
 
   /**
@@ -749,7 +1313,7 @@ export class ReplBridge {
    * After this call, rlm_call and rlm_batch are exposed in the REPL namespace.
    */
   async configureRlm(req: RlmConfigRequest): Promise<RlmConfigResult> {
-    return this.request(
+    const result = await this.request(
       {
         op: 'configure_rlm',
         api_key: req.apiKey,
@@ -759,6 +1323,10 @@ export class ReplBridge {
       },
       5_000,
     );
+    if (!result.error) {
+      this.bindings.rlmConfig = req;
+    }
+    return result;
   }
 
   /**
@@ -766,6 +1334,11 @@ export class ReplBridge {
    */
   async shutdown(): Promise<void> {
     if (!this.process) return;
+    // Stop the heartbeat BEFORE telling the process to shut down so the
+    // ~1.5s deadline can't fire during the graceful-exit window and emit
+    // a spurious unhealthy event. Once shutdown begins, an absent body
+    // is expected, not pathological.
+    this.stopHeartbeat();
     await this.process.shutdown(2_000);
     this.process = null;
   }
@@ -799,6 +1372,27 @@ export class ReplBridge {
   /** Read-only accessor for the current project vault (for banner/config sync). */
   getProjectVault(): OriVault | null {
     return this.projectVault;
+  }
+
+  /**
+   * Record the path of a discovered-but-not-yet-connected project vault
+   * (Phase 4, lazy connect). Called by setup.ts when findProjectVault
+   * locates an existing .ori/ on disk. The actual OriVault instantiation +
+   * MCP subprocess spawn is deferred until routeVaultMethod sees the first
+   * project-scope op. Pass null to clear (e.g., during reset).
+   */
+  setProjectVaultPath(path: string | null): void {
+    this.projectVaultPath = path;
+  }
+
+  /**
+   * Read-only accessor for the recorded project vault path. Returns the
+   * path even when no MCP subprocess has been spawned yet — used by the
+   * setup.ts banner so it accurately shows "Vault (project): <path>"
+   * regardless of connection state.
+   */
+  getProjectVaultPath(): string | null {
+    return this.projectVaultPath;
   }
 
   /**
@@ -901,7 +1495,100 @@ export class ReplBridge {
    * After this, `research` is available in the REPL namespace.
    */
   async connectResearch(): Promise<ResearchConnectResult> {
-    return this.request({ op: 'connect_research' }, 20_000);
+    // P4: research connect imports backends + warms HTTP clients. Cold-DNS
+    // spikes are not a death signal; heartbeat handles real death. No
+    // bridge ceiling.
+    const result = await this.request({ op: 'connect_research' }, null);
+    if (result.ok) {
+      this.bindings.researchConnected = true;
+    }
+    return result;
+  }
+
+  /**
+   * Send a cancel-exec signal to the body, telling it to abort the current
+   * exec via _async_raise(KeyboardInterrupt). Used on user interrupt
+   * (Ctrl+C, mode switch). Bypasses requestTail because pending requests
+   * may already be queued; the cancel needs to skip the queue and reach
+   * the body directly.
+   *
+   * Returns:
+   *   - { cancel_acked: true, joined: bool } if the body acked within the
+   *     deadline. `joined` indicates whether the worker thread actually
+   *     terminated (true on Linux/mac and on Windows when the worker
+   *     wasn't in an OS-level wait; false otherwise — caller should
+   *     treat as "cancel didn't take, fall back to restart").
+   *   - null on timeout (body didn't ack at all — strongly implies wedge,
+   *     caller should fire restart()).
+   *
+   * Cancel ack is routed via a special inline branch in onLine to avoid
+   * adding a permanent path through the pending queue. Implementation
+   * uses a one-shot resolver wired up here.
+   */
+  async cancelExec(deadlineMs: number = 1500): Promise<{ cancel_acked: boolean; joined: boolean } | null> {
+    if (!this.process?.isAlive()) return null;
+    const cancelStart = Date.now();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.cancelAckResolver = null;
+        this.appendDiagnostic({
+          event: 'cancel_no_ack',
+          waited_ms: Date.now() - cancelStart,
+          deadline_ms: deadlineMs,
+        });
+        resolve(null);
+      }, deadlineMs);
+      this.cancelAckResolver = (result) => {
+        clearTimeout(timer);
+        this.cancelAckResolver = null;
+        this.appendDiagnostic({
+          event: 'cancel_acked',
+          ack_ms: Date.now() - cancelStart,
+          joined: result.joined === true,
+        });
+        resolve({
+          cancel_acked: result.cancel_acked === true,
+          joined: result.joined === true,
+        });
+      };
+      this.process!.write(JSON.stringify({ op: 'cancel_exec' }));
+    });
+  }
+
+  /**
+   * Read-only snapshot of bound state. Used by tests and by the (P3)
+   * restart-with-replay path to recreate the body's state. Returned as
+   * a fresh object (defensive copy of the live cache) so callers can't
+   * accidentally mutate the live bindings via the returned reference.
+   */
+  getBindings(): {
+    project: string | null;
+    vaultGlobal: string | null;
+    vaultProject: string | null;
+    mode: 'project+vault' | 'vault-only' | null;
+    shell: string | null;
+    indexRequest: IndexRequest | null;
+    vaultConnect: VaultConnectRequest | null;
+    rlmConfig: RlmConfigRequest | null;
+    researchConnected: boolean;
+  } {
+    return {
+      project: this.bindings.project,
+      vaultGlobal: this.bindings.vaultGlobal,
+      vaultProject: this.bindings.vaultProject,
+      mode: this.bindings.mode,
+      shell: this.bindings.shell,
+      indexRequest: this.bindings.indexRequest
+        ? { ...this.bindings.indexRequest }
+        : null,
+      vaultConnect: this.bindings.vaultConnect
+        ? { ...this.bindings.vaultConnect }
+        : null,
+      rlmConfig: this.bindings.rlmConfig
+        ? { ...this.bindings.rlmConfig }
+        : null,
+      researchConnected: this.bindings.researchConnected,
+    };
   }
 
   /**
@@ -989,12 +1676,27 @@ export class ReplBridge {
     }
 
     if (scope === 'project') {
-      // Auto-create path: only on ori_add. Reads against a non-existent
-      // project vault should fail loud ("no project vault to read from")
-      // rather than silently auto-scaffold — we don't want the model
-      // creating empty vaults during exploratory queries.
+      // Three-state precedence (Phase 4 lazy connect, 2026-04-29):
+      //   (1) projectVault already connected → use it directly.
+      //   (2) projectVaultPath set (vault exists on disk, just not connected
+      //       yet) → spawn the MCP subprocess now and use it. Sessions that
+      //       never reach this branch never pay the ~270MB-RAM startup cost.
+      //   (3) Neither set: same as before — auto-create on ori_add only,
+      //       fail loud on reads against a non-existent project vault.
       if (!this.projectVault?.connected) {
-        if (method === 'ori_add') {
+        if (this.projectVaultPath) {
+          // (2) Lazy connect to an existing on-disk vault. Skips the
+          // initVault scaffold step in ensureProjectVault — the directory
+          // already has .ori/ + notes/ or self/, that's why
+          // findProjectVault returned this path during setup.
+          const ok = await this.connectProjectVaultLazy();
+          if (!ok) {
+            throw new Error(
+              `project vault lazy-connect failed at ${this.projectVaultPath}. The directory may have been moved or deleted since session start.`
+            );
+          }
+        } else if (method === 'ori_add') {
+          // (3a) No path on disk; ori_add scaffolds + connects.
           const created = await this.ensureProjectVault();
           if (!created) {
             throw new Error(
@@ -1002,6 +1704,7 @@ export class ReplBridge {
             );
           }
         } else {
+          // (3b) No path on disk and method is not ori_add — fail loud.
           throw new Error(
             `no project vault at ${this.cwd}. ori_add with scope="project" will create one automatically; for ${method} you need a vault that already exists.`
           );
@@ -1019,7 +1722,18 @@ export class ReplBridge {
       // a null side and emits federation telemetry for a degenerate
       // one-vault case. Route directly to the global vault instead.
       // Correctness-equivalent, noise-free, one less async hop per call.
+      //
+      // Phase 4 lazy connect (2026-04-29): if a project vault path is
+      // recorded but not yet connected, scope="both" also triggers the
+      // lazy spawn — federation against an actually-existing on-disk vault
+      // should include it, not silently skip. If lazy-connect fails, fall
+      // through to global-only (the existing degraded-mode behavior).
       if (!this.projectVault?.connected) {
+        if (this.projectVaultPath) {
+          const ok = await this.connectProjectVaultLazy();
+          if (ok) return this.federateRetrieval(method, args);
+          // lazy-connect failed; fall through to global-only.
+        }
         if (!this.vault?.connected) throw new Error('no vaults connected');
         return this.vault.callTool(method, args);
       }
@@ -1052,6 +1766,38 @@ export class ReplBridge {
       this.opts.onEvent?.({
         type: 'bridge_error',
         error: `project vault auto-create exception: ${(err as Error).message}`,
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Lazy-connect to an EXISTING project vault on disk. Phase 4 (2026-04-29).
+   *
+   * Differs from ensureProjectVault in two ways:
+   *   1. Skips the initVault scaffold step — the directory was discovered by
+   *      findProjectVault during setup, so it already has .ori/ + notes/ or
+   *      self/. Re-running initVault would be safe (idempotent) but wasteful.
+   *   2. Uses this.projectVaultPath (set by setup.ts) rather than this.cwd.
+   *      The two are usually the same but findProjectVault walks UP from
+   *      cwd, so the matched path may be an ancestor directory. Using the
+   *      recorded path matches what the user's banner showed at startup.
+   *
+   * Returns true on successful connect, false on any failure. Failure
+   * leaves projectVault null and projectVaultPath unchanged so a retry can
+   * try again.
+   */
+  private async connectProjectVaultLazy(): Promise<boolean> {
+    if (!this.projectVaultPath) return false;
+    try {
+      const pv = new OriVault(this.projectVaultPath);
+      await pv.connect();
+      this.projectVault = pv;
+      return true;
+    } catch (err) {
+      this.opts.onEvent?.({
+        type: 'bridge_error',
+        error: `project vault lazy-connect exception (${this.projectVaultPath}): ${(err as Error).message}`,
       });
       return false;
     }
@@ -1733,7 +2479,7 @@ export class ReplBridge {
       }, timeoutMs);
 
       child.on('close', (code) => {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         const duration_ms = Date.now() - start;
         if (killed) {
           // Timeout — surface as error so Python raises ShellError. Return
@@ -1755,7 +2501,7 @@ export class ReplBridge {
       });
 
       child.on('error', (err) => {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         resolveP({
           error: `shell.run: spawn failed (${err.message}). cmd='${cmd.slice(0, 200)}'`,
         });

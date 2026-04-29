@@ -64,6 +64,21 @@ export type ReplEvent =
   | { type: 'bridge_ready' }
   | { type: 'bridge_restart'; reason: string; attempt: number }
   | { type: 'bridge_error'; error: string }
+  // bridge_unhealthy fires when the heartbeat watchdog declares the body
+  // unresponsive (>= MISS_THRESHOLD consecutive ping deadlines missed).
+  // It's emitted as observability — the bridge itself reacts internally
+  // by triggering a restart-with-replay; consumers do not need to do
+  // anything with this event. Surfaced for telemetry and for tests
+  // that want to assert the watchdog fired.
+  | { type: 'bridge_unhealthy'; consecutiveMisses: number; msSinceLastPong: number }
+  // bridge_recovered fires after a heartbeat-triggered restart has
+  // completed AND replayed all bound state (configure / index / vault /
+  // rlm / research). Distinct from `bridge_ready` (which fires on every
+  // process spawn including initial start) — `bridge_recovered` only
+  // fires after an unhealthy → restart → replay cycle. The UI does NOT
+  // surface this to the user — silent recovery is the whole point — but
+  // it's emitted so tests can wait for the post-restart steady state.
+  | { type: 'bridge_recovered'; replayMs: number }
   // repl_say fires when Python calls say(text) during exec. Fire-and-forget
   // from the Python side; the UI may register a handler via setOnSay to
   // append the text to the assistant message stream. No response is sent

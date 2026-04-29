@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, execSync, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname, resolve as resolvePath } from 'node:path';
@@ -75,6 +75,14 @@ class McpClient extends EventEmitter {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env },
         shell: bin.cmd === 'ori-memory', // Only need shell for global .cmd shim fallback
+        // detached: true on POSIX puts the child in its OWN process group.
+        // We can then `process.kill(-pid)` to kill the whole group when the
+        // parent exits (see killTree below). On Windows, detached is wrong
+        // — it breaks stdio piping and we use taskkill /T instead. The
+        // 2026-04-29 diagnosis confirmed Windows parent death does NOT
+        // cascade to children, leaving 11 zombie ori-memory subprocesses
+        // on the user's machine.
+        detached: process.platform !== 'win32',
       });
 
       this.proc.stdout!.on('data', (chunk: Buffer) => {
@@ -238,6 +246,13 @@ class McpClient extends EventEmitter {
    * which triggers Node's 'beforeExit' event → flushSession in Ori.
    * This ensures Q-value batch rewards, NPMI recomputation, and
    * homeostasis normalization run before the process exits.
+   *
+   * After 2s grace, falls back to killTree() which uses taskkill /T on
+   * Windows or process-group-kill on POSIX. Pre-2026-04-29 this called
+   * proc.kill() directly which on Windows kills only the immediate child
+   * — if ori-memory itself spawned descendants (it doesn't today, but
+   * future versions might), they'd survive. killTree() handles the
+   * whole subtree.
    */
   disconnect(): void {
     if (this.proc) {
@@ -249,11 +264,40 @@ class McpClient extends EventEmitter {
 
       // Give it a moment to flush, then force kill if still alive
       setTimeout(() => {
-        try { this.proc?.kill(); } catch { /* already dead */ }
+        this.killTree();
         this.proc = null;
       }, 2000);
 
       // Don't null proc immediately — let the timeout handle it
+    }
+  }
+
+  /**
+   * Kill the child process AND its descendants. Cross-platform:
+   *   - Windows: `taskkill /F /T /PID <pid>` walks the process tree and
+   *     hard-kills everything. Requires the child to have been spawned
+   *     WITHOUT detached:true (which we already do on Windows — see spawn).
+   *   - POSIX: `process.kill(-pid)` sends SIGTERM to the entire process
+   *     group, which the child belongs to because we spawned with
+   *     detached:true. SIGKILL follows after 2s if anything survives.
+   *
+   * Best-effort: any error is swallowed. The process may already be dead,
+   * or we may not have permission. The OS will reap stragglers eventually.
+   */
+  private killTree(): void {
+    if (!this.proc?.pid) return;
+    const pid = this.proc.pid;
+    if (process.platform === 'win32') {
+      try {
+        execSync(`taskkill /F /T /PID ${pid}`, { stdio: 'ignore', timeout: 2_000 });
+      } catch { /* already dead, or access denied */ }
+    } else {
+      // Negative PID = process group. Requires the child was spawned with
+      // detached:true (it was — see connect()).
+      try { process.kill(-pid, 'SIGTERM'); } catch { /* already dead */ }
+      setTimeout(() => {
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* dead now */ }
+      }, 2_000);
     }
   }
 }

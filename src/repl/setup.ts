@@ -136,11 +136,14 @@ export async function setupReplBridge(
         await bridge.configure({
           project: opts.cwd,
           vaultGlobal: opts.vaultPath,
-          // The project vault (OriVault instance) survives body-process
-          // restart because it's held on the bridge, not the body. No
-          // reconnect needed; just re-send its path to the new body so
-          // the banner is correct post-restart.
-          vaultProject: bridge.getProjectVault()?.vaultPath ?? null,
+          // The project vault path (and the OriVault instance, if connected)
+          // survive body-process restart because both are held on the bridge,
+          // not the body. No reconnect needed; just re-send the path to the
+          // new body so the banner is correct post-restart. Phase 4 lazy
+          // connect: prefer getProjectVaultPath() (the recorded path, set
+          // even when no subprocess is spawned yet) over getProjectVault()
+          // (the connection state, only set after first project op).
+          vaultProject: bridge.getProjectVaultPath() ?? bridge.getProjectVault()?.vaultPath ?? null,
           mode,
           shell,
         });
@@ -219,29 +222,31 @@ export async function setupReplBridge(
   // Non-fatal: a configure failure still lets the body run, just with a
   // less-informative banner. Log and keep moving — the alternative is
   // aborting every session on a cosmetic-display failure.
-  // Connect the project vault BEFORE sending configure — this way the
-  // banner's "Vault (project):" line reflects whether a project vault is
-  // actually connected, not merely whether one was discovered on disk.
-  // Connect failure is non-fatal: the banner degrades to "(none — ...)"
-  // and scope="project" ops throw teaching errors until the next restart.
+  // Record the discovered project vault path on the bridge WITHOUT spawning
+  // its MCP subprocess (Phase 4 lazy connect, 2026-04-29). Pre-this we
+  // eagerly instantiated + connect()ed an OriVault here, paying ~270MB-RAM
+  // and ~1-2s startup for a subprocess most sessions never touched. The
+  // bridge's routeVaultMethod now spawns the subprocess on the first
+  // project-scope op (read or write) — sessions that only use the global
+  // vault never pay the cost.
+  //
+  // The banner read on the next configure call uses bridge.getProjectVaultPath()
+  // (the recorded path) instead of bridge.getProjectVault()?.vaultPath
+  // (the connection state) so the banner remains accurate even when no
+  // subprocess exists yet. From the user's perspective, "Vault (project):
+  // <path>" means "I can write to this vault on demand"; whether the MCP
+  // is currently spawned is an implementation detail.
   if (projectVaultPath) {
-    try {
-      const pv = new OriVault(projectVaultPath);
-      await pv.connect();
-      bridge.setProjectVault(pv);
-    } catch (err) {
-      opts.onEvent?.({
-        type: 'bridge_error',
-        error: `project vault auto-connect failed (${projectVaultPath}): ${(err as Error).message}`,
-      });
-    }
+    bridge.setProjectVaultPath(projectVaultPath);
   }
 
   try {
     await bridge.configure({
       project: opts.cwd,
       vaultGlobal: opts.vaultPath,
-      vaultProject: bridge.getProjectVault()?.vaultPath ?? null,
+      // Banner reads from the recorded path, not the connection state, so
+      // discovered-but-not-yet-connected project vaults still display.
+      vaultProject: bridge.getProjectVaultPath() ?? null,
       mode,
       shell,
     });

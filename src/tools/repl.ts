@@ -39,6 +39,19 @@ const REPL_DESCRIPTION = `Execute a batch of composed Python operations in your 
 
 Pre-loaded primitives: codebase, vault, fs, shell, web, rlm_call, rlm_batch, say, ask, done, json, os.path, reindex. All namespace primitives return structured, schema-stable output — chain them aggressively and access fields directly (result['field']) without intermediate print() probes. The first Repl call in a session returns a banner listing exactly what's loaded.
 
+## When to use Repl (read first)
+
+Repl is for code execution against the workspace: file reads/edits, codebase queries, vault lookups, shell commands, composed Python.
+
+Skip Repl entirely — respond with plain text — when ALL of these are true:
+- the user message is conversational ("yo", "hi", "thanks", "ok", "what's up", short questions about something already on screen)
+- you are NOT being asked to do anything that touches files, vault, codebase, or shell
+- you do NOT need to look anything up to give a useful reply
+
+Concrete: "yo" → "what's up, what are we building?" (text). NOT vault.orient + warmth queries. The user did not ask for a session orientation; do not auto-orient on a greeting.
+
+If the message is genuinely conversational, your reply is a sentence of text and nothing else. The minItems:2 schema floor on Repl is structural — when one op feels right, the right answer was text.
+
 ## How to submit
 
 You do NOT submit raw code. You submit {plan, operations}:
@@ -514,8 +527,42 @@ export class ReplTool implements Tool {
         continue;
       }
 
-      // Execute this op independently
-      const result = await handle.exec({ code: opCode }, _ctx.signal);
+      // Execute this op independently. BodyRestartedError fires when the
+      // heartbeat detected a wedged body and triggered a silent restart-
+      // with-replay; we emit it as a recoverable per-op rejectedReason so
+      // the model gets a clear retry signal rather than seeing the tool
+      // crash. State (project, vault, rlm config, codebase index) was
+      // replayed by the bridge — only the Python namespace from prior
+      // batches is gone, which codemode's compose-then-commit pattern
+      // already accommodates.
+      let result: ReplResult;
+      try {
+        result = await handle.exec({ code: opCode }, _ctx.signal);
+      } catch (err) {
+        const restartErr = err as { name?: string; restartReason?: string };
+        if (restartErr?.name === 'BodyRestartedError') {
+          opResults.push({
+            purpose: op.purpose,
+            stdout: '', stderr: '', exception: null,
+            duration_ms: 0, rejected: false, timed_out: false,
+            lintError:
+              `[harness:restart] body became unresponsive and was restarted ` +
+              `(reason: ${restartErr.restartReason ?? 'unknown'}). Bound state ` +
+              `(project, vault, rlm config, codebase index) was preserved; ` +
+              `Python namespace from prior Repl batches was reset. Retry ` +
+              `this batch — subsequent ops in this same Repl call were ` +
+              `skipped to avoid duplicating side effects on a fresh body.`,
+          });
+          anyError = true;
+          // Skip the remaining ops in this batch — the harness restart
+          // means subsequent ops would run against a fresh body without
+          // the prior ops' namespace effects, producing inconsistent
+          // partial state. Cleaner to surface the restart, let the model
+          // re-run the whole batch.
+          break;
+        }
+        throw err;
+      }
 
       if (result.exception || result.rejected || result.timed_out) {
         anyError = true;

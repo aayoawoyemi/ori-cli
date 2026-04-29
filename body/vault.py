@@ -399,8 +399,16 @@ class Vault:
                 for h in ranked['results']:
                     say(f"Archive: {h['title']}")
         """
+        # MCP's ori_warmth tool expects `context` (the topic to filter warmth
+        # by), not `query` — the body's public API keeps `query` because that's
+        # what callers know and the docstring documents, but we translate at
+        # the wire. Without this translation MCP rejects with
+        # "Invalid type for context: expected string" because `query` lands
+        # nowhere in the MCP schema. Found 2026-04-28 while profiling user-
+        # reported "orient takes 50s" — Sonnet was hitting this error and
+        # retrying / re-thinking, which accounted for the bulk of the 50s.
         return self._inject_paths(_unwrap_data(self._call("ori_warmth", {
-            "query": query, "limit": limit, "scope": scope,
+            "context": query, "limit": limit, "scope": scope,
         })))
 
     def query_important(self, limit: int = 10, scope: str = "both") -> dict:

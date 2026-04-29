@@ -53,6 +53,11 @@ export type SessionEntry =
   // how often truncation requires multi-turn recovery vs. single-turn.
   | { type: 'max_output_recovery'; attempt: number; timestamp: number }
   | { type: 'max_output_recovery_exhausted'; attempts: number; timestamp: number }
+  // Per-model-call usage emitted on every assistant turn. Logged for bench
+  // harness consumption (bench/2026-04/runner). cacheRead/Write are the
+  // Anthropic prompt-cache fields; absent for providers that don't surface
+  // them. inputTokens excludes cache reads (Anthropic billing semantics).
+  | { type: 'usage'; inputTokens: number; outputTokens: number; totalTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number; timestamp: number }
   | { type: 'error'; message: string; timestamp: number };
 
 export interface SessionMeta {

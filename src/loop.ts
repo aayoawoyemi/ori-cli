@@ -524,6 +524,15 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
           }
 
           case 'usage':
+            session?.log({
+              type: 'usage',
+              inputTokens: event.inputTokens,
+              outputTokens: event.outputTokens,
+              totalTokens: event.totalTokens,
+              cacheReadTokens: event.cacheReadTokens,
+              cacheWriteTokens: event.cacheWriteTokens,
+              timestamp: Date.now(),
+            });
             yield { type: 'usage', inputTokens: event.inputTokens, outputTokens: event.outputTokens, totalTokens: event.totalTokens, cacheReadTokens: event.cacheReadTokens, cacheWriteTokens: event.cacheWriteTokens };
             break;
 

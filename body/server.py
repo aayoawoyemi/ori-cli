@@ -18,6 +18,7 @@ vault, rlm_call to the namespace.
 """
 import sys
 import json
+import os
 import threading
 import builtins as _builtins
 import os.path as _ospath
@@ -292,11 +293,25 @@ def _lazy_load_rlm():
     return _rlm_module
 
 
-def _reindex(path: str) -> dict:
-    """Reindex the codebase on a new directory. Available in REPL as reindex()."""
+def _reindex(path: str, include_nested_repos: bool = False) -> dict:
+    """Reindex the codebase on a new directory. Available in REPL as reindex().
+
+    By default, subdirectories that are themselves git repositories (vendored
+    libraries, SWE-Bench-style fixtures, sample repos) are treated as nested
+    foreign projects and skipped — they're not part of "this project."
+
+    Pass include_nested_repos=True to walk ALL subdirectories regardless
+    of whether they have their own .git/. Use this when:
+      - You're debugging a vendored library you're actively patching.
+      - You're indexing a benchmark or fixtures workspace and want the
+        full symbol graph available to the model.
+      - You want the model to find symbols in nested test repos.
+    Note: opting into the full walk on a large workspace (e.g., aries-cli
+    with bench/swe-lite/) is slow — 6,000+ files, several minutes of CPU.
+    """
     global CODEBASE
     idx_mod, cb_mod = _lazy_load_indexer()
-    idx_result = idx_mod.index_repo(path)
+    idx_result = idx_mod.index_repo(path, include_nested_repos=include_nested_repos)
     CODEBASE = cb_mod.CodebaseGraph(idx_result)
     _rebuild_namespace()
     return CODEBASE.stats()
@@ -727,12 +742,17 @@ def handle_sync(msg: dict):
         repo_path = msg.get("repo_path", ".")
         include_exts = msg.get("include_exts")
         exclude_dirs = msg.get("exclude_dirs")
+        # Default False: skip nested foreign git repos (vendored libs,
+        # SWE-Bench fixtures, sample repos). When the bridge passes True,
+        # walk everything regardless of nested .git/ directories.
+        include_nested_repos = bool(msg.get("include_nested_repos", False))
         try:
             idx_mod, cb_mod = _lazy_load_indexer()
             idx_result = idx_mod.index_repo(
                 repo_path,
                 include_exts=include_exts,
                 exclude_dirs=exclude_dirs,
+                include_nested_repos=include_nested_repos,
             )
             CODEBASE = cb_mod.CodebaseGraph(idx_result)
             _rebuild_namespace()
@@ -928,6 +948,39 @@ def _run_exec(msg: dict) -> None:
     _write_response(result)
 
 
+def _run_sync_op_in_thread(msg: dict) -> None:
+    """Run any handle_sync op in a background thread.
+
+    Why this exists: slow ops (index, connect_vault, connect_research,
+    codebase_signature, refresh_files) used to run inline in main loop,
+    blocking it for their whole duration. That made the heartbeat fire
+    spuriously during cold-start binding sequences (legit slow op vs.
+    actual wedge are indistinguishable from outside the main loop). By
+    running everything-except-exec in a worker thread, the main loop
+    stays free to answer pings and route callback responses.
+
+    The exec_thread slot is reused for these threads. Bridge's requestTail
+    serializes top-level ops at the TS layer, so at most one threaded op
+    is alive at a time. Errors are caught here so a thread death never
+    leaves the bridge waiting for a response that never arrives.
+    """
+    try:
+        response = handle_sync(msg)
+        if response is None:
+            # `None` means shutdown — but we route shutdown inline in main
+            # loop, so we shouldn't get here. Defensive: write a sane
+            # response and let the bridge see something rather than hang.
+            _write_response({"error": "unexpected None response from handle_sync in worker thread"})
+            return
+        _write_response(response)
+    except Exception as e:
+        import traceback
+        _write_response({
+            "error": f"sync op failed in worker thread: {e}",
+            "traceback": traceback.format_exc(),
+        })
+
+
 def _run_vault_op(op: str, msg: dict) -> None:
     """Run vault ops in a thread so vault proxy callbacks don't deadlock."""
     try:
@@ -1021,12 +1074,92 @@ def main():
                 RESEARCH.cancel(cr["id"])
             continue
 
+        # ── Health-check fast-path: pong before join ────────────────────
+        # Heartbeat pings (TS bridge → body) MUST respond even while exec
+        # is mid-flight — that's the whole reason a heartbeat exists. The
+        # legacy code routed `ping` through `handle_sync(msg)` after the
+        # `exec_thread.join()` below, which means a wedged exec (worker
+        # stuck in an OS-level Event.wait that _async_raise can't unwind
+        # on Windows) would silence pings too. Heartbeat-blind = wedge-
+        # invisible = the exact failure mode the watchdog is supposed to
+        # catch. Recognising `op:"ping"` BEFORE the join keeps the
+        # bridge's wedge detector functional in the one scenario it has
+        # to work in. Body's main loop is single-threaded so this is
+        # safe — _write_response holds the stdout lock per call. The
+        # legacy ping handler in `handle_sync` (line ~693) is now
+        # unreachable for new traffic but kept intact as documentation /
+        # backstop in case someone calls handle_sync directly.
+        op = msg.get("op")
+        if op == "ping":
+            _write_response({"pong": True, "version": "0.2.0-single-mcp"})
+            continue
+
+        # ── Cancel currently-running exec (user interrupt path) ─────────
+        # Triggered by bridge.cancelExec() when the user hits Ctrl+C or
+        # otherwise aborts mid-turn. Unlike `restart`, this is recoverable
+        # without losing namespace state — _async_raise unwinds the worker
+        # thread, control returns to _run_exec which writes a result, and
+        # the body is ready for the next op without restarting. Falls back
+        # to bridge-side restart if the unwind doesn't take (typically on
+        # Windows when the worker is blocked in an OS-level wait that
+        # _async_raise can't reach — the bridge fires a restart after no
+        # cancel_acked arrives within ~1.5s).
+        #
+        # Routes BEFORE the join branch so it can fire mid-exec; otherwise
+        # we'd be queued behind the very exec we're trying to cancel.
+        if op == "cancel_exec":
+            # Semantics:
+            #   cancel_acked = "we received the cancel op"
+            #     (always true at this branch — the body got the msg)
+            #   joined = "no exec_thread is alive after this op"
+            #     (true when nothing was running, or when we successfully
+            #     unwound the worker; false when the worker is stuck in
+            #     an OS-level wait that _async_raise can't reach —
+            #     caller should fall back to restart in that case)
+            #
+            # cancel_current() injects KeyboardInterrupt into the WORKER
+            # thread (the inner exec inside repl.execute), not the outer
+            # exec_thread that's just waiting in t.join. Injecting into
+            # exec_thread directly would just propagate KeyboardInterrupt
+            # through repl.execute without touching the worker — the
+            # worker would leak. cancel_current() targets the right tid.
+            repl.cancel_current()
+            joined = True
+            if exec_thread is not None:
+                # Wait for the worker to unwind and exec_thread to finish
+                # naturally. Budget 1s — should be ~ms when async raise
+                # works (Linux/mac, lucky Windows). On a stuck OS wait,
+                # this returns with joined=False so caller restarts.
+                exec_thread.join(timeout=1.0)
+                joined = not exec_thread.is_alive()
+                if joined:
+                    exec_thread = None
+            _write_response({"cancel_acked": True, "joined": joined})
+            continue
+
+        # ── DEV-only: force-wedge the main loop ─────────────────────────
+        # Used by bench/recovery/* tests to verify the heartbeat watchdog
+        # actually fires unhealthy and the bridge restarts cleanly. Only
+        # active when ARIES_DEVKIT=1 in the body process env — production
+        # users never see this branch. We call threading.Event().wait()
+        # rather than time.sleep() to avoid touching the (otherwise
+        # restricted) `time` module here; threading is already imported
+        # at the top of server.py so no additional import surface. The
+        # wait will be terminated by SIGKILL when the bridge restarts the
+        # body, which is exactly the recovery flow we want to test.
+        if op == "__test_wedge_main_loop" and os.environ.get("ARIES_DEVKIT") == "1":
+            seconds = msg.get("seconds", 60)
+            threading.Event().wait(seconds)
+            # Will be unreachable in the test path because SIGKILL fires
+            # before this; included so the op is well-defined if ARIES_DEVKIT
+            # is set in a non-restart scenario.
+            _write_response({"ok": True, "wedged_for_seconds": seconds})
+            continue
+
         # If there's a previous exec thread, wait for it before accepting new ops
         if exec_thread is not None:
             exec_thread.join()
             exec_thread = None
-
-        op = msg.get("op")
 
         if op == "exec":
             # Run exec in a background thread so the main loop stays responsive
@@ -1044,11 +1177,34 @@ def main():
             exec_thread.start()
             continue
 
-        response = handle_sync(msg)
-        if response is None:
-            _write_response({"ok": True, "shutdown": True})
-            break
-        _write_response(response)
+        # Shutdown is handled inline — it's the one op where blocking is
+        # correct (we want main loop to stop reading stdin before exiting).
+        if op == "shutdown":
+            response = handle_sync(msg)
+            if response is None:
+                _write_response({"ok": True, "shutdown": True})
+                break
+            _write_response(response)
+            continue
+
+        # ── All other ops run in a background thread ────────────────────
+        # Why: slow ops like `index` (5-30s on a real repo), `connect_vault`
+        # (MCP subprocess spawn), `connect_research` (HTTP warmup), and
+        # `codebase_signature` (signature compile) used to run inline in
+        # `handle_sync`, blocking the main loop for their whole duration.
+        # The pre-join ping fast-path doesn't help here because pings sit
+        # in stdin until the for-line iterator gets back to read; while
+        # handle_sync runs, the iterator is paused. Threading these ops
+        # keeps the main loop free to answer pings and route callback
+        # responses, so the heartbeat watchdog stays accurate even during
+        # cold-start binding sequences. The bridge's requestTail still
+        # serializes top-level ops at the TS layer (one in flight at a
+        # time), so main loop's exec_thread slot is safe to reuse here —
+        # at most one threaded op exists at any moment.
+        exec_thread = threading.Thread(
+            target=_run_sync_op_in_thread, args=(msg,), daemon=True,
+        )
+        exec_thread.start()
 
     # Clean up any running exec thread
     if exec_thread is not None:

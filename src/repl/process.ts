@@ -8,7 +8,7 @@
  *   - handle unexpected exit
  *   - graceful shutdown (shutdown op → wait → SIGKILL)
  */
-import { spawn, ChildProcess } from 'node:child_process';
+import { spawn, execSync, ChildProcess } from 'node:child_process';
 import { createInterface, Interface } from 'node:readline';
 
 export type OnLine = (line: string) => void;
@@ -65,6 +65,11 @@ export class ReplProcess {
       windowsHide: true,
       cwd: this.opts.cwd,
       env: { ...process.env, PYTHONUNBUFFERED: '1' },
+      // POSIX: detached gives the child its own process group so killTree()
+      // can take down the whole subtree via process.kill(-pid). Windows
+      // doesn't support this without breaking stdio piping; we use
+      // taskkill /T instead. See killTree() for the full rationale.
+      detached: process.platform !== 'win32',
     });
 
     this.rl = createInterface({
@@ -123,7 +128,37 @@ export class ReplProcess {
   }
 
   /**
-   * Send shutdown op, wait for graceful exit, then SIGKILL if still alive.
+   * Kill the body subprocess AND every descendant. Cross-platform:
+   *   - Windows: `taskkill /F /T /PID <pid>` walks the tree and force-kills
+   *     each process. Without /T, killing the body would orphan whatever it
+   *     spawned (e.g., shell.run subprocesses mid-flight).
+   *   - POSIX: `process.kill(-pid)` sends SIGTERM to the entire process
+   *     group, valid because we spawned with detached:true.
+   *
+   * Best-effort — process may already be dead; permissions may deny. The
+   * OS reaps stragglers eventually.
+   */
+  killTree(): void {
+    if (!this.proc?.pid) return;
+    const pid = this.proc.pid;
+    if (process.platform === 'win32') {
+      try {
+        execSync(`taskkill /F /T /PID ${pid}`, { stdio: 'ignore', timeout: 2_000 });
+      } catch { /* already dead, or access denied */ }
+    } else {
+      try { process.kill(-pid, 'SIGTERM'); } catch { /* already dead */ }
+      setTimeout(() => {
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* dead now */ }
+      }, 1_000);
+    }
+  }
+
+  /**
+   * Send shutdown op, wait for graceful exit, then killTree if still alive.
+   * Pre-2026-04-29 the SIGKILL fallback used kill('SIGKILL') which on
+   * Windows kills only the immediate child — orphaning anything the body
+   * had spawned (web fetch curl subprocesses, mid-flight shell.run, etc.).
+   * killTree() walks the tree on Windows via taskkill /T.
    */
   async shutdown(gracefulMs: number = 2000): Promise<void> {
     if (!this.proc || this.exited) return;
@@ -134,7 +169,7 @@ export class ReplProcess {
     // Wait for exit or force-kill
     await new Promise<void>((resolve) => {
       const timer = setTimeout(() => {
-        if (this.isAlive()) this.kill('SIGKILL');
+        if (this.isAlive()) this.killTree();
       }, gracefulMs);
 
       if (this.exited) {
