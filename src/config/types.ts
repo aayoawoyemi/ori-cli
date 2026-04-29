@@ -59,8 +59,12 @@ export interface VaultConfig {
   // VaultConfig.preflight flag removed 2026-04-21 — the ambient preflight
   // retrieval path was killed 2026-04-19 (codemode harness pulls memory
   // on-demand via vault.* in the Repl). Flag had no consumers.
-  postflight: boolean;
-  reflectionThreshold: number;
+  //
+  // VaultConfig.postflight + reflectionThreshold removed 2026-04-29 — the
+  // auto-vault-write pathway (threshold-triggered LLM reflection +
+  // session-end auto-reflection + session-metadata note) was eliminated
+  // for polluting warm-context retrieval with low-signal synthesized
+  // noise. See src/memory/postflight.ts header.
 }
 
 export interface ProjectBrainConfig {

@@ -24,7 +24,10 @@ import type { OriVault } from '../memory/vault.js';
 import type { ProjectBrain } from '../memory/projectBrain.js';
 import type { SessionStorage } from '../session/storage.js';
 import type { Message } from '../router/types.js';
-import { syncSession } from '../session/sync.js';
+// syncSession removed 2026-04-29. It performed three auto-vault-writes on
+// every session exit (final postflight reflection, ungated session-end
+// reflection, session-metadata note). All were LLM-synthesized noise that
+// polluted warm-context retrieval. See src/memory/postflight.ts header.
 import { runHooks } from '../hooks/runner.js';
 import type { HooksConfig, DisplayMode, ExperimentalConfig } from '../config/types.js';
 import type { ReplHandle } from '../repl/setup.js';
@@ -102,6 +105,7 @@ export function App(props: AppProps): React.ReactElement {
   const [showResumePicker, setShowResumePicker] = useState(initialResumePicker ?? false);
   const [sessionTitle, setSessionTitle] = useState<string | null>(null);
   const [pasteStatus, setPasteStatus] = useState<string | null>(null);
+  const [pendingCount, setPendingCount] = useState(0);
   const pasteStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Conversation messages for the loop (mutable ref to avoid stale closures)
@@ -111,6 +115,10 @@ export function App(props: AppProps): React.ReactElement {
   const trackerRef = useRef(new UsageTracker(session.sessionId, router.current.model));
   const toolTimingRef = useRef(new Map<string, number>());
   const turnCountRef = useRef(0);
+  // Input queue: messages typed while the model is running. Drained as one
+  // combined message on turn complete. Cleared on abort so stale queued
+  // messages do not fire into a subsequent unrelated turn.
+  const pendingInputRef = useRef<string[]>([]);
 
   // Token buffer: accumulate text, flush to state at 30fps for smooth rendering
   const textBufferRef = useRef('');
@@ -187,7 +195,6 @@ export function App(props: AppProps): React.ReactElement {
       if (exitWarningAt && Date.now() - exitWarningAt < 2000) {
         // Second press within 2s — actually exit
         runHooks('stop', hooks, { cwd, vaultPath: vault?.vaultPath })
-          .then(() => syncSession(messagesRef.current, 0, projectBrain, vault, router))
           .finally(() => {
             vault?.disconnect();
             exit();
@@ -301,7 +308,8 @@ export function App(props: AppProps): React.ReactElement {
   }, [permissionMode]);
 
   // Subscribe the usage tracker to router.cheapCall so research, compaction,
-  // postflight, and session-title spend all show up in /usage.
+  // and session-title spend all show up in /usage. (Postflight spend used to
+  // be on this list — removed 2026-04-29 along with its LLM call.)
   useEffect(() => {
     const unsub = router.onCheapCallUsage(({ provider, model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens }) => {
       trackerRef.current.markTurnStart();
@@ -467,6 +475,14 @@ export function App(props: AppProps): React.ReactElement {
     planApprovalResolveRef.current = null;
   }, []);
 
+  // â”€â”€ Input queue â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Accumulates messages typed while the model is running. The ref holds
+  // raw strings; pendingCount is display-facing for the queued indicator.
+  const handleQueue = useCallback((text: string) => {
+    pendingInputRef.current.push(text);
+    setPendingCount(pendingInputRef.current.length);
+  }, []);
+
   // ── Handle user input ───────────────────────────────────────────────
   const handleSubmit = useCallback(async (input: string, images?: AttachedImage[]) => {
     const trimmed = input.trim();
@@ -618,9 +634,13 @@ export function App(props: AppProps): React.ReactElement {
         fullText += `\n\nError: ${(err as Error).message}`;
       }
     }
-
     abortRef.current = null;
+    // Clear queued messages on abort â€” they were typed for a turn that was
+    // interrupted; firing them into the next unrelated turn would be wrong.
+    pendingInputRef.current = [];
+    setPendingCount(0);
 
+    // Finalize: flush any remaining buffered text, then clear stream
     // Finalize: flush any remaining buffered text, then clear stream
     if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
     textBufferRef.current = '';
@@ -632,6 +652,16 @@ export function App(props: AppProps): React.ReactElement {
     setTitleDone(agentName, cwd);
     flashTaskbar();
     setActiveTool(undefined);
+
+    // Drain the input queue â€” all messages typed during this turn arrive as
+    // one combined user message. Join with newline so the model sees them
+    // as a single coherent block, not separate requests.
+    if (pendingInputRef.current.length > 0) {
+      const combined = pendingInputRef.current.join('\n');
+      pendingInputRef.current = [];
+      setPendingCount(0);
+      handleSubmit(combined);
+    }
 
     // Track turns and update session metadata
     turnCountRef.current++;
@@ -855,7 +885,6 @@ export function App(props: AppProps): React.ReactElement {
       case '/exit':
       case '/quit':
         await runHooks('stop', hooks, { cwd, vaultPath: vault?.vaultPath });
-        await syncSession(messagesRef.current, 0, projectBrain, vault, router);
         vault?.disconnect();
         exit();
         break;
@@ -1777,6 +1806,8 @@ export function App(props: AppProps): React.ReactElement {
               }}
               model={router.info.model}
               isLoading={isLoading}
+              onQueue={handleQueue}
+              pendingCount={pendingCount}
             />
             <StatusBar
               model={router.info.model}

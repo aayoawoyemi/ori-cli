@@ -608,7 +608,8 @@ export class ModelRouter {
       }
     }
     // Notify any listeners (UsageTracker in app.tsx) about this call so
-    // research/compaction/postflight spend shows up in /usage.
+    // research/compaction spend shows up in /usage. (Postflight used to
+    // call cheapCall too — removed 2026-04-29.)
     for (const cb of this._cheapCallListeners) {
       try {
         cb({

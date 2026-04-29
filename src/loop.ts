@@ -18,7 +18,10 @@ import { estimateTokens } from './utils/tokens.js';
 // Model pulls memory on-demand via vault.* in the Repl. Preflight functions
 // live on in src/memory/preflight.ts for repurpose as session-start soft-map.
 import { stripSyntheticFromMessages, wrapSynthetic } from './memory/syntheticMarkers.js';
-import { runPostflight } from './memory/postflight.js';
+// runPostflight + threshold-triggered reflection removed 2026-04-29 — see
+// src/memory/postflight.ts header for rationale. The importanceAccumulator
+// counter still increments below as a session-shape signal but no longer
+// drives any side effect.
 import { runCompaction, pruneToolOutputs } from './memory/compact.js';
 // tickTurn / assembleWarmContext per-turn refresh removed alongside preflight kill.
 // Warm context still assembled at session start; no per-turn vault round-trip.
@@ -873,9 +876,10 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       return (m.content as ContentBlock[]).some(b => b.type === 'tool_use' || b.type === 'tool_result');
     });
     if (turnHadToolWork) {
-      importanceAccumulator = await runPostflight(
-        messages, projectBrain, vault, importanceAccumulator, router,
-      );
+      // Tool-using turn = +3 importance, otherwise +1. Pure counter now —
+      // the threshold-triggered reflection that consumed this used to fire
+      // an LLM synthesis to vault every ~50 tool turns. Removed 2026-04-29.
+      importanceAccumulator += 3;
       session?.log({
         type: 'postflight',
         importance: importanceAccumulator,

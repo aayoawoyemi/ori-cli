@@ -12,8 +12,8 @@ export const DEFAULT_CONFIG: AriesConfig = {
   vault: {
     // preflight flag removed 2026-04-21 — ambient preflight retrieval path
     // killed 2026-04-19; codemode pulls memory on-demand via vault.* in Repl.
-    postflight: true,
-    reflectionThreshold: 150,
+    // postflight + reflectionThreshold removed 2026-04-29 — auto-vault-write
+    // pathway eliminated. See src/memory/postflight.ts header for rationale.
   },
   projectBrain: {
     enabled: true,

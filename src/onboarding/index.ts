@@ -114,7 +114,6 @@ agent:
 
 vault:
   path: ${vaultPath}
-  postflight: true
 `;
 
   const configPath = join(globalConfigDir, 'config.yaml');

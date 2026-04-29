@@ -1,60 +1,20 @@
 import type { Message } from '../router/types.js';
-import type { OriVault } from './vault.js';
-import type { ProjectBrain } from './projectBrain.js';
 import type { ModelRouter } from '../router/index.js';
-import { triggerReflectionWithModel, triggerReflectionSimple } from './reflection.js';
 import { getMessageText } from '../utils/messages.js';
 
-// ── Constants ───────────────────────────────────────────────────────────────
-
-export const REFLECTION_THRESHOLD = 150;
-
-// ── Postflight Engine ───────────────────────────────────────────────────────
-
-/**
- * Run after a tool-using turn completes (gated by caller).
- *
- * 1. Accumulate importance (tool-using turns score 3, otherwise 1)
- * 2. Trigger reflection if accumulator crosses REFLECTION_THRESHOLD
- *
- * Agreement-ratio scanning removed 2026-04-19 — keyword slop that wrote
- * to vault on every threshold crossing. The no-sycophancy rule lives in
- * the system prompt instead.
- *
- * Returns the new importance accumulator value.
- */
-export async function runPostflight(
-  messages: Message[],
-  _projectBrain: ProjectBrain | null,
-  vault: OriVault | null,
-  currentImportance: number,
-  router?: ModelRouter,
-): Promise<number> {
-  const recentMessages = messages.slice(-5);
-  const hadToolCalls = recentMessages.some(m => {
-    if (typeof m.content === 'string') return false;
-    return m.content.some(b => b.type === 'tool_use' || b.type === 'tool_result');
-  });
-
-  const importance = hadToolCalls ? 3 : 1;
-  const newAccumulator = currentImportance + importance;
-
-  // ── Reflection trigger ──────────────────────────────────────────────
-  if (vault?.connected && newAccumulator >= REFLECTION_THRESHOLD) {
-    if (router) {
-      triggerReflectionWithModel(messages, vault, router).catch(() => {
-        triggerReflectionSimple(messages, vault).catch(() => {});
-      });
-    } else {
-      triggerReflectionSimple(messages, vault).catch(() => {});
-    }
-    return 0;
-  }
-
-  return newAccumulator;
-}
-
 // ── Compaction Classification ───────────────────────────────────────────────
+//
+// History note (2026-04-29): runPostflight + threshold-triggered reflection
+// + session-end auto-reflection + session-metadata vault writes were all
+// removed. They were LLM-synthesized "insights" auto-written to the global
+// vault on importance thresholds and session exit — usually too generic to
+// win retrieval ("be careful with async error handling") or too session-
+// specific to reuse ("the indexer was slow because of nested foreign repos").
+// They polluted warm-context retrieval and diluted curated notes. Sibling
+// feature (agreement-ratio scanning) was killed for the same reason on
+// 2026-04-19. extractAndClassifyInsights survives because it only fires
+// during user-invoked /compact, classifies by tier (ephemeral|project|vault),
+// and the user has an explicit moment to reject the write.
 
 export type InsightTier = 'ephemeral' | 'project' | 'vault';
 
