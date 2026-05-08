@@ -7,6 +7,9 @@ test/
 .env.local
 __pycache__/
 *.pyc
+body/__pycache__/
+body/bench/
+body/test_*.py
 bench/results/
 docs/
 spike/
