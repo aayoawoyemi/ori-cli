@@ -1,17 +1,17 @@
 # File: body/web.py
-# Purpose: Web primitive exposed to the model inside the Repl namespace.
+# Purpose: Web primitive exposed to the model inside the code namespace.
 #   Wraps the TS-side WebFetchTool and WebSearchTool so the model can fetch
 #   URLs and search the web without having them as top-level tools. Same
 #   philosophy as every other namespace primitive: no sibling tool in the
 #   schema, no zigzag between tools. The model composes
 #   `results = web.search(q); content = web.fetch(results[0]['url'])` in one
-#   Repl call.
+#   code call.
 # Key pieces:
 #   - Web class, instantiated once as module-global WEB
 #   - fetch(url, max_length=50000) — proxies WebFetchTool via bridge
 #   - search(query, max_results=10) — proxies WebSearchTool via bridge
 #   - resolve(id, result) — called by server.py main loop on web_response
-# Role: Registered under "web" in the Repl namespace. Mirrors the vault /
+# Role: Registered under "web" in the code namespace. Mirrors the vault /
 #   research / fs / shell callback pattern. If you change the transport
 #   here, change it in the others — the bridge's routing code is uniform.
 
@@ -116,6 +116,20 @@ class Web:
         if not isinstance(url, str) or not url.strip():
             raise WebError("web.fetch: url must be a non-empty string")
         return self._call("fetch", {"url": url, "max_length": max_length})
+
+    def read(self, url: str, max_length: int = 50_000) -> str:
+        """
+        Reader-mode URL fetch — alias for web.fetch.
+
+        Pi uses `read('http://...')` as the universal URL primitive; we
+        expose `web.read` for naming consistency so Pi-trained models hit
+        the right name without a teaching round-trip. Identical behavior
+        to web.fetch (Jina Reader under the hood, falls back to direct
+        HTTP + HTML cleanup).
+
+        Args, returns, exceptions: see web.fetch.
+        """
+        return self.fetch(url, max_length=max_length)
 
     def search(self, query: str, max_results: int = 10) -> list[dict]:
         """

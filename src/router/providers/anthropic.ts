@@ -1,7 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk';
-import type { ModelProvider, Message, ToolDefinition, StreamEvent, ContentBlock } from '../types.js';
-import type { ModelConfig, FeaturesConfig } from '../../config/types.js';
-import { resolveMaxTokens, resolveThinkingBudget } from '../model-capabilities.js';
+import type { ModelProvider, Message, ToolDefinition, StreamEvent, ContentBlock, SystemPromptInput } from '../types.js';
+import type { ModelConfig, FeaturesConfig, CacheConfig } from '../../config/types.js';
+import { resolveMaxTokens, resolveThinkingBudget, supportsAdaptiveThinking } from '../model-capabilities.js';
+import type { EffortLevel } from '../types.js';
 import {
   AnthropicLocalOAuthError,
   AnthropicLocalOAuthSource,
@@ -9,9 +10,19 @@ import {
 } from '../../auth/anthropicLocalOAuth.js';
 import { buildBillingHeader } from '../../auth/cch.js';
 import { getMessageText } from '../../utils/messages.js';
-import { CACHE_PREFIX_BREAK } from '../../prompt.js';
+import { sanitizeMessages, sanitizeSystemPrompt } from '../../utils/sanitize.js';
+import { splitSystemPromptInput } from '../../prompt.js';
+import {
+  buildCacheMarker,
+  resolveCacheRetention,
+  type CacheControlMarker,
+  type CacheRetention,
+} from '../cache.js';
 
-function toAnthropicMessages(messages: Message[]): Anthropic.MessageParam[] {
+function toAnthropicMessages(
+  messages: Message[],
+  marker: CacheControlMarker | null,
+): Anthropic.MessageParam[] {
   const result: Anthropic.MessageParam[] = [];
 
   for (const msg of messages) {
@@ -69,21 +80,30 @@ function toAnthropicMessages(messages: Message[]): Anthropic.MessageParam[] {
   // to cache the entire conversation history up to this point. Next turn,
   // only new messages after this point get charged as input. This is the
   // single highest-leverage optimization for token cost.
-  for (let i = result.length - 1; i >= 0; i--) {
-    if (result[i].role === 'user') {
-      const msg = result[i];
-      if (Array.isArray(msg.content)) {
-        const lastBlock = msg.content[msg.content.length - 1];
-        if (lastBlock && typeof lastBlock === 'object') {
-          (lastBlock as any).cache_control = { type: 'ephemeral' };
+  //
+  // When marker is null (retention='none'), skip the breakpoint entirely —
+  // the API treats absence of cache_control as opt-out, exactly what we want.
+  // The `as any` cast is required because `@anthropic-ai/sdk` v0.52.0 types
+  // CacheControlEphemeral as `{ type: 'ephemeral' }` only — `ttl: '1h'` is in
+  // the beta path. The wire format accepts it when the extended-cache-ttl
+  // beta header is set (added in stream() below for retention='long').
+  if (marker !== null) {
+    for (let i = result.length - 1; i >= 0; i--) {
+      if (result[i].role === 'user') {
+        const msg = result[i];
+        if (Array.isArray(msg.content)) {
+          const lastBlock = msg.content[msg.content.length - 1];
+          if (lastBlock && typeof lastBlock === 'object') {
+            (lastBlock as any).cache_control = marker;
+          }
+        } else if (typeof msg.content === 'string') {
+          result[i] = {
+            role: 'user',
+            content: [{ type: 'text', text: msg.content, cache_control: marker } as any],
+          };
         }
-      } else if (typeof msg.content === 'string') {
-        result[i] = {
-          role: 'user',
-          content: [{ type: 'text', text: msg.content, cache_control: { type: 'ephemeral' } }] as any,
-        };
+        break;
       }
-      break;
     }
   }
 
@@ -93,29 +113,26 @@ function toAnthropicMessages(messages: Message[]): Anthropic.MessageParam[] {
 // Cache breakpoint on the last tool definition (Pi pattern). Tells Anthropic
 // to cache system prompt + all tool schemas as a prefix block. Without this,
 // ~5K tokens of tool schemas get re-read every turn.
-function toAnthropicTools(tools: ToolDefinition[]): Anthropic.Tool[] {
-  return tools.map((t, i) => ({
-    name: t.name,
-    description: t.description,
-    input_schema: t.input_schema as Anthropic.Tool.InputSchema,
-    ...(i === tools.length - 1 ? { cache_control: { type: 'ephemeral' as const } } : {}),
-  }));
-}
-
-function splitSystemPromptByCacheBoundary(systemPrompt: string): {
-  prefix?: string;
-  remainder: string;
-} {
-  const idx = systemPrompt.indexOf(CACHE_PREFIX_BREAK);
-  if (idx === -1) {
-    return { remainder: systemPrompt };
-  }
-  const prefix = systemPrompt.slice(0, idx).trim();
-  const remainder = systemPrompt.slice(idx + CACHE_PREFIX_BREAK.length).trim();
-  return {
-    ...(prefix ? { prefix } : {}),
-    remainder: remainder || ' ',
-  };
+//
+// marker=null (retention='none') skips the breakpoint and tools schemas
+// roundtrip uncached every turn. Used for cost-instrumented runs.
+function toAnthropicTools(
+  tools: ToolDefinition[],
+  marker: CacheControlMarker | null,
+): Anthropic.Tool[] {
+  return tools.map((t, i) => {
+    const base = {
+      name: t.name,
+      description: t.description,
+      input_schema: t.input_schema as Anthropic.Tool.InputSchema,
+    };
+    if (marker !== null && i === tools.length - 1) {
+      // Same `as any` rationale as above — non-beta SDK type doesn't
+      // include `ttl` but the wire accepts it under the beta header.
+      return { ...base, cache_control: marker as any };
+    }
+    return base;
+  });
 }
 
 function estimateRequestTokens(
@@ -154,6 +171,10 @@ interface AnthropicProviderOptions {
    *  hits. Threaded from ModelRouter (router/index.ts) so the provider
    *  doesn't have to reach into config itself. */
   features?: FeaturesConfig;
+  /** Prompt-cache retention policy. Threaded from ModelRouter; resolved
+   *  through ARIES_CACHE_RETENTION env override at construction time so
+   *  a setter isn't needed for mid-session changes. */
+  cache?: CacheConfig;
 }
 
 export class AnthropicProvider implements ModelProvider {
@@ -171,10 +192,24 @@ export class AnthropicProvider implements ModelProvider {
   private readonly sleepImpl: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Extended thinking budget (tokens). 0 = no thinking. Set by ModelRouter before each stream call. */
   private _thinkingBudget = 0;
+  /**
+   * Effort level for the next stream call. Drives adaptive thinking on Opus
+   * 4.6/4.7 + Sonnet 4.6 (`output_config.effort`). Set by ModelRouter alongside
+   * setThinkingBudget. Default 'high' matches the router's default — guarantees
+   * the model always thinks when adaptive is in use.
+   */
+  private _effort: EffortLevel = 'high';
   /** Batch 3 — captured at construction for the message_delta cutoff_warning
    *  branch. Stored on the instance because the for-await closure inside
    *  stream() can't see the original `options` arg without re-plumbing. */
   private readonly features?: FeaturesConfig;
+  /**
+   * Resolved retention tier. ENV beats config beats default. Drives the
+   * cache_control marker shape (5min vs 1h vs none) AND the beta header
+   * ('extended-cache-ttl-2025-04-11' for 1h). Captured at construction so
+   * stream() doesn't redo the resolution on every call.
+   */
+  private readonly cacheRetention: CacheRetention;
 
   constructor(config: ModelConfig, options: AnthropicProviderOptions = {}) {
     this.model = config.model;
@@ -188,6 +223,10 @@ export class AnthropicProvider implements ModelProvider {
     this.maxTokens = this.features?.harnessCleanup
       ? resolveMaxTokens(config.model, config.maxTokens)
       : (config.maxTokens ?? 16_384);
+    // resolveCacheRetention also reads ARIES_CACHE_RETENTION /
+    // PI_CACHE_RETENTION env so a session can flip retention without
+    // touching YAML — mirrors pi's affordance.
+    this.cacheRetention = resolveCacheRetention(options.cache?.retention);
     this.useOAuth = config.auth === 'oauth';
     this.baseUrl = config.baseUrl;
     this.maxRateLimitRetries = Math.max(0, options.maxRateLimitRetries ?? 1);
@@ -284,20 +323,69 @@ export class AnthropicProvider implements ModelProvider {
     const rec = AnthropicProvider.asRecord(err);
     const retryAfter = this.getHeaderValue(rec.headers, 'retry-after');
 
+    const capHeadlessBackoff = (ms: number): number => {
+      const envCap = Number(process.env.ARIES_HEADLESS_RATE_LIMIT_BACKOFF_CAP_MS ?? '');
+      const cap = Number.isFinite(envCap) && envCap > 0
+        ? envCap
+        // Headless is measurement/substrate mode. A long OAuth retry-after
+        // should become a visible failed run, not an apparently-dead agent
+        // that the outer bench kills five minutes later with tokens=0.
+        : process.env.ARIES_HEADLESS === '1'
+          ? 15_000
+          : Infinity;
+      return Math.min(ms, cap);
+    };
+
     if (retryAfter) {
       const asNum = Number(retryAfter);
       if (Number.isFinite(asNum) && asNum > 0) {
-        return Math.max(1000, Math.floor(asNum * 1000));
+        return capHeadlessBackoff(Math.max(1000, Math.floor(asNum * 1000)));
       }
 
       const asDate = Date.parse(retryAfter);
       if (!Number.isNaN(asDate)) {
         const delta = asDate - Date.now();
-        if (delta > 0) return Math.max(1000, delta);
+        if (delta > 0) return capHeadlessBackoff(Math.max(1000, delta));
       }
     }
 
-    return this.defaultRateLimitBackoffMs;
+    return capHeadlessBackoff(this.defaultRateLimitBackoffMs);
+  }
+
+  private getFirstEventTimeoutMs(): number {
+    const raw = process.env.ARIES_PROVIDER_FIRST_EVENT_TIMEOUT_MS;
+    if (raw !== undefined) {
+      const parsed = Number(raw);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+    }
+    // Headless has no live UI and no human-visible stream while waiting.
+    // Without this watchdog an OAuth/provider stall logs only meta+user
+    // until an outer harness SIGKILLs the process, which erases the cause.
+    return process.env.ARIES_HEADLESS === '1' ? 60_000 : 0;
+  }
+
+  private getStreamIdleTimeoutMs(): number {
+    const raw = process.env.ARIES_PROVIDER_STREAM_IDLE_TIMEOUT_MS;
+    if (raw !== undefined) {
+      const parsed = Number(raw);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+    }
+    // The first-event watchdog only proves the HTTP stream opened. In
+    // headless/bench mode a stream can then stall before text, usage, or stop;
+    // fail it explicitly instead of letting an outer harness SIGKILL it.
+    return process.env.ARIES_HEADLESS === '1' ? 90_000 : 0;
+  }
+
+  private getStreamMaxDurationMs(): number {
+    const raw = process.env.ARIES_PROVIDER_STREAM_MAX_DURATION_MS;
+    if (raw !== undefined) {
+      const parsed = Number(raw);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+    }
+    // Independent of idle timeout: a stream can keep receiving raw events
+    // without producing model-visible text/thinking/usage. In headless mode
+    // surface that as a provider error before the outer bench SIGKILLs us.
+    return process.env.ARIES_HEADLESS === '1' ? 180_000 : 0;
   }
 
   private async defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -337,6 +425,26 @@ export class AnthropicProvider implements ModelProvider {
   }
 
   /**
+   * Set the effort level for the next stream call. Drives adaptive thinking's
+   * `output_config.effort`. Ignored when the model doesn't support adaptive
+   * (legacy budget mode used instead).
+   */
+  setEffort(effort: EffortLevel): void {
+    this._effort = effort;
+  }
+
+  /**
+   * No-op for Anthropic native — there's no client-supplied session-affinity
+   * field on the Messages API. Caching is purely prefix-based; cache_control
+   * markers + a stable system-prompt prefix are sufficient. Method exists
+   * solely to satisfy the optional ModelProvider.setSessionId interface
+   * shape so ModelRouter.setSessionId can fan out unconditionally.
+   */
+  setSessionId(_id: string): void {
+    // intentionally empty
+  }
+
+  /**
    * Temporarily set the per-call max_tokens. Used by cheapCall to cap
    * utility calls (extraction, reflection) at much smaller outputs than
    * the provider's configured default (typically 16k). Caller is responsible
@@ -367,19 +475,46 @@ export class AnthropicProvider implements ModelProvider {
 
   async *stream(
     messages: Message[],
-    systemPrompt: string,
+    systemPrompt: SystemPromptInput,
     tools: ToolDefinition[],
     signal?: AbortSignal,
   ): AsyncGenerator<StreamEvent> {
     await this.ensureToken();
 
-    const anthropicMessages = toAnthropicMessages(messages);
-    const anthropicTools = toAnthropicTools(tools);
+    // Sanitize unpaired UTF-16 surrogates BEFORE any downstream serialization.
+    // Web fetches, file reads, or model token-boundary cuts can leave half a
+    // surrogate pair in a string; JSON.stringify will emit it; Anthropic's
+    // parser rejects with `invalid_request_error: invalid high surrogate`.
+    // See src/utils/sanitize.ts header for full rationale.
+    messages = sanitizeMessages(messages);
+    const systemParts = splitSystemPromptInput(systemPrompt);
+    const stableSystemPrompt = sanitizeSystemPrompt(systemParts.stable);
+    const volatileSystemPrompt = sanitizeSystemPrompt(systemParts.volatile);
+
+    // Build the cache marker once per stream call. Anthropic native
+    // supports the long-TTL extension (ttl: '1h') so supportsLongTtl=true.
+    // Returns null when retention='none' — then helpers skip emission.
+    const cacheMarker = buildCacheMarker(this.cacheRetention, true);
+
+    const anthropicMessages = toAnthropicMessages(messages, cacheMarker);
+    const anthropicTools = toAnthropicTools(tools, cacheMarker);
 
     // Build system array. If a cache marker is present, the prefix block
     // (ambient signatures) is marked cacheable and billed at cache rates.
+    // marker=null path drops the cache_control field entirely so the
+    // system prompt round-trips uncached every turn (retention='none').
     let systemArray: Anthropic.TextBlockParam[];
-    const split = splitSystemPromptByCacheBoundary(systemPrompt);
+    const split = {
+      ...(stableSystemPrompt ? { prefix: stableSystemPrompt } : {}),
+      remainder: volatileSystemPrompt || ' ',
+    };
+
+    // Helper to attach cache_control via cast — same SDK type-vs-wire
+    // divergence rationale as toAnthropicMessages above.
+    const withCache = (block: Anthropic.TextBlockParam): Anthropic.TextBlockParam => {
+      if (cacheMarker === null) return block;
+      return { ...block, cache_control: cacheMarker as any };
+    };
 
     if (this.useOAuth) {
       // OAuth mode: inject billing header as first system block
@@ -390,18 +525,18 @@ export class AnthropicProvider implements ModelProvider {
       systemArray = [{ type: 'text', text: billingHeader }];
       if (split.prefix) {
         systemArray.push(
-          { type: 'text', text: split.prefix, cache_control: { type: 'ephemeral' } },
+          withCache({ type: 'text', text: split.prefix }),
           { type: 'text', text: split.remainder },
         );
       } else {
         systemArray.push(
-          { type: 'text', text: split.remainder, cache_control: { type: 'ephemeral' } },
+          withCache({ type: 'text', text: split.remainder }),
         );
       }
     } else {
       if (split.prefix) {
         systemArray = [
-          { type: 'text', text: split.prefix, cache_control: { type: 'ephemeral' } },
+          withCache({ type: 'text', text: split.prefix }),
           { type: 'text', text: split.remainder },
         ];
       } else {
@@ -421,7 +556,31 @@ export class AnthropicProvider implements ModelProvider {
     //
     // Only set when tools are present — no effect on plain conversational
     // turns and avoids API validation errors on tool-less requests.
-    const thinkingBudget = resolveThinkingBudget(this.maxTokens, this._thinkingBudget);
+    // ── Thinking config: adaptive vs legacy fork ────────────────────────────
+    //
+    // Adaptive thinking (`thinking: {type: 'adaptive', display: 'summarized'}`
+    // + `output_config: {effort}`) is the new shape for Opus 4.6/4.7 + Sonnet
+    // 4.6. Two reasons it's load-bearing:
+    //
+    //  1. **Interleaved thinking auto-enabled.** Adaptive turns on inter-tool
+    //     reasoning automatically — model thinks BETWEEN tool calls, not just
+    //     at start of turn. Legacy `enabled+budget_tokens` on Opus 4.6 has
+    //     interleaved DISABLED (per Anthropic docs); on Opus 4.7 it's outright
+    //     rejected with a 400.
+    //
+    //  2. **`display: 'summarized'` makes thinking content visible on Opus 4.7.**
+    //     4.7's default `display` is `'omitted'` — thinking blocks come back
+    //     with empty `thinking` field. The "two-line thinking" symptom maps
+    //     exactly here: thinking IS happening, the API just isn't sending
+    //     the content back. Explicit `summarized` opts in.
+    //
+    // Models without adaptive support (Haiku 4.5, older Sonnet/Opus) keep the
+    // legacy `enabled+budget_tokens` shape — adaptive is rejected on those.
+    //
+    // SDK 0.52.0 doesn't model adaptive yet — `as any` cast is required on the
+    // request params. Same pattern as the cache_control casts at L95/L100.
+    const adaptive = supportsAdaptiveThinking(this.model);
+    const thinkingBudget = adaptive ? 0 : resolveThinkingBudget(this.maxTokens, this._thinkingBudget);
 
     const requestParams = {
       model: this.model,
@@ -432,10 +591,18 @@ export class AnthropicProvider implements ModelProvider {
         tools: anthropicTools,
         tool_choice: { type: 'auto' as const, disable_parallel_tool_use: true },
       }),
-      // Extended thinking: inject budget when > 0. budget_tokens counts toward max_tokens.
-      ...(thinkingBudget > 0 && {
-        thinking: { type: 'enabled' as const, budget_tokens: thinkingBudget },
-      }),
+      ...(adaptive
+        ? {
+            // Adaptive thinking — model self-regulates depth via effort.
+            // Cast required: SDK 0.52.0 only types `enabled`/`disabled`.
+            thinking: { type: 'adaptive', display: 'summarized' } as unknown as Anthropic.ThinkingConfigParam,
+            output_config: { effort: this._effort },
+          }
+        : thinkingBudget > 0 && {
+            // Legacy: budget-cap thinking. Used for Haiku 4.5 + older models
+            // that don't accept adaptive. budget_tokens counts toward max_tokens.
+            thinking: { type: 'enabled' as const, budget_tokens: thinkingBudget },
+          }),
     } as Anthropic.MessageCreateParams;
 
     if (this.useOAuth) {
@@ -448,8 +615,19 @@ export class AnthropicProvider implements ModelProvider {
     const streamOptions: Record<string, unknown> = {};
     if (signal) streamOptions.signal = signal;
 
+    // Extended-cache-ttl beta — required when emitting `ttl: '1h'` on the
+    // cache_control marker. Without this header the wire field is silently
+    // dropped (markers fall back to 5min). Header name confirmed from SDK
+    // beta enum in @anthropic-ai/sdk/resources/beta/beta.d.ts.
+    const needsLongTtlBeta = this.cacheRetention === 'long';
+
     if (this.useOAuth) {
-      // OAuth mode: static beta list already includes adaptive-thinking-2026-01-28.
+      // OAuth mode: static beta list. Per Anthropic docs (May 2026), adaptive
+      // thinking does NOT require a beta header — it's GA on Opus 4.6/4.7 +
+      // Sonnet 4.6 directly. Previously we shipped 'adaptive-thinking-2026-01-28'
+      // which was the server-side translator from legacy → adaptive; now that
+      // we send adaptive directly, the translator is moot.
+      //
       // context-1m is only added when the actual payload approaches the 200k
       // window. Adding it unconditionally for 1M-model shortcuts triggers
       // Anthropic's "Extra usage is required for long context requests" 429
@@ -457,7 +635,6 @@ export class AnthropicProvider implements ModelProvider {
       const betas = [
         'claude-code-20250219',
         'oauth-2025-04-20',
-        'adaptive-thinking-2026-01-28',
         'research-preview-2026-02-01',
       ];
       if (this.contextWindow > 200_000) {
@@ -466,27 +643,139 @@ export class AnthropicProvider implements ModelProvider {
           betas.push('context-1m-2025-08-07');
         }
       }
+      if (needsLongTtlBeta) betas.push('extended-cache-ttl-2025-04-11');
       streamOptions.headers = {
         'anthropic-beta': betas.join(','),
         'user-agent': 'aries-cli/0.1.0 (external, cli)',
         'x-app': 'cli',
       };
-    } else if (thinkingBudget > 0) {
-      // API key mode: add extended thinking beta only when thinking is active
-      streamOptions.headers = {
-        'anthropic-beta': 'interleaved-thinking-2025-05-14',
-      };
+    } else {
+      // API key mode: build beta list dynamically. Adaptive thinking doesn't
+      // need a beta header (auto-enables interleaved thinking internally), so
+      // we no longer ship 'interleaved-thinking-2025-05-14'. Adaptive-capable
+      // models get inter-tool reasoning for free; legacy-budget models on
+      // Haiku 4.5 + older Sonnets don't support interleaved at all per the
+      // Anthropic docs, so the header was a no-op there too.
+      const betas: string[] = [];
+      if (needsLongTtlBeta) betas.push('extended-cache-ttl-2025-04-11');
+      if (betas.length > 0) {
+        streamOptions.headers = {
+          'anthropic-beta': betas.join(','),
+        };
+      }
     }
 
     let attempt = 0;
     while (true) {
       const toolInputBuffers = new Map<string, { name: string; json: string }>();
       let emittedAnyOutput = false;
+      const requestStartedAt = Date.now();
+      const firstEventTimeoutMs = this.getFirstEventTimeoutMs();
+      const streamIdleTimeoutMs = this.getStreamIdleTimeoutMs();
+      const streamMaxDurationMs = this.getStreamMaxDurationMs();
+      const debugStream = process.env.ARIES_PROVIDER_DEBUG_STREAM_EVENTS === '1';
+      let rawEventCount = 0;
+      let firstEventAt = 0;
+      let firstEventTimer: ReturnType<typeof setTimeout> | null = null;
+      let streamIdleTimer: ReturnType<typeof setTimeout> | null = null;
+      let streamDurationTimer: ReturnType<typeof setTimeout> | null = null;
+      let firstEventTimedOut = false;
+      let streamIdleTimedOut = false;
+      let streamDurationTimedOut = false;
+      let firstRawEventSeen = false;
+      let relayAbort: (() => void) | null = null;
+      const requestAbort = firstEventTimeoutMs > 0 || streamIdleTimeoutMs > 0 || streamMaxDurationMs > 0
+        ? new AbortController()
+        : null;
+
+      const clearFirstEventWatchdog = () => {
+        if (firstEventTimer) {
+          clearTimeout(firstEventTimer);
+          firstEventTimer = null;
+        }
+      };
+
+      const clearStreamIdleWatchdog = () => {
+        if (streamIdleTimer) {
+          clearTimeout(streamIdleTimer);
+          streamIdleTimer = null;
+        }
+      };
+
+      const clearStreamDurationWatchdog = () => {
+        if (streamDurationTimer) {
+          clearTimeout(streamDurationTimer);
+          streamDurationTimer = null;
+        }
+      };
+
+      const armStreamIdleWatchdog = () => {
+        if (!requestAbort || streamIdleTimeoutMs <= 0) return;
+        clearStreamIdleWatchdog();
+        streamIdleTimer = setTimeout(() => {
+          streamIdleTimedOut = true;
+          requestAbort.abort(new Error(
+            `No ${this.name} stream event for ${streamIdleTimeoutMs}ms after stream opened`,
+          ));
+        }, streamIdleTimeoutMs);
+      };
+
+      const cleanupRequestWatchdogs = () => {
+        clearFirstEventWatchdog();
+        clearStreamIdleWatchdog();
+        clearStreamDurationWatchdog();
+        if (signal && relayAbort) {
+          signal.removeEventListener('abort', relayAbort);
+          relayAbort = null;
+        }
+      };
+
+      const eventDiagnostics = () => ({
+        rawEventCount,
+        msSinceFirstEvent: firstEventAt > 0 ? Date.now() - firstEventAt : 0,
+      });
 
       try {
+        yield {
+          type: 'provider_event',
+          stage: 'request_start',
+          provider: this.name,
+          model: this.model,
+          attempt,
+        };
+
+        if (requestAbort) {
+          if (signal?.aborted) {
+            requestAbort.abort(signal.reason ?? new Error('Upstream signal aborted before provider request'));
+          } else if (signal) {
+            relayAbort = () => requestAbort.abort(signal.reason ?? new Error('Upstream signal aborted'));
+            signal.addEventListener('abort', relayAbort, { once: true });
+          }
+          if (firstEventTimeoutMs > 0) {
+            firstEventTimer = setTimeout(() => {
+              firstEventTimedOut = true;
+              requestAbort.abort(new Error(
+                `No ${this.name} stream event after ${firstEventTimeoutMs}ms`,
+              ));
+            }, firstEventTimeoutMs);
+          }
+          if (streamMaxDurationMs > 0) {
+            streamDurationTimer = setTimeout(() => {
+              streamDurationTimedOut = true;
+              requestAbort.abort(new Error(
+                `${this.name} stream exceeded ${streamMaxDurationMs}ms wall-clock`,
+              ));
+            }, streamMaxDurationMs);
+          }
+          armStreamIdleWatchdog();
+        }
+
+        const effectiveStreamOptions = requestAbort
+          ? { ...streamOptions, signal: requestAbort.signal }
+          : streamOptions;
         const stream = this.client.messages.stream(
           requestParams,
-          streamOptions as Anthropic.RequestOptions,
+          effectiveStreamOptions as Anthropic.RequestOptions,
         );
 
         // Track block types by stream index so we route deltas and stop events
@@ -515,6 +804,28 @@ export class AnthropicProvider implements ModelProvider {
         // capture; defensive cleanup keeps memory + state honest.
         try {
         for await (const event of stream) {
+          rawEventCount += 1;
+          if (firstEventAt === 0) firstEventAt = Date.now();
+          if (debugStream) {
+            const evAny = event as { type: string; delta?: { type?: string }; content_block?: { type?: string } };
+            const sub = evAny.delta?.type ?? evAny.content_block?.type;
+            process.stderr.write(
+              `[anthropic-stream] +${Date.now() - requestStartedAt}ms type=${evAny.type}${sub ? ` sub=${sub}` : ''}\n`,
+            );
+          }
+          armStreamIdleWatchdog();
+          if (!firstRawEventSeen) {
+            firstRawEventSeen = true;
+            clearFirstEventWatchdog();
+            yield {
+              type: 'provider_event',
+              stage: 'first_event',
+              provider: this.name,
+              model: this.model,
+              attempt,
+              elapsedMs: Date.now() - requestStartedAt,
+            };
+          }
           if (event.type === 'content_block_start') {
             const cb = event.content_block as { type: string; id?: string; name?: string };
             if (cb.type === 'thinking') {
@@ -526,7 +837,16 @@ export class AnthropicProvider implements ModelProvider {
               yield { type: 'tool_use_start', id: cb.id, name: cb.name };
             }
           } else if (event.type === 'content_block_delta') {
-            if (thinkingBlockIndices.has(event.index)) continue;
+            if (thinkingBlockIndices.has(event.index)) {
+              // 2026-05-01: Yield thinking content to the UI instead of
+              // silently dropping it. The continue stays so text_delta/tool
+              // logic below doesn't fire for thinking blocks.
+              const delta = event.delta as { type?: string; thinking?: string };
+              if (delta?.type === 'thinking_delta' && delta.thinking) {
+                yield { type: 'thinking', content: delta.thinking };
+              }
+              continue;
+            }
             if (event.delta.type === 'text_delta') {
               emittedAnyOutput = true;
               yield { type: 'text', content: event.delta.text };
@@ -613,7 +933,7 @@ export class AnthropicProvider implements ModelProvider {
               type: 'usage',
               inputTokens: usage.input_tokens,
               outputTokens: usage.output_tokens,
-              totalTokens: usage.input_tokens + usage.output_tokens,
+              totalTokens: usage.input_tokens + usage.output_tokens + (usage.cache_read_input_tokens ?? 0),
               cacheReadTokens: usage.cache_read_input_tokens ?? 0,
               cacheWriteTokens: usage.cache_creation_input_tokens ?? 0,
             };
@@ -645,6 +965,7 @@ export class AnthropicProvider implements ModelProvider {
           }
         }
         } finally {
+          cleanupRequestWatchdogs();
           // Batch 3 — defensive cleanup. Buffers should already be empty
           // after content_block_stop fires for each tool_use, but stream
           // aborts (network drop, AbortSignal, downstream throw) skip
@@ -657,6 +978,56 @@ export class AnthropicProvider implements ModelProvider {
 
         return;
       } catch (err) {
+        cleanupRequestWatchdogs();
+
+        if (firstEventTimedOut && !firstRawEventSeen) {
+          const message = `No ${this.name} stream event after ${firstEventTimeoutMs}ms`;
+          yield {
+            type: 'provider_event',
+            stage: 'request_error',
+            provider: this.name,
+            model: this.model,
+            attempt,
+            elapsedMs: Date.now() - requestStartedAt,
+            reason: 'first_event_timeout',
+            message,
+            ...eventDiagnostics(),
+          };
+          throw this.formatRequestError('stream first-event timeout', message);
+        }
+
+        if (streamDurationTimedOut) {
+          const message = `${this.name} stream exceeded ${streamMaxDurationMs}ms wall-clock`;
+          yield {
+            type: 'provider_event',
+            stage: 'request_error',
+            provider: this.name,
+            model: this.model,
+            attempt,
+            elapsedMs: Date.now() - requestStartedAt,
+            reason: 'stream_duration_timeout',
+            message,
+            ...eventDiagnostics(),
+          };
+          throw this.formatRequestError('stream duration timeout', message);
+        }
+
+        if (streamIdleTimedOut) {
+          const message = `No ${this.name} stream event for ${streamIdleTimeoutMs}ms after stream opened`;
+          yield {
+            type: 'provider_event',
+            stage: 'request_error',
+            provider: this.name,
+            model: this.model,
+            attempt,
+            elapsedMs: Date.now() - requestStartedAt,
+            reason: 'stream_idle_timeout',
+            message,
+            ...eventDiagnostics(),
+          };
+          throw this.formatRequestError('stream idle timeout', message);
+        }
+
         const canRetry =
           this.isRateLimitError(err)
           && !emittedAnyOutput
@@ -664,14 +1035,35 @@ export class AnthropicProvider implements ModelProvider {
           && !(signal?.aborted);
 
         if (!canRetry) {
+          const msg = err instanceof Error ? err.message : String(err);
+          yield {
+            type: 'provider_event',
+            stage: 'request_error',
+            provider: this.name,
+            model: this.model,
+            attempt,
+            elapsedMs: Date.now() - requestStartedAt,
+            reason: this.isRateLimitError(err) ? 'rate_limit' : 'error',
+            message: msg.slice(0, 1000),
+            ...eventDiagnostics(),
+          };
           if (this.isRateLimitError(err) && attempt > 0) {
-            const msg = err instanceof Error ? err.message : String(err);
             throw this.formatRequestError('stream execution', `rate limit persisted after ${attempt} retry attempt(s): ${msg}`);
           }
           throw this.formatRequestError('stream execution', err);
         }
 
         const backoffMs = this.getRateLimitBackoffMs(err);
+        yield {
+          type: 'provider_event',
+          stage: 'backoff',
+          provider: this.name,
+          model: this.model,
+          attempt,
+          backoffMs,
+          reason: 'rate_limit',
+          message: (err instanceof Error ? err.message : String(err)).slice(0, 1000),
+        };
         try {
           await this.sleepImpl(backoffMs, signal);
         } catch (sleepErr) {

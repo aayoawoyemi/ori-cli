@@ -46,6 +46,8 @@ export interface SetupOptions {
   cwd: string;
   /** Custom trajectory path. Defaults to <cwd>/.aries/repl-traces/<ts>.jsonl */
   trajectoryPath?: string;
+  /** Durable Python state directory. Defaults to <cwd>/.aries/state if omitted. */
+  stateDir?: string;
   /** If provided, auto-connects the vault at startup. */
   vaultPath?: string;
   /** If provided, auto-configures rlm_call with this API key. */
@@ -146,6 +148,7 @@ export async function setupReplBridge(
           vaultProject: bridge.getProjectVaultPath() ?? bridge.getProjectVault()?.vaultPath ?? null,
           mode,
           shell,
+          stateDir: opts.stateDir ?? null,
         });
       } catch (err) {
         opts.onEvent?.({
@@ -249,6 +252,7 @@ export async function setupReplBridge(
       vaultProject: bridge.getProjectVaultPath() ?? null,
       mode,
       shell,
+      stateDir: opts.stateDir ?? null,
     });
   } catch (err) {
     opts.onEvent?.({

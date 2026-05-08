@@ -15,7 +15,7 @@ Build it incrementally using Write or Edit. This is the ONLY file you may edit.
 ## How to Plan
 
 ### Step 1: Understand
-Read relevant code, ask questions, explore. Don't make assumptions about intent. Use Repl (codebase.search, fs.read) freely — all reads are auto-approved.
+Read relevant code, ask questions, explore. Don't make assumptions about intent. Use code (codebase.search, fs.read) freely — all reads are auto-approved.
 
 ### Step 2: Discuss and Write
 As you understand the problem, write your plan incrementally to the plan file. This isn't a ceremony — write as decisions are made. Ask questions when uncertain. Don't wait until the end to write.

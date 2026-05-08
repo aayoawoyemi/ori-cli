@@ -15,6 +15,13 @@ export interface TurnRecord {
   costEstimate: number;      // USD
   timestamp: number;         // epoch ms
   durationMs?: number;       // wall time for this turn
+  // â”€â”€ Tool telemetry (added 2026-05-03) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Populated via patchLastTurn() after tool execution completes â€” usage
+  // event fires during streaming (before tools run), so tool data arrives
+  // separately on turn_complete and is merged in here.
+  toolCallCount?: number;    // total tool calls this turn
+  toolNames?: string[];      // names of tools called (may repeat, e.g. ['Repl','Repl'])
+  replCellCount?: number;    // total Python cells executed across all Repl calls
 }
 
 export interface SessionSummary {
@@ -50,9 +57,14 @@ const COST_PER_M: Record<string, CostTier> = {
   'gpt-4o':                       { input: 2.5,  output: 10,  cacheRead: 1.25, cacheWrite: 2.5 },
   'gpt-5':                        { input: 10,   output: 30,  cacheRead: 2.5,  cacheWrite: 10 },
   'o4-mini':                      { input: 1.1,  output: 4.4, cacheRead: 0.275, cacheWrite: 1.1 },
-  // DeepSeek
-  'deepseek-chat':                { input: 0.27, output: 1.1, cacheRead: 0.07, cacheWrite: 0.27 },
-  'deepseek-reasoner':            { input: 0.55, output: 2.19, cacheRead: 0.14, cacheWrite: 0.55 },
+  // DeepSeek V4 — prices per M tokens (source: api-docs.deepseek.com, 2026-04-30)
+  // Flash: $0.14 in / $0.28 out / $0.0028 cache-hit-in
+  // Pro:   $0.435 in / $0.87 out / $0.003625 cache-hit-in  (75% off until 2026-05-31; full: $1.74/$3.48)
+  'deepseek-v4-flash':            { input: 0.14,   output: 0.28, cacheRead: 0.0028,   cacheWrite: 0.14 },
+  'deepseek-v4-pro':              { input: 0.435,  output: 0.87, cacheRead: 0.003625, cacheWrite: 0.435 },
+  // Legacy aliases deprecated 2026-07-24 — map to v4-flash pricing
+  'deepseek-chat':                { input: 0.14,   output: 0.28, cacheRead: 0.0028,   cacheWrite: 0.14 },
+  'deepseek-reasoner':            { input: 0.14,   output: 0.28, cacheRead: 0.0028,   cacheWrite: 0.14 },
   // Qwen (DashScope)
   'qwen3.6-plus':                 { input: 0.8, output: 2,   cacheRead: 0.2, cacheWrite: 0.8 },
   'qwen3-235b-a22b':              { input: 0.8, output: 2,   cacheRead: 0.2, cacheWrite: 0.8 },
@@ -147,7 +159,31 @@ export class UsageTracker {
     return record;
   }
 
-  // ── Queries ───────────────────────────────────────────────────────────
+  /**
+   * Patch the most recent turn with tool telemetry.
+   *
+   * Called from app.tsx on the turn_complete event, which fires after tool
+   * execution completes â€” after the usage event that drove recordTurn. Token
+   * counts land at usage time; tool call data lands here.
+   *
+   * Re-persists the corrected record by appending a replacement line tagged
+   * with the same turn number. Historical readers should prefer the last
+   * entry with a given (sessionId, turn) pair.
+   */
+  patchLastTurn(toolCallCount: number, toolNames: string[], replCellCount?: number): void {
+    const last = this.turns[this.turns.length - 1];
+    if (!last) return;
+
+    last.toolCallCount = toolCallCount;
+    last.toolNames = toolNames;
+    if (replCellCount !== undefined) last.replCellCount = replCellCount;
+
+    // Append a corrected entry â€” downstream readers take the last record per turn.
+    // 2026-05-03: simpler than rewriting the whole file; good enough for analytics.
+    this.persistTurn(last);
+  }
+
+  // â”€â”€ Queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   /** All turns this session. */
   get allTurns(): readonly TurnRecord[] {

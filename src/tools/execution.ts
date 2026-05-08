@@ -46,8 +46,33 @@ export function resetDoomLoop(): void {
 // ── Tool Execution ──────────────────────────────────────────────────────────
 
 /**
- * Execute tool calls with read/write partitioning and doom loop detection.
- * Read-only tools run in parallel. Write tools run serially.
+ * Result of executeTools — list of tool results plus optional steering
+ * messages captured mid-batch. Steering is a Pi-parity primitive (Batch 4):
+ * the user can interrupt a long-running tool batch by typing into the
+ * steering queue, and the next tool finish point picks up the messages,
+ * aborts remaining tools (returning skipped results for them), and surfaces
+ * the captured steering for the loop to inject as the next user message.
+ */
+export interface ExecuteToolsResult {
+  results: ToolResult[];
+  steeringMessages?: string[];
+}
+
+/**
+ * Execute tool calls with read/write partitioning, doom loop detection, and
+ * mid-batch steering interrupt.
+ *
+ * Read-only tools run in parallel. Write tools run serially. After each
+ * tool finishes, `getSteeringMessages` (if provided) is called; if it
+ * returns a non-empty array, the batch's AbortController fires, remaining
+ * write tools get a "skipped: user steered" result,
+ * and the captured steering messages are returned in `result.steeringMessages`
+ * so the loop can inject them as the next user message before re-streaming.
+ *
+ * The mid-batch interrupt does NOT cancel reads already in flight (they
+ * run as a Promise.all that's already kicked off). It interrupts BETWEEN
+ * reads → writes. Pi’s pattern is the same — the abort
+ * check happens between batch phases, not inside a phase.
  */
 export async function executeTools(
   toolCalls: ToolCall[],
@@ -55,8 +80,8 @@ export async function executeTools(
   ctx: ToolContext,
   hooks?: HooksConfig,
   vaultPath?: string,
-  maxSubagents = 5,
-): Promise<ToolResult[]> {
+  getSteeringMessages?: () => Promise<string[]> | string[],
+): Promise<ExecuteToolsResult> {
   const results: ToolResult[] = [];
 
   for (const tc of toolCalls) {
@@ -73,10 +98,38 @@ export async function executeTools(
   }
 
   // If all calls were doom-looped, return early
-  if (results.length === toolCalls.length) return results;
+  if (results.length === toolCalls.length) return { results };
 
   // Filter out doom-looped calls
   const validCalls = toolCalls.filter(tc => !results.some(r => r.id === tc.id));
+
+  // Per-batch AbortController layered on top of ctx.signal. Tools see a
+  // combined signal; mid-batch steering check fires this controller to
+  // skip remaining work without affecting the user's outer signal.
+  const batchAbort = new AbortController();
+  const combinedSignal: AbortSignal = ctx.signal
+    ? anySignal([ctx.signal, batchAbort.signal])
+    : batchAbort.signal;
+  const batchCtx: ToolContext = { ...ctx, signal: combinedSignal };
+
+  // Helper: drain steering, return whether we should abort.
+  const checkSteering = async (): Promise<string[] | null> => {
+    if (!getSteeringMessages) return null;
+    const msgs = await getSteeringMessages();
+    if (msgs.length === 0) return null;
+    batchAbort.abort();
+    return msgs;
+  };
+
+  // Skipped-result emitter — used when remaining tools are short-circuited
+  // by mid-batch steering. Maintains tool_use/tool_result pairing the API
+  // requires (no orphaned tool_use IDs) without running the actual tool.
+  const skippedResult = (tc: ToolCall): ToolResult => ({
+    id: tc.id,
+    name: tc.name,
+    output: 'Skipped: user steered the batch mid-execution. The steering message is the next user input.',
+    isError: false,
+  });
 
   // Partition into read-only and write groups
   const readCalls: ToolCall[] = [];
@@ -90,66 +143,67 @@ export async function executeTools(
     }
   }
 
-  // Separate agent calls from other read-only tools
-  const agentCalls = readCalls.filter(tc => tc.name === 'Agent');
-  const otherReads = readCalls.filter(tc => tc.name !== 'Agent');
-
-  // Other reads: unbounded parallel (fast filesystem ops)
-  if (otherReads.length > 0) {
+  // Read-only tools: unbounded parallel (fast filesystem ops)
+  // Agent-specific bounded-parallel block removed 2026-05-03 â€” AgentTool deleted.
+  if (readCalls.length > 0) {
     const readResults = await Promise.all(
-      otherReads.map(tc => executeSingle(tc, registry, ctx, hooks, vaultPath)),
+      readCalls.map(tc => executeSingle(tc, registry, batchCtx, hooks, vaultPath)),
     );
     results.push(...readResults);
+
+    const steering = await checkSteering();
+    if (steering) {
+      for (const tc of writeCalls) results.push(skippedResult(tc));
+      return { results, steeringMessages: steering };
+    }
   }
 
-  // Agent calls: bounded parallel (each spawns a child process)
-  if (agentCalls.length > 0) {
-    const agentResults = await runBounded(
-      agentCalls,
-      maxSubagents,
-      tc => executeSingle(tc, registry, ctx, hooks, vaultPath),
-    );
-    results.push(...agentResults);
-  }
-
-  // Run write tools serially
-  for (const tc of writeCalls) {
-    const result = await executeSingle(tc, registry, ctx, hooks, vaultPath);
+  // Run write tools serially. Steering is checked AFTER each — write tools
+  // are typically the long-running ones (Repl batches with many cells), so
+  // mid-write steering is the most-frequent interrupt point.
+  for (let i = 0; i < writeCalls.length; i++) {
+    const tc = writeCalls[i];
+    const result = await executeSingle(tc, registry, batchCtx, hooks, vaultPath);
     results.push(result);
+
+    const steering = await checkSteering();
+    if (steering) {
+      // Skip remaining write tools (i+1..end)
+      for (let j = i + 1; j < writeCalls.length; j++) {
+        results.push(skippedResult(writeCalls[j]));
+      }
+      return { results, steeringMessages: steering };
+    }
   }
 
-  return results;
+  return { results };
+}
+
+/**
+ * Combine multiple AbortSignals into one. Fires when any of the inputs
+ * fires. Polyfill for AbortSignal.any (Node 20+) — the runtime version
+ * is preferred when available since it's lighter weight.
+ */
+function anySignal(signals: AbortSignal[]): AbortSignal {
+  // Prefer the standard if available (Node 20+, browsers)
+  if (typeof (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any === 'function') {
+    return (AbortSignal as unknown as { any: (s: AbortSignal[]) => AbortSignal }).any(signals);
+  }
+  const controller = new AbortController();
+  for (const sig of signals) {
+    if (sig.aborted) {
+      controller.abort();
+      return controller.signal;
+    }
+    sig.addEventListener('abort', () => controller.abort(), { once: true });
+  }
+  return controller.signal;
 }
 
 /**
  * Run async tasks with bounded concurrency.
  * At most `limit` tasks execute simultaneously; the rest queue.
  */
-async function runBounded(
-  items: ToolCall[],
-  limit: number,
-  fn: (item: ToolCall) => Promise<ToolResult>,
-): Promise<ToolResult[]> {
-  const results: ToolResult[] = [];
-  const executing = new Set<Promise<void>>();
-
-  for (const item of items) {
-    const p = (async () => {
-      const result = await fn(item);
-      results.push(result);
-    })();
-    executing.add(p);
-    p.finally(() => executing.delete(p));
-
-    if (executing.size >= limit) {
-      await Promise.race(executing);
-    }
-  }
-
-  await Promise.all(executing);
-  return results;
-}
-
 async function executeSingle(
   tc: ToolCall,
   registry: ToolRegistry,

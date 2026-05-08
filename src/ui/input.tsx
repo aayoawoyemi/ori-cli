@@ -34,11 +34,23 @@ interface PromptInputProps {
   onPasteError?: (message: string) => void;
   model: string;
   isLoading: boolean;
+  // Queue callback + count for buffering input typed while the model is running.
+  // onQueue accumulates messages; pendingCount drives the indicator display.
+  onQueue?: (text: string) => void;
+  pendingCount?: number;
+  // Steering callback — natural-text mid-turn interject. While `isLoading=true`,
+  // typing text and pressing Enter sends it into the steering queue instead of
+  // the post-turn queue. The loop's mid-batch steering check picks it up
+  // between tools, aborts the rest of the current batch, and injects it as the
+  // next user message. No keybind required — the gesture IS typing while the
+  // agent is working. No-op when `isLoading=false` (just submits normally).
+  onSteer?: (text: string) => void;
+  steerCount?: number;
 }
 
 // ── Component ──────────────────────────────────────────────────────────────
 
-export function PromptInput({ onSubmit, onPasteError, model, isLoading }: PromptInputProps): React.ReactElement {
+export function PromptInput({ onSubmit, onPasteError, model, isLoading, onQueue, pendingCount = 0, onSteer, steerCount = 0 }: PromptInputProps): React.ReactElement {
   const [value, setValue] = useState('');
   const [images, setImages] = useState<AttachedImage[]>([]);
   const imageCountRef = useRef(0);
@@ -113,7 +125,17 @@ export function PromptInput({ onSubmit, onPasteError, model, isLoading }: Prompt
       return;
     }
 
-    // Clear latch on any non-V char after ESC
+    // Steering is natural-text + Enter while isLoading=true (see handleSubmit
+    // below). No keybind shortcut — typing IS the gesture. The previous Alt+S
+    // alias was removed 2026-05-08 because (a) the feature was already
+    // discoverable through normal typing, and (b) the keybind both failed to
+    // surface the capability AND added a Pi-ism that didn't fit the "talk
+    // normally" UX. If we ever want a "send-as-steer-without-clearing-input"
+    // affordance, that's a different question and should land as its own
+    // explicit gesture, not as a hidden modifier.
+
+    // Clear latch on any non-V char after ESC. Sole latch consumer: Alt+V
+    // (paste). Add to this filter when adding more Alt+key bindings.
     if (escapeLatchRef.current && input && input !== 'v') {
       escapeLatchRef.current = false;
     }
@@ -171,7 +193,21 @@ export function PromptInput({ onSubmit, onPasteError, model, isLoading }: Prompt
 
   const handleSubmit = (text: string) => {
     const trimmed = text.trim();
-    if (!trimmed || isLoading) return;
+    if (!trimmed) return;
+    // While loading, steer mid-turn — the user's message injects into the
+    // current loop iteration as a synthetic user message, redirecting the
+    // agent immediately. Typing + Enter IS the steering gesture; no modifier
+    // key. Falls back to post-turn queue if onSteer isn't wired (subagent fork).
+    if (isLoading) {
+      if (onSteer) { onSteer(trimmed); } else { onQueue?.(trimmed); }
+      setHistory(prev => [...prev, trimmed]);
+      setHistoryIdx(-1);
+      setValue('');
+      setImages([]);
+      imageCountRef.current = 0;
+      setPaletteIdx(0);
+      return;
+    }
 
     // If palette is showing, Enter acts on the selected command
     if (showPalette && filteredCommands.length > 0) {
@@ -228,16 +264,22 @@ export function PromptInput({ onSubmit, onPasteError, model, isLoading }: Prompt
         {/* Mode indicator */}
         <ModeIndicator mode={mode} isLoading={isLoading} />
 
-        {isLoading ? (
-          <Text dimColor>Waiting for response...</Text>
-        ) : (
-          <StableInput
-            value={value}
-            onChange={handleChange}
-            onSubmit={handleSubmit}
-            placeholder=""
-            isEscapeLatchActive={escapeLatchRef.current}
-          />
+        <StableInput
+          value={value}
+          onChange={handleChange}
+          onSubmit={handleSubmit}
+          placeholder=""
+          isEscapeLatchActive={escapeLatchRef.current}
+        />
+        {isLoading && pendingCount > 0 && (
+          <Box marginLeft={2}>
+            <Text color={colors.dim}>{pendingCount} message{pendingCount > 1 ? 's' : '' } queued</Text>
+          </Box>
+        )}
+        {isLoading && steerCount > 0 && (
+          <Box marginLeft={2}>
+            <Text color={colors.warning}>↳ {steerCount} steer{steerCount > 1 ? 's' : ''} pending</Text>
+          </Box>
         )}
       </Box>
     </Box>

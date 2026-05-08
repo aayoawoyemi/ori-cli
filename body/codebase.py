@@ -1,5 +1,5 @@
 """
-CodebaseGraph — the `codebase` object exposed in the REPL namespace.
+CodebaseGraph — the `codebase` object exposed in the code namespace.
 
 Wraps the indexer output into a rustworkx graph with:
   - PageRank (personalized via seed vector)
@@ -78,7 +78,7 @@ def _get_cached_parser(language: str):
 
 class CodebaseGraph:
     """
-    The `codebase` primitive exposed in the Repl namespace. Wraps the indexer
+    The `codebase` primitive exposed in the code namespace. Wraps the indexer
     output as a directed reference graph + rankings (PageRank/HITS/Louvain) so
     the agent can orient itself structurally before reading files.
 
@@ -317,7 +317,8 @@ class CodebaseGraph:
             query: substring to match (case-insensitive)
             limit: stop after this many matches (default 50)
 
-        Returns list of {file, line, snippet} dicts.
+        Returns list of {file, line, snippet, text} dicts. `text` is an
+        alias for `snippet`.
 
         Example (find usage sites, group by file, read context):
             hits = codebase.search("handleSubmit", limit=30)
@@ -331,14 +332,63 @@ class CodebaseGraph:
         for path, rec in self.files.items():
             for i, line in enumerate(rec.lines, start=1):
                 if q in line.lower():
+                    snippet = line.strip()[:200]
+                    # 2026-05-04: keep `snippet` as the canonical field, but
+                    # include `text` as a compatibility alias. Sonnet 4.6
+                    # naturally guessed `h["text"]` on the first Level-1
+                    # bench cell; the KeyError cost a whole model turn and
+                    # surfaced the huge first-turn banner in the error
+                    # output. This is a by-construction schema tolerance:
+                    # either common field name works, no retry lesson needed.
+                    #
+                    # Same pattern extended for `path`: the model's training
+                    # prior from vault/fs primitives binds `h["path"]` as the
+                    # natural read; canonical here is `file` for grep-like
+                    # ergonomics. Mirroring as alias avoids the second
+                    # whole-turn KeyError observed in the 2026-05-04 Loop2
+                    # bench (cells 6/9 attempting fs.read on a guessed path
+                    # they would have read off h["path"]).
                     results.append({
                         "file": path,
+                        "path": path,
                         "line": i,
-                        "snippet": line.strip()[:200],
+                        "snippet": snippet,
+                        "text": snippet,
                     })
                     if len(results) >= limit:
+                        # Identifier hint: if query looks like a symbol name and
+                        # find_symbol has exact definition matches, nudge the model
+                        # toward the more precise primitive.
+                        self._maybe_hint_find_symbol(query, results)
                         return results
+        # Empty-result hint: the model may be searching for something outside
+        # the indexed workspace. Suggest shell.run("grep ...") as fallback.
+        if not results:
+            print(f'NOTE: 0 results for "{query}" across {len(self.files)} indexed files.')
+            print(f"  If the target is outside this workspace, use: shell.run(\"grep -r {query} /path\")")
+        else:
+            self._maybe_hint_find_symbol(query, results)
         return results
+
+    def _maybe_hint_find_symbol(self, query: str, results: list[dict]) -> None:
+        """Print a hint if query looks like an identifier and find_symbol has matches."""
+        # Heuristic: identifiers are CamelCase, snake_case, or single words
+        # with no spaces. Skip short queries that are likely substrings.
+        if " " in query or len(query) < 4:
+            return
+        is_identifier = (
+            query[0].isupper()  # CamelCase
+            or "_" in query     # snake_case
+            or query.isidentifier()
+        )
+        if not is_identifier:
+            return
+        defs = self.find_symbol(query)
+        if defs:
+            sites = ", ".join(f"{d['file']}:{d['line']}" for d in defs[:3])
+            print(f'NOTE: {len(defs)} exact definition(s) found via codebase.find_symbol("{query}"):')
+            print(f"  {sites}")
+            print("  Use find_symbol for definition-only matches (functions, classes, methods).")
 
     def find_symbol(self, name: str) -> list[dict]:
         """

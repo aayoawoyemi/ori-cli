@@ -6,6 +6,8 @@ import { StatusBar } from './statusBar.js';
 import { Spinner } from './spinner.js';
 import { ModelPicker } from './modelPicker.js';
 import { agentLoop, type LoopEvent, type PermissionMode, type PermissionDecision } from '../loop.js';
+import { agentLoop3, type Loop3Event } from '../loop3/agent.js';
+import { AnthropicToolUseAdapter } from '../loop3/adapters/anthropic.js';
 import { PermissionDialog } from './permissionDialog.js';
 import { AskDialog } from './askDialog.js';
 import { PlanApprovalDialog, type PlanAcceptMode } from './planApprovalDialog.js';
@@ -18,12 +20,12 @@ import { ResumePicker } from './resumePicker.js';
 import { figures, colors } from './theme.js';
 import { UsageTracker, formatTokenCount, formatCost, formatDuration } from '../telemetry/tracker.js';
 import { ModelRouter, type EffortLevel } from '../router/index.js';
-import type { ToolCall } from '../router/types.js';
+import type { Message, SystemPromptInput, ToolCall } from '../router/types.js';
+import { buildComposeRequestSystemPrompt } from '../prompt.js';
 import type { ToolRegistry } from '../tools/registry.js';
 import type { OriVault } from '../memory/vault.js';
 import type { ProjectBrain } from '../memory/projectBrain.js';
 import type { SessionStorage } from '../session/storage.js';
-import type { Message } from '../router/types.js';
 // syncSession removed 2026-04-29. It performed three auto-vault-writes on
 // every session exit (final postflight reflection, ungated session-end
 // reflection, session-metadata note). All were LLM-synthesized noise that
@@ -34,6 +36,9 @@ import type { ReplHandle } from '../repl/setup.js';
 import { runResearch } from '../research/index.js';
 import type { ResearchDepth } from '../research/types.js';
 import { ResearchJournal, type ResearchJournalHandle } from './researchJournal.js';
+import { classifyRequestMode, newRequestId, type RequestMode } from '../compose/router.js';
+import { ComposeController } from '../compose/controller.js';
+import { ComposeDisplayFilter, renderComposeBlocksForDisplay } from '../compose/display.js';
 
 interface AppProps {
   agentName: string;
@@ -43,15 +48,190 @@ interface AppProps {
   vault: OriVault | null;
   projectBrain: ProjectBrain | null;
   session: SessionStorage;
-  systemPrompt: string;
+  systemPrompt: SystemPromptInput;
   hooks: HooksConfig;
   vaultNoteCount?: number;
   initialPrompt?: string;
   initialPermissionMode?: PermissionMode;
   replHandle?: ReplHandle | null;
+  getReplHandle?: () => ReplHandle | null;
   resumedMessages?: Message[] | null;
   initialResumePicker?: boolean;
   experimental?: ExperimentalConfig;
+}
+
+function formatLoop3ExecutionOutput(event: Extract<Loop3Event, { type: 'action_executed' }>): string {
+  const result = event.result;
+  const stdout = stdoutWithoutSayEcho(result.stdout, result.sayTexts);
+  const parts = [
+    ...result.sayTexts,
+    stdout,
+    result.stderr,
+    result.exception,
+    result.rejectedReason,
+    result.timedOut ? 'timeout' : '',
+  ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+  if (result.doneValue !== undefined) {
+    parts.push(formatDoneValueForDisplay(result.doneValue));
+  }
+  if (typeof result.runtime?.footer === 'string' && result.runtime.footer.trim()) {
+    parts.push(result.runtime.footer.trim());
+  }
+  return parts.join('\n') || 'ok';
+}
+
+function formatDoneValueForDisplay(value: unknown): string {
+  if (typeof value === 'string') return value;
+  const planSummary = summarizePlanCreateValue(value);
+  if (planSummary) return planSummary;
+  return JSON.stringify(value, null, 2);
+}
+
+function summarizePlanCreateValue(value: unknown): string | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (record.ok !== true || typeof record.path !== 'string') return null;
+  if (typeof record.goal !== 'string' && typeof record.phase_count !== 'number') return null;
+
+  const goal = typeof record.goal === 'string' && record.goal.trim()
+    ? ` goal="${record.goal.trim().slice(0, 80)}"`
+    : '';
+  const layers = typeof record.layer_count === 'number' ? ` layers=${record.layer_count}` : '';
+  const phases = typeof record.phase_count === 'number' ? ` phases=${record.phase_count}` : '';
+  const warnings = Array.isArray(record.warnings) && record.warnings.length > 0
+    ? ` warnings=${record.warnings.length}`
+    : '';
+  return `plan.create: ok${goal}${layers}${phases}${warnings} path=${record.path}`;
+}
+
+function summarizePlanCreateText(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
+  try {
+    return summarizePlanCreateValue(JSON.parse(trimmed));
+  } catch {
+    return null;
+  }
+}
+
+function stdoutWithoutSayEcho(stdoutRaw: string, sayTexts: string[]): string {
+  let stdout = stdoutRaw.trim();
+  for (const say of sayTexts) {
+    const text = say.trim();
+    if (!text) continue;
+    if (stdout === text) return '';
+    if (stdout.startsWith(`${text}\n`)) stdout = stdout.slice(text.length).trimStart();
+    if (stdout.endsWith(`\n${text}`)) stdout = stdout.slice(0, -text.length).trimEnd();
+  }
+  return stdout;
+}
+
+function parseGoalTrigger(input: string): string | null {
+  const match = input.match(/^(#goal|\\goal)\b\s*/i);
+  if (!match) return null;
+  return input.slice(match[0].length).trim();
+}
+
+function buildGoalModePrompt(goalText: string): string {
+  return `Goal mode requested.
+
+User goal:
+${goalText || '(not yet specified)'}
+
+Refine the goal before implementation. If the goal is ambiguous, ask concise clarifying questions with say()/ask(). Once it is sharp, call spanner.escalate(reason, layers=...) and create a detailed plan with plan.create(...). The plan must use Layer -> Phase -> Composition structure: each phase declares intent, primitives, produces, and composition. Execute planned phases with plan.enter_phase(id), one or two composed Repl cells, and plan.exit_phase(id, outputs).`;
+}
+
+function buildHeadlessChildInvocation(task: string): { command: string; args: string[] } {
+  const entry = process.argv[1];
+  if (entry && /\.(?:ts|tsx)$/i.test(entry)) {
+    return {
+      command: process.platform === 'win32' ? 'npx.cmd' : 'npx',
+      args: ['tsx', entry, '--headless', task],
+    };
+  }
+  if (entry) {
+    return {
+      command: process.execPath,
+      args: [entry, '--headless', task],
+    };
+  }
+  return {
+    command: process.platform === 'win32' ? 'npx.cmd' : 'npx',
+    args: ['tsx', 'src/index.ts', '--headless', task],
+  };
+}
+
+function capHeadlessText(text: string, maxChars = 20_000): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= maxChars) return trimmed;
+  const hidden = trimmed.length - maxChars;
+  return `${trimmed.slice(0, maxChars)}\n\n[${hidden} chars truncated]`;
+}
+
+const MAX_HISTORY_SEGMENTS = 40;
+const MAX_HISTORY_TEXT_CHARS = 4000;
+const MAX_HISTORY_SAYS = 12;
+
+function truncateForHistory(text: string, maxChars = MAX_HISTORY_TEXT_CHARS): string {
+  if (text.length <= maxChars) return text;
+  const hidden = text.length - maxChars;
+  return `[${hidden} chars hidden]\n${text.slice(-maxChars)}`;
+}
+
+function compactToolForHistory(tool: DisplayToolCall): DisplayToolCall {
+  return {
+    ...tool,
+    summary: truncateForHistory(tool.summary, 800),
+    resultPreview: tool.resultPreview ? truncateForHistory(tool.resultPreview, 3000) : tool.resultPreview,
+    says: tool.says
+      ? tool.says.slice(-MAX_HISTORY_SAYS).map(s => truncateForHistory(s, 1200))
+      : tool.says,
+  };
+}
+
+function compactSegmentsForHistory(segments: StreamSegment[]): StreamSegment[] {
+  return segments.slice(-MAX_HISTORY_SEGMENTS).map(seg => {
+    if (seg.type === 'text') {
+      return { ...seg, content: truncateForHistory(seg.content) };
+    }
+    if (seg.type === 'thinking') {
+      return { ...seg, content: truncateForHistory(seg.content, 2000) };
+    }
+    return { ...seg, data: compactToolForHistory(seg.data) };
+  });
+}
+
+function mapLoop3EventToLoopEvents(event: Loop3Event): LoopEvent[] {
+  switch (event.type) {
+    case 'model_start':
+      return [{ type: 'model_start', turn: event.turn, model: event.provider }];
+    case 'action_start':
+      return [{ type: 'tool_call', toolCall: event.toolCall }];
+    case 'action_denied':
+      return [{ type: 'tool_denied', id: event.toolCall.id, name: event.toolCall.name }];
+    case 'action_executed':
+      return [{
+        type: 'tool_result',
+        id: event.toolCall.id,
+        name: event.toolCall.name,
+        output: formatLoop3ExecutionOutput(event).slice(0, 4000),
+        output_full: formatLoop3ExecutionOutput(event),
+        isError: event.result.exception !== null || event.result.rejectedReason !== null || event.result.timedOut,
+      }];
+    case 'turn_complete':
+      return [{
+        type: 'turn_complete',
+        turn: event.turn,
+        tokenEstimate: event.tokenEstimate,
+        toolCallCount: event.cellCount > 0 ? 1 : 0,
+        toolNames: event.cellCount > 0 ? ['Repl'] : [],
+        replCellCount: event.cellCount,
+      }];
+    case 'done_committed':
+      return [];
+    default:
+      return [event as LoopEvent];
+  }
 }
 
 export function App(props: AppProps): React.ReactElement {
@@ -59,10 +239,12 @@ export function App(props: AppProps): React.ReactElement {
   const {
     agentName, cwd, router, registry, vault, projectBrain,
     session, systemPrompt, hooks, vaultNoteCount, initialPrompt,
-    initialPermissionMode, replHandle,
+    initialPermissionMode, replHandle: initialReplHandle,
     resumedMessages: initialResumedMessages, initialResumePicker,
     experimental,
+    getReplHandle,
   } = props;
+  const [replHandle, setReplHandle] = useState<ReplHandle | null>(initialReplHandle ?? null);
 
   // ── State ───────────────────────────────────────────────────────────
   const [displayMessages, setDisplayMessages] = useState<DisplayMessage[]>([]);
@@ -86,9 +268,32 @@ export function App(props: AppProps): React.ReactElement {
   const [researchRunning, setResearchRunning] = useState(false);
   const researchJournalRef = useRef<ResearchJournalHandle | null>(null);
   const researchAbortRef = useRef<AbortController | null>(null);
+  const researchRunningRef = useRef(false);
+  const isLoadingRef = useRef(false);
   const planApprovalResolveRef = useRef<((r: PlanApprovalResult) => void) | null>(null);
   const [exitWarningAt, setExitWarningAt] = useState<number | null>(null);
   const [displayMode, setDisplayMode] = useState<DisplayMode>('normal');
+  // Body drift indicator: true when the running Python body subprocess was
+  // started before the current source on disk. Body code does not hot-reload,
+  // so structural body changes (e.g. the planned-phase composition wall) do
+  // not take effect until the user restarts the CLI. Set by polling the
+  // bridge — the bridge captures the body's contentHash on each pong and
+  // compares against the on-disk hash. See body/version.py + bridge.ts:
+  // checkBodyDrift. Surfaced in the StatusBar so the user knows when
+  // dogfooding signal is unreliable.
+  const [bodyStale, setBodyStale] = useState<boolean>(false);
+  // Compose sub-loop request mode. Set by classifyRequestMode in handleSubmit
+  // when a top-level user message arrives; reset to null when the agentLoop3
+  // generator finishes. Surfaced in the StatusBar so the user can see which
+  // lane (quick / compose / goal) the auto-router picked. Tier 1 of the
+  // compose sub-loop only TRACKS the mode for telemetry; the scratch
+  // substrate (Tier 2) and gate (Tier 3) build on top of it.
+  const [currentRequestMode, setCurrentRequestMode] = useState<RequestMode | null>(null);
+  // Track isLoading transitions so we can reset currentRequestMode when a
+  // request finishes. Multiple call sites set isLoading(false) (normal
+  // completion, abort, error); a single useEffect catching the transition
+  // is cleaner than touching each site.
+  const prevIsLoadingRef = useRef<boolean>(false);
   const [pendingPermission, setPendingPermission] = useState<{
     toolCall: ToolCall;
     resolve: (decision: PermissionDecision) => void;
@@ -106,6 +311,8 @@ export function App(props: AppProps): React.ReactElement {
   const [sessionTitle, setSessionTitle] = useState<string | null>(null);
   const [pasteStatus, setPasteStatus] = useState<string | null>(null);
   const [pendingCount, setPendingCount] = useState(0);
+  const [gitBranch, setGitBranch] = useState<string | null>(null);
+  const [indexedFiles, setIndexedFiles] = useState<number | undefined>(undefined);
   const pasteStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Conversation messages for the loop (mutable ref to avoid stale closures)
@@ -114,6 +321,12 @@ export function App(props: AppProps): React.ReactElement {
   const alwaysAllowRef = useRef(new Set<string>());
   const trackerRef = useRef(new UsageTracker(session.sessionId, router.current.model));
   const toolTimingRef = useRef(new Map<string, number>());
+  // Tracks the id of the currently-executing tool call. Set on tool_call,
+  // cleared on tool_result/denied. Used by setOnSay to route say() output
+  // to the right segment by id, not by index. Eagerly synced on the JS
+  // event loop, so it stays consistent across bridge callbacks even when
+  // React has not yet flushed pending setStreamSegments updates.
+  const activeToolIdRef = useRef<string | null>(null);
   const turnCountRef = useRef(0);
   // Input queue: messages typed while the model is running. Drained as one
   // combined message on turn complete. Cleared on abort so stale queued
@@ -124,24 +337,61 @@ export function App(props: AppProps): React.ReactElement {
   const textBufferRef = useRef('');
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const segmentsRef = useRef<StreamSegment[]>([]);
+  const composeDisplayFilterRef = useRef(new ComposeDisplayFilter());
+
+  useEffect(() => {
+    isLoadingRef.current = isLoading;
+  }, [isLoading]);
+
+  useEffect(() => {
+    researchRunningRef.current = researchRunning;
+  }, [researchRunning]);
+
+  const interruptActiveRun = useCallback((): boolean => {
+    if (researchRunningRef.current && researchAbortRef.current) {
+      researchAbortRef.current.abort();
+      setDisplayMessages(prev => [...prev, { role: 'system', text: 'Interrupt requested', subtype: 'info' }]);
+      return true;
+    }
+    if (isLoadingRef.current && abortRef.current) {
+      abortRef.current.abort();
+      setActiveTool(undefined);
+      setDisplayMessages(prev => [...prev, { role: 'system', text: 'Interrupt requested', subtype: 'info' }]);
+      return true;
+    }
+    return false;
+  }, []);
+
+  useEffect(() => {
+    const onSigint = () => {
+      interruptActiveRun();
+    };
+    process.on('SIGINT', onSigint);
+    return () => {
+      process.off('SIGINT', onSigint);
+    };
+  }, [interruptActiveRun]);
 
   const flushTextBuffer = useCallback(() => {
     flushTimerRef.current = null;
     if (!textBufferRef.current) return;
     const buffered = textBufferRef.current;
     textBufferRef.current = '';
-    // Append to last text segment, or create a new one
-    setStreamSegments(prev => {
-      const segs = [...prev];
-      const last = segs[segs.length - 1];
-      if (last && last.type === 'text') {
-        segs[segs.length - 1] = { type: 'text', content: last.content + buffered };
-      } else {
-        segs.push({ type: 'text', content: buffered });
-      }
-      segmentsRef.current = segs;
-      return segs;
-    });
+    // Eager ref sync: write segmentsRef BEFORE setStreamSegments so other
+    // synchronous readers (e.g. the bridge's setOnSay callback firing between
+    // React commits) see the fresh value. Putting the sync inside a functional
+    // updater is unsafe — React 18 may defer the updater past the next bridge
+    // event, leaving readers with stale state. Pattern: read from ref, mutate,
+    // write ref, push to setState.
+    const segs = [...segmentsRef.current];
+    const last = segs[segs.length - 1];
+    if (last && last.type === 'text') {
+      segs[segs.length - 1] = { type: 'text', content: last.content + buffered };
+    } else {
+      segs.push({ type: 'text', content: buffered });
+    }
+    segmentsRef.current = segs;
+    setStreamSegments(segs);
   }, []);
 
   const bufferText = useCallback((text: string) => {
@@ -152,6 +402,28 @@ export function App(props: AppProps): React.ReactElement {
   }, [flushTextBuffer]);
 
   // ── Load resumed messages on mount ──────────────────────────────────
+  // ── Git branch detection (once on mount) ─────────────────────────────
+  useEffect(() => {
+    try {
+      const branch = require('node:child_process')
+        .execSync('git rev-parse --abbrev-ref HEAD', { cwd, encoding: 'utf-8', timeout: 2000 })
+        .trim();
+      setGitBranch(branch);
+    } catch { /* not a git repo */ }
+  }, [cwd]);
+
+
+  useEffect(() => {
+    if (!getReplHandle) return;
+    const update = () => {
+      const next = getReplHandle();
+      setReplHandle(prev => prev === next ? prev : next);
+    };
+    update();
+    const timer = setInterval(update, 250);
+    return () => clearInterval(timer);
+  }, [getReplHandle]);
+
   useEffect(() => {
     if (initialResumedMessages && initialResumedMessages.length > 0) {
       messagesRef.current = initialResumedMessages;
@@ -182,13 +454,7 @@ export function App(props: AppProps): React.ReactElement {
     // Ctrl+C → exit
     if (key.ctrl && input === 'c') {
       // If a research run is live, Ctrl+C aborts it first.
-      if (researchRunning && researchAbortRef.current) {
-        researchAbortRef.current.abort();
-        return;
-      }
-      // If loading, first Ctrl+C interrupts; second exits
-      if (isLoading && abortRef.current) {
-        abortRef.current.abort();
+      if (interruptActiveRun()) {
         return;
       }
       // Not loading — double Ctrl+C to exit
@@ -212,12 +478,7 @@ export function App(props: AppProps): React.ReactElement {
         setShowModelPicker(false);
         return;
       }
-      if (researchRunning && researchAbortRef.current) {
-        researchAbortRef.current.abort();
-        return;
-      }
-      if (isLoading && abortRef.current) {
-        abortRef.current.abort();
+      if (interruptActiveRun()) {
         return;
       }
     }
@@ -239,7 +500,7 @@ export function App(props: AppProps): React.ReactElement {
       return;
     }
 
-    // Alt+Z → toggle explore mode (Repl-only, no mutations)
+    // Alt+Z → toggle explore mode (code-only, no mutations)
     if (key.meta && input === 'z') {
       if (!isLoading) {
         setTaskMode(prev => {
@@ -247,7 +508,7 @@ export function App(props: AppProps): React.ReactElement {
           setDisplayMessages(p => [...p, {
             role: 'system',
             text: next === 'explore'
-              ? '🔍 Explore mode — read-only. Only Repl, VaultAdd, ProjectSave visible. Alt+Z to exit.'
+              ? '🔍 Explore mode — read-only. Only code, VaultAdd, ProjectSave visible. Alt+Z to exit.'
               : '⚡ Normal mode restored.',
             subtype: 'info',
           }]);
@@ -369,15 +630,72 @@ export function App(props: AppProps): React.ReactElement {
   //   revisit if it actually happens in usage.
   useEffect(() => {
     if (!replHandle) return;
+    // Fetch indexed file count when the bridge becomes available.
+    // The background index may already be done by the time replHandle lands.
     replHandle.bridge.setOnSay((text: string) => {
+      // Attribute say() output to the Repl call that produced it. The bridge
+      // doesn't pass call_id, but Repl calls are sequential — the most recent
+      // unresolved tool segment is the active one. Routing here keeps the
+      // voice visually inside the Repl block instead of fragmenting the
+      // turn into separate ● bubbles per say(). Falls back to displayMessages
+      // if no active tool (e.g. say() fired outside a Repl execution path).
+      const activeId = activeToolIdRef.current;
+      if (activeId) {
+        const segs = segmentsRef.current;
+        const idx = segs.findIndex(s => s.type === 'tool' && s.data.id === activeId);
+        if (idx >= 0) {
+          const target = segs[idx];
+          if (target && target.type === 'tool') {
+            const next = [...segs];
+            next[idx] = {
+              type: 'tool',
+              data: { ...target.data, says: [...(target.data.says ?? []), text] },
+            };
+            segmentsRef.current = next;
+            setStreamSegments(next);
+            return;
+          }
+        }
+      }
+      // Fallback — say() fired with no active tool (e.g. before the first
+      // exec lands in segments, or after the tool resolved in a race). Push
+      // as a standalone assistant message so the voice isn't lost.
       setDisplayMessages(prev => [...prev, { role: 'assistant', text }]);
     });
     replHandle.bridge.setOnAsk((id: number, question: string) => {
+      session.log({
+        type: 'loop3_ask',
+        phase: 'shown',
+        id,
+        question_chars: question.length,
+        question_head: question.length <= 1000 ? question : question.slice(0, 1000),
+        timestamp: Date.now(),
+      });
       setPendingAsk({ id, question });
     });
+    // Fetch indexed file count. Uses print() so the result lands in stdout
+    // without triggering the setOnSay callback we just installed.
+    replHandle.bridge.exec({ code: 'print(codebase.stats()["file_count"])' }).then(r => {
+      const n = parseInt(r.stdout?.trim() ?? '', 10);
+      if (!isNaN(n)) setIndexedFiles(n);
+    }).catch(() => {});
+    // Body drift watcher: poll the bridge every ~5s. The bridge captures
+    // body version + content hash on every heartbeat pong; stale === true
+    // means the on-disk body source has changed since the body process
+    // started. Polling (vs subscribing to body_drift events) is intentional:
+    // it auto-recovers when the user finally restarts (poll observes the
+    // false → true → false transition) without needing a separate "recovered"
+    // event. 5s is fast enough to surface within one user turn, slow enough
+    // not to thrash file IO walking body/*.py.
+    const driftInterval = setInterval(() => {
+      const stale = replHandle.bridge.isBodyStale();
+      if (stale === null) return; // not yet captured
+      setBodyStale(prev => prev === stale ? prev : stale);
+    }, 5000);
     return () => {
       replHandle.bridge.setOnSay(null);
       replHandle.bridge.setOnAsk(null);
+      clearInterval(driftInterval);
     };
   }, [replHandle]);
 
@@ -385,6 +703,15 @@ export function App(props: AppProps): React.ReactElement {
   const handleModelSelect = useCallback((model: string, effort: EffortLevel) => {
     try {
       router.setModel(`${model} ${effort}`);
+      session.updateMeta({ model: router.info.model });
+      session.log({
+        type: 'model_selected',
+        provider: router.info.name,
+        model: router.info.model,
+        effort: router.info.effort,
+        shortcut: router.info.shortcut,
+        timestamp: Date.now(),
+      });
       setShowModelPicker(false);
       setDisplayMessages(prev => [...prev, {
         role: 'assistant',
@@ -483,15 +810,143 @@ export function App(props: AppProps): React.ReactElement {
     setPendingCount(pendingInputRef.current.length);
   }, []);
 
+  // ── Mid-turn steering queue (2026-05-01) ───────────────────────────────
+  // Distinct from pendingInputRef:
+  //   - pendingInput: typed input becomes a NEW user submission AFTER
+  //     this agentLoop returns (handleSubmit recursion at L716-720).
+  //     Restarts the conversational arc — fresh turn, no goal context.
+  //   - steeringQueueRef: typed input drains at the TOP of the next loop
+  //     iteration INSIDE this agentLoop. Same goal context preserved;
+  //     model sees the steer as a user message between assistant turns.
+  //
+  // Mid-stream abort+reinject (Pi's pattern) is NOT done here yet —
+  // requires per-turn abort controllers since AbortSignal is single-use.
+  // Steering takes effect at the next natural turn boundary instead.
+  // Still meaningful: when the loop runs many turns (goal pursuit, tool-
+  // call chains), the user can redirect WITHOUT restarting the goal.
+  // Mid-stream interrupt is a future enhancement.
+  const steeringQueueRef = useRef<string[]>([]);
+  const [steerCount, setSteerCount] = useState(0);
+  const handleSteer = useCallback((text: string) => {
+    steeringQueueRef.current.push(text);
+    setSteerCount(steeringQueueRef.current.length);
+  }, []);
+
+  // Reset the compose-sub-loop mode indicator when the request loop ends.
+  // Triggers on the isLoading true→false transition (any path: completion,
+  // abort, error). Initial render has prev=false / isLoading=false so the
+  // condition stays false until a real request runs first.
+  useEffect(() => {
+    if (prevIsLoadingRef.current && !isLoading) {
+      setCurrentRequestMode(null);
+    }
+    prevIsLoadingRef.current = isLoading;
+  }, [isLoading]);
+
+  // The loop drains steeringQueueRef when it picks up the messages (mid-batch
+  // checkSteering or top-of-iteration drain). Sync the React-visible counter
+  // back down on a timer so the status pill clears when the loop consumed
+  // the queue. Cheap polling — fires only while the count is non-zero.
+  useEffect(() => {
+    if (steerCount === 0) return;
+    const t = setInterval(() => {
+      const live = steeringQueueRef.current.length;
+      if (live !== steerCount) setSteerCount(live);
+    }, 250);
+    return () => clearInterval(t);
+  }, [steerCount]);
+
   // ── Handle user input ───────────────────────────────────────────────
   const handleSubmit = useCallback(async (input: string, images?: AttachedImage[]) => {
     const trimmed = input.trim();
     if (!trimmed && !images?.length) return;
 
     // ── Slash commands ──────────────────────────────────────────────
+    // Slash commands are dispatched BEFORE mode classification because
+    // /compose, /quick, /goal etc. transform input into a #-prefixed string
+    // and re-enter handleSubmit (e.g. /compose foo → handleSubmit("#compose foo")).
+    // The classifier picks up that prefix on the second pass.
     if (trimmed.startsWith('/')) {
       await handleSlashCommand(trimmed);
       return;
+    }
+
+    // ── Compose sub-loop: classify mode, generate request id ────────
+    // The classifier strips any #compose / #quick / #goal marker and
+    // returns the mode + cleaned text. The model never sees the marker —
+    // it's a harness-only signal. For goal mode we still wrap with the
+    // legacy buildGoalModePrompt for now; the full Codex-style goal
+    // runtime ships in a later tier and replaces that path entirely.
+    const classification = classifyRequestMode(trimmed);
+    const requestId = newRequestId();
+    setCurrentRequestMode(classification.mode);
+    session.log({
+      type: 'request_mode_selected' as any,
+      request_id: requestId,
+      mode: classification.mode,
+      reason: classification.reason,
+      matched_trigger: classification.matchedTrigger,
+      input_chars: trimmed.length,
+      timestamp: Date.now(),
+    } as any);
+    const modelInput = classification.mode === 'goal'
+      ? buildGoalModePrompt(classification.cleanedText)
+      : classification.cleanedText;
+
+    // ── Compose sub-loop: instantiate controller for this request ─────
+    // The controller is the in-memory state machine for the gate. It
+    // parses <compose_preflight> / <compose_update> blocks out of the
+    // model's text and decides whether the next Repl call may execute.
+    // Lives only for this request — discarded when handleSubmit returns.
+    // onEvent forwards telemetry to the session log so bench rollups can
+    // measure preflight coverage, gate rejections, scout overruns, etc.
+    const composeController = new ComposeController({
+      mode: classification.mode,
+      requestId,
+      onEvent: (e) => session.log({ ...e, timestamp: Date.now() } as any),
+    });
+    const activeReplHandle = getReplHandle?.() ?? replHandle;
+    const isComposeRequest = classification.mode === 'compose' || classification.mode === 'goal';
+
+    // ── Compose substrate: configure body for this request, create scratch ──
+    // The body needs session_id + request_id to compute the per-request
+    // scratch markdown path. We re-configure on every submit (cheap op,
+    // ~2ms) so the body always knows which request scope is active. For
+    // compose/goal mode we also fire scratch_start to materialize the file
+    // with the user request pre-filled. Quick mode skips scratch creation.
+    if (activeReplHandle?.bridge) {
+      try {
+        await activeReplHandle.bridge.configure({
+          sessionId: session.sessionId,
+          requestId,
+          composeMode: classification.mode,
+        });
+        if (isComposeRequest) {
+          const intent = classification.cleanedText.split(/\r?\n/, 1)[0]?.slice(0, 120) ?? '';
+          await activeReplHandle.bridge.composeStart({
+            intent,
+            userRequest: classification.cleanedText,
+            mode: classification.mode === 'goal' ? 'goal' : 'compose',
+          });
+          session.log({
+            type: 'scratch_created' as any,
+            request_id: requestId,
+            mode: classification.mode,
+            intent_chars: intent.length,
+            timestamp: Date.now(),
+          } as any);
+        }
+      } catch (err) {
+        // Scratch creation is best-effort — never block the request on it.
+        // The body footer will show "scratch: (none)" and the gate (Tier 3)
+        // will fall back to no-op when no scratch exists.
+        session.log({
+          type: 'scratch_setup_error' as any,
+          request_id: requestId,
+          error: (err as Error)?.message ?? String(err),
+          timestamp: Date.now(),
+        } as any);
+      }
     }
 
     // ── Shell passthrough ───────────────────────────────────────────
@@ -518,7 +973,7 @@ export function App(props: AppProps): React.ReactElement {
     const hasImages = images && images.length > 0;
     const contentBlocks = hasImages
       ? [
-          ...(trimmed ? [{ type: 'text' as const, text: trimmed }] : []),
+          ...(modelInput ? [{ type: 'text' as const, text: modelInput }] : []),
           ...images!.map(img => ({
             type: 'image' as const,
             source: {
@@ -528,7 +983,7 @@ export function App(props: AppProps): React.ReactElement {
             },
           })),
         ]
-      : trimmed;
+      : modelInput;
 
     const displayText = hasImages
       ? trimmed || `[${images!.length} image${images!.length > 1 ? 's' : ''} attached]`
@@ -541,23 +996,15 @@ export function App(props: AppProps): React.ReactElement {
     setStreamSegments([]);
     segmentsRef.current = [];
     textBufferRef.current = '';
+    composeDisplayFilterRef.current.reset();
     if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
 
-    // In cerebral mode, prepend a hard execution constraint to every user turn
-    let finalContent: typeof contentBlocks;
-    if (displayMode === 'cerebral') {
-      const prefix = '[CEREBRAL MODE] Execute directly. Zero narration. No "let me", no "I will", no explaining what you\'re about to do. Tool calls only until you have a final result. One sentence max at the end.\n\n';
-      if (typeof contentBlocks === 'string') {
-        finalContent = prefix + contentBlocks;
-      } else {
-        const [first, ...rest] = contentBlocks;
-        const firstText = first && 'text' in first ? first.text : '';
-        finalContent = [{ type: 'text' as const, text: prefix + firstText }, ...rest];
-      }
-    } else {
-      finalContent = contentBlocks;
-    }
-    messagesRef.current.push({ role: 'user', content: finalContent });
+    // 2026-05-01: 'cerebral' mode prefix injection removed. The prefix told
+    // the model "Execute directly. Zero narration. Tool calls only." — which
+    // suppressed both narration AND thinking, despite the name. With adaptive
+    // thinking now enabled (anthropic.ts), the model self-regulates reasoning
+    // depth; we no longer need a per-turn prefix to fight that.
+    messagesRef.current.push({ role: 'user', content: contentBlocks });
     session.log({ type: 'user', content: displayText, timestamp: Date.now() });
 
     let fullText = '';
@@ -576,9 +1023,65 @@ export function App(props: AppProps): React.ReactElement {
         cwd.split(/[\\/]/).pop() ?? '', // project dir name
       ].filter(Boolean).join(', ');
 
-      const loop = agentLoop({
+      // Loop3 is the default interactive runtime as of 2026-05-06. Architecture:
+      // single Repl tool, code-only action surface, all discovery/edits go through
+      // Python primitives. Bench (bench/2026-04 head-to-head, 3/3 wins, 30-60%
+      // wall-clock improvement) validated Loop3 vs Loop2 in headless mode; flipping
+      // the interactive default here so daily-driver use lands on Loop3 too.
+      // Legacy loop (the original `agentLoop` from src/loop.ts with 14+ top-level
+      // tools — Read/Edit/Bash/Grep/Glob/Web*/Vault*/Project*) stays available as
+      // an opt-out via ARIES_LEGACY_LOOP=1 for fallback while we shake out Loop3
+      // friction in interactive mode. Loop2 was never supported in interactive.
+      const useLoop3Interactive = process.env.ARIES_LEGACY_LOOP !== '1';
+      const buildLoopSystemPrompt = async (): Promise<SystemPromptInput> => {
+        if (!isComposeRequest) return systemPrompt;
+        let scratchContent = '';
+        let scratchError: string | undefined;
+        let verificationFilled = false;
+        const bridge = (getReplHandle?.() ?? activeReplHandle)?.bridge;
+        if (bridge) {
+          try {
+            const scratch = await bridge.composeRead();
+            scratchContent = scratch.content ?? '';
+            scratchError = scratch.error;
+            verificationFilled = Array.isArray(scratch.status?.sections_filled)
+              && scratch.status.sections_filled.includes('verification');
+          } catch (err) {
+            scratchError = err instanceof Error ? err.message : String(err);
+          }
+        } else {
+          scratchError = 'bridge unavailable';
+        }
+        return buildComposeRequestSystemPrompt(systemPrompt, {
+          mode: classification.mode === 'goal' ? 'goal' : 'compose',
+          requestId,
+          scratchContent,
+          scratchError,
+          verificationFilled,
+        });
+      };
+      const loop = useLoop3Interactive
+        ? agentLoop3({
+          messages: messagesRef.current,
+          systemPrompt: buildLoopSystemPrompt,
+          adapter: new AnthropicToolUseAdapter(router),
+          replHandle: activeReplHandle,
+          session,
+          estimateTokens: (m) => router.current.estimateTokens(m),
+          signal: abort.signal,
+          permissionMode: permissionModeRef.current,
+          permissionModeRef,
+          alwaysAllowTools: alwaysAllowRef.current,
+          onPermissionRequest: (tc: ToolCall) => {
+            return new Promise<PermissionDecision>((resolve) => {
+              setPendingPermission({ toolCall: tc, resolve });
+            });
+          },
+          composeController,
+        })
+        : agentLoop({
         messages: messagesRef.current,
-        systemPrompt,
+        systemPrompt: await buildLoopSystemPrompt(),
         router,
         registry,
         toolContext: { cwd, signal: abort.signal },
@@ -593,10 +1096,10 @@ export function App(props: AppProps): React.ReactElement {
         permissionModeRef, // live ref — loop re-reads each turn for mid-loop mode changes (ExitPlanMode)
         alwaysAllowTools: alwaysAllowRef.current,
         identityContext: identityCtx,
-        maxSubagents: 5,
         dynamicTools: true,
         planFilePathRef,
         taskMode,
+        steeringQueueRef, // mid-turn user input for steer-and-reinject
         onPermissionRequest: (tc: ToolCall) => {
           return new Promise<PermissionDecision>((resolve) => {
             setPendingPermission({ toolCall: tc, resolve });
@@ -609,10 +1112,12 @@ export function App(props: AppProps): React.ReactElement {
           interrupted = true;
           break;
         }
-        handleLoopEvent(event, (text) => {
+        const uiEvents = useLoop3Interactive ? mapLoop3EventToLoopEvents(event as Loop3Event) : [event as LoopEvent];
+        for (const uiEvent of uiEvents) {
+        handleLoopEvent(uiEvent, (text) => {
           fullText += text;
           if (displayMode === 'quiet') {
-            if (event.type === 'text') {
+            if (uiEvent.type === 'text') {
               displayText2 += text;
             }
           } else {
@@ -620,11 +1125,12 @@ export function App(props: AppProps): React.ReactElement {
             bufferText(text);
           }
         });
-        if (event.type === 'tool_call') {
+        if (uiEvent.type === 'tool_call') {
           hasSeenToolCall = true;
           if (displayMode === 'quiet') {
             displayText2 = '';
           }
+        }
         }
       }
     } catch (err) {
@@ -635,6 +1141,44 @@ export function App(props: AppProps): React.ReactElement {
       }
     }
     abortRef.current = null;
+
+    // ── Compose substrate: close the per-request scratch markdown ────
+    // Idempotent — body's scratch.close no-ops when no file exists. We
+    // fire on every request termination path (normal, error, abort) by
+    // running this after the try/catch. Quick mode never had a scratch
+    // open so the close is a cheap no-op there. The body sweeper handles
+    // any file that survives a CLI crash via 24h orphan cleanup.
+    if (activeReplHandle?.bridge && isComposeRequest) {
+      try {
+        await activeReplHandle.bridge.composeClose();
+        const composeTelemetry = composeController.telemetry();
+        session.log({
+          type: 'scratch_closed' as any,
+          request_id: requestId,
+          mode: classification.mode,
+          terminated_via: interrupted ? 'abort' : (fullText.includes('\n\nError:') ? 'error' : 'natural'),
+          ...composeTelemetry,
+          timestamp: Date.now(),
+        } as any);
+      } catch (err) {
+        session.log({
+          type: 'scratch_close_error' as any,
+          request_id: requestId,
+          error: (err as Error)?.message ?? String(err),
+          timestamp: Date.now(),
+        } as any);
+      }
+    }
+    // Always log request_completed regardless of mode so bench rollups can
+    // count quick vs compose requests, average cells/turns per request, etc.
+    session.log({
+      type: 'request_completed' as any,
+      request_id: requestId,
+      mode: classification.mode,
+      terminated_via: interrupted ? 'abort' : (fullText.includes('\n\nError:') ? 'error' : 'natural'),
+      ...composeController.telemetry(),
+      timestamp: Date.now(),
+    } as any);
     // Clear queued messages on abort â€” they were typed for a turn that was
     // interrupted; firing them into the next unrelated turn would be wrong.
     pendingInputRef.current = [];
@@ -645,7 +1189,7 @@ export function App(props: AppProps): React.ReactElement {
     if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
     textBufferRef.current = '';
     // Capture segments before clearing — used to preserve tool calls in display history
-    const completedSegments = segmentsRef.current.slice();
+    const completedSegments = compactSegmentsForHistory(segmentsRef.current);
     setStreamSegments([]);
     segmentsRef.current = [];
     setIsLoading(false);
@@ -673,7 +1217,7 @@ export function App(props: AppProps): React.ReactElement {
       // In quiet mode, only show the final text block (after last tool call)
       const shownText = displayMode === 'quiet' ? displayText2.trim() : fullText;
       // Preserve segments (tool calls + text) if the turn had tool calls, so they persist in history
-      const hasToolCalls = completedSegments.some(s => s.type === 'tool');
+      const hasToolCalls = completedSegments.some(s => s.type === 'tool' || s.type === 'thinking');
       setDisplayMessages(prev => [
         ...prev,
         ...(shownText ? [{
@@ -704,9 +1248,27 @@ export function App(props: AppProps): React.ReactElement {
   // ── Handle loop events ──────────────────────────────────────────────
   const handleLoopEvent = useCallback((event: LoopEvent, appendText: (text: string) => void) => {
     switch (event.type) {
-      case 'text':
-        appendText(event.content);
+      case 'text': {
+        const displayText = composeDisplayFilterRef.current.push(event.content);
+        if (displayText) appendText(displayText);
         break;
+      }
+
+      case 'thinking': {
+        // 2026-05-01: Extended thinking blocks rendered as dim italic text
+        // above the response. Uses the same segment/buffer pattern as text
+        // but with a 'thinking' segment type.
+        const segs = [...segmentsRef.current];
+        const last = segs[segs.length - 1];
+        if (last && last.type === 'thinking') {
+          segs[segs.length - 1] = { type: 'thinking', content: last.content + event.content };
+        } else {
+          segs.push({ type: 'thinking', content: event.content });
+        }
+        segmentsRef.current = segs;
+        setStreamSegments(segs);
+        break;
+      }
 
       case 'tool_call': {
         // Flush any buffered text so it appears BEFORE the tool in the timeline
@@ -714,25 +1276,29 @@ export function App(props: AppProps): React.ReactElement {
         if (textBufferRef.current) {
           const buffered = textBufferRef.current;
           textBufferRef.current = '';
-          setStreamSegments(prev => {
-            const segs = [...prev];
-            const last = segs[segs.length - 1];
-            if (last && last.type === 'text') {
-              segs[segs.length - 1] = { type: 'text', content: last.content + buffered };
-            } else {
-              segs.push({ type: 'text', content: buffered });
-            }
-            return segs;
-          });
+          const segs = [...segmentsRef.current];
+          const last = segs[segs.length - 1];
+          if (last && last.type === 'text') {
+            segs[segs.length - 1] = { type: 'text', content: last.content + buffered };
+          } else {
+            segs.push({ type: 'text', content: buffered });
+          }
+          segmentsRef.current = segs;
+          setStreamSegments(segs);
         }
         const tc = event.toolCall;
         const summary = getToolSummary(tc.name, tc.input);
         const displayName = getToolDisplayName(tc.name, tc.input);
         toolTimingRef.current.set(tc.id, Date.now());
+        activeToolIdRef.current = tc.id;
         const toolData: DisplayToolCall = {
           id: tc.id, name: displayName, summary, resolved: false, isError: false,
         };
-        setStreamSegments(prev => [...prev, { type: 'tool', data: toolData }]);
+        {
+          const next: StreamSegment[] = [...segmentsRef.current, { type: 'tool', data: toolData }];
+          segmentsRef.current = next;
+          setStreamSegments(next);
+        }
         setActiveTool(tc.name);
         break;
       }
@@ -742,11 +1308,14 @@ export function App(props: AppProps): React.ReactElement {
         const startTime = toolTimingRef.current.get(event.id);
         const durationMs = startTime ? Date.now() - startTime : undefined;
         toolTimingRef.current.delete(event.id);
-        setStreamSegments(prev => prev.map(seg =>
+        if (activeToolIdRef.current === event.id) activeToolIdRef.current = null;
+        const next = segmentsRef.current.map(seg =>
           seg.type === 'tool' && seg.data.id === event.id
             ? { ...seg, data: { ...seg.data, resolved: true, isError: event.isError, resultPreview: preview, durationMs } }
             : seg
-        ));
+        );
+        segmentsRef.current = next;
+        setStreamSegments(next);
         setActiveTool(undefined);
         break;
       }
@@ -763,17 +1332,21 @@ export function App(props: AppProps): React.ReactElement {
         );
         break;
 
-      case 'tool_denied':
-        setStreamSegments(prev => prev.map(seg =>
+      case 'tool_denied': {
+        if (activeToolIdRef.current === event.id) activeToolIdRef.current = null;
+        const next = segmentsRef.current.map(seg =>
           seg.type === 'tool' && seg.data.id === event.id
             ? { ...seg, data: { ...seg.data, resolved: true, isError: true, resultPreview: 'Denied by user' } }
             : seg
-        ));
+        );
+        segmentsRef.current = next;
+        setStreamSegments(next);
         setActiveTool(undefined);
         break;
+      }
 
-      case 'plan_step':
-        setStreamSegments(prev => [...prev, {
+      case 'plan_step': {
+        const next: StreamSegment[] = [...segmentsRef.current, {
           type: 'tool',
           data: {
             id: event.toolCall.id,
@@ -783,8 +1356,11 @@ export function App(props: AppProps): React.ReactElement {
             isError: false,
             resultPreview: '(plan — not executed)',
           },
-        }]);
+        }];
+        segmentsRef.current = next;
+        setStreamSegments(next);
         break;
+      }
 
       case 'plan_complete':
         setDisplayMessages(prev => [...prev, {
@@ -812,6 +1388,21 @@ export function App(props: AppProps): React.ReactElement {
             : `Conversation compacted (${event.savedCount} insights saved to memory)`,
           subtype: 'compact',
         }]);
+        break;
+
+      case 'turn_complete':
+        // Patch the most recent telemetry record with tool call data.
+        // usage event (which drove recordTurn) fires during streaming before
+        // tools execute; turn_complete fires after, so tool names + cell counts
+        // are available. 2026-05-03: added toolCallCount, toolNames, replCellCount.
+        trackerRef.current.patchLastTurn(event.toolCallCount, event.toolNames, event.replCellCount);
+        // Use the locally-computed tokenEstimate for context utilization display.
+        // The API's usage.totalTokens returns 1 on OAuth/subscription auth (Anthropic
+        // doesn't report real counts for Max plan users), making the status bar
+        // show 0%. tokenEstimate comes from estimateTokens(messages) in loop.ts â€”
+        // a local word-count heuristic that works regardless of auth method.
+        // 2026-05-03: fixes 0%/1.0M status bar on OAuth.
+        setTokenCount(event.tokenEstimate);
         break;
 
       case 'error': {
@@ -869,7 +1460,7 @@ export function App(props: AppProps): React.ReactElement {
                 .join('\n')
             : '';
         if (text) {
-          historyDisplay.push({ role: 'assistant', text });
+          historyDisplay.push({ role: 'assistant', text: renderComposeBlocksForDisplay(text) });
         }
       }
     }
@@ -938,14 +1529,14 @@ export function App(props: AppProps): React.ReactElement {
       }
 
       case '/effort':
-        if (arg && ['high', 'medium', 'low'].includes(arg)) {
+        if (arg && ['max', 'high', 'medium', 'low'].includes(arg)) {
           router.setEffort(arg as EffortLevel);
           setDisplayMessages(prev => [...prev, {
             role: 'assistant', text: `Effort: ${arg}`,
           }]);
         } else {
           setDisplayMessages(prev => [...prev, {
-            role: 'assistant', text: `**Effort:** ${router.effort}\n**Usage:** /effort high, /effort medium, /effort low`,
+            role: 'assistant', text: `**Effort:** ${router.effort}\n**Usage:** /effort max, /effort high, /effort medium, /effort low`,
           }]);
         }
         break;
@@ -1004,6 +1595,167 @@ export function App(props: AppProps): React.ReactElement {
           }
         }
         break;
+
+      case '/goal':
+        if (!arg.trim()) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: '**Usage:** `/goal <goal>`\n\nStarts Loop3 goal mode: refine intent, call spanner.escalate(), create a layered plan with phase-level composition, then execute through Repl.',
+          }]);
+        } else {
+          handleSubmit(`#goal ${arg.trim()}`);
+        }
+        break;
+
+      case '/compose':
+        // Force compose mode for the next request: scratch doc + preflight
+        // gate active. Sometimes the auto-router misclassifies an ambiguous
+        // request as quick; this slash forces compose. The #compose prefix
+        // is stripped by classifyRequestMode so the model never sees it.
+        if (!arg.trim()) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: '**Usage:** `/compose <task>`\n\nForces compose mode for this request: a temporary request scratch is created, preflight is required before each Repl, and updates are required between Repls. Use this when the auto-router would otherwise route to quick mode.',
+          }]);
+        } else {
+          handleSubmit(`#compose ${arg.trim()}`);
+        }
+        break;
+
+      case '/quick':
+        // Force quick mode for the next request: no scratch, no preflight,
+        // no gate. For when you want a fast direct answer without the
+        // composition ceremony — even if the auto-router would default to
+        // compose. The #quick prefix is stripped by classifyRequestMode.
+        if (!arg.trim()) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: '**Usage:** `/quick <question>`\n\nForces quick mode for this request: no scratch, no preflight gate, default Loop3 behavior. Use for trivial questions when the auto-router would otherwise route to compose.',
+          }]);
+        } else {
+          handleSubmit(`#quick ${arg.trim()}`);
+        }
+        break;
+
+      case '/headless': {
+        const task = arg.trim();
+        if (!task) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: '**Usage:** `/headless <task>`\n\nRuns a separate headless Aries session using the same compose-loop architecture as the bench path. The child session has its own request scratch, gate telemetry, and session log; this UI shows the final result when it exits.',
+          }]);
+          break;
+        }
+        if (isLoadingRef.current) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: 'A request is already running. Stop it or wait for it to finish before launching a headless child session.',
+          }]);
+          break;
+        }
+
+        const startedAt = Date.now();
+        const { spawn } = await import('node:child_process');
+        const invocation = buildHeadlessChildInvocation(task);
+        setIsLoading(true);
+        setActiveTool('headless');
+        setTitleBusy(agentName, cwd);
+        setDisplayMessages(prev => [...prev, {
+          role: 'system',
+          text: `Headless session started: ${task.slice(0, 140)}`,
+          subtype: 'info',
+        }]);
+
+        let stdout = '';
+        let stderr = '';
+        const child = spawn(invocation.command, invocation.args, {
+          cwd,
+          env: { ...process.env, ARIES_HEADLESS: '1' },
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        child.stdout?.on('data', chunk => { stdout += chunk.toString(); });
+        child.stderr?.on('data', chunk => { stderr += chunk.toString(); });
+
+        const result = await new Promise<{ code: number | null; error: Error | null }>((resolve) => {
+          child.once('error', error => resolve({ code: null, error }));
+          child.once('close', code => resolve({ code, error: null }));
+        });
+        const code = result.code;
+        const elapsed = Date.now() - startedAt;
+        setIsLoading(false);
+        setActiveTool(undefined);
+        setTitleDone(agentName, cwd);
+
+        if (result.error) {
+          const message = result.error.message;
+          setDisplayMessages(prev => [...prev, {
+            role: 'system',
+            text: `Headless session failed to start: ${message}`,
+            subtype: 'error',
+          }]);
+          break;
+        }
+
+        const output = capHeadlessText(stdout || '(no output)');
+        const errText = capHeadlessText(stderr);
+        const statusLine = `Headless exited code=${code ?? 'unknown'} wall=${formatDuration(elapsed)}`;
+        setDisplayMessages(prev => [
+          ...prev,
+          {
+            role: code === 0 ? 'system' : 'assistant',
+            text: code === 0
+              ? `${statusLine}\n\n${output}`
+              : `${statusLine}\n\n${output}${errText ? `\n\nstderr:\n\`\`\`\n${errText}\n\`\`\`` : ''}`,
+            subtype: code === 0 ? 'info' : 'error',
+          },
+        ]);
+        break;
+      }
+
+      case '/scratch': {
+        const subcommand = arg.trim() || 'show';
+        if (subcommand !== 'show') {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: '**Usage:** `/scratch show`',
+          }]);
+          break;
+        }
+
+        const handle = getReplHandle?.() ?? replHandle;
+        if (!handle?.bridge) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: 'Scratch unavailable: REPL bridge is not running.',
+          }]);
+          break;
+        }
+
+        try {
+          const status = await handle.bridge.composeStatus();
+          if (!status.active) {
+            setDisplayMessages(prev => [...prev, {
+              role: 'assistant',
+              text: '**Scratch:** inactive',
+            }]);
+            break;
+          }
+          const read = await handle.bridge.composeRead();
+          const content = read.content?.trimEnd() || '(empty)';
+          const pathLine = status.path ? `\n**Path:** \`${status.path}\`` : '';
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: `**Scratch:** active${pathLine}\n\n\`\`\`markdown\n${content}\n\`\`\``,
+          }]);
+        } catch (err) {
+          setDisplayMessages(prev => [...prev, {
+            role: 'assistant',
+            text: `**Scratch error:** ${(err as Error).message}`,
+          }]);
+        }
+        break;
+      }
 
       case '/execute':
         // Quick exit from plan mode → execute
@@ -1237,14 +1989,14 @@ export function App(props: AppProps): React.ReactElement {
         break;
 
       case '/display': {
-        const modes: DisplayMode[] = ['verbose', 'normal', 'quiet', 'cerebral'];
+        const modes: DisplayMode[] = ['verbose', 'normal', 'quiet'];
         if (arg && modes.includes(arg as DisplayMode)) {
           setDisplayMode(arg as DisplayMode);
           setDisplayMessages(prev => [...prev, {
             role: 'system', text: `Display mode: ${arg}`, subtype: 'info',
           }]);
         } else {
-          // Cycle: verbose → normal → quiet → cerebral → verbose
+          // Cycle: verbose → normal → quiet → verbose
           const nextIdx = (modes.indexOf(displayMode) + 1) % modes.length;
           const next = modes[nextIdx]!;
           setDisplayMode(next);
@@ -1252,19 +2004,6 @@ export function App(props: AppProps): React.ReactElement {
             role: 'system', text: `Display mode: ${next}`, subtype: 'info',
           }]);
         }
-        break;
-      }
-
-      case '/cerebral': {
-        const next = displayMode === 'cerebral' ? 'normal' : 'cerebral';
-        setDisplayMode(next as DisplayMode);
-        setDisplayMessages(prev => [...prev, {
-          role: 'system',
-          text: next === 'cerebral'
-            ? 'Cerebral mode: execute-only, no narration'
-            : 'Cerebral mode: off',
-          subtype: 'info',
-        }]);
         break;
       }
 
@@ -1446,6 +2185,7 @@ export function App(props: AppProps): React.ReactElement {
         try {
           const r = await replHandle.bridge.index({ repoPath });
           if (r.ok) {
+            setIndexedFiles(r.file_count);
             setDisplayMessages(prev => [...prev, {
               role: 'assistant',
               text: `**Indexed ${r.file_count} files** (${r.symbol_count} symbols, ${r.edge_count} edges, ${r.unique_symbols} unique symbols) in ${r.elapsed_ms}ms.\n\n\`codebase\` is now available in the REPL. Try \`/repl print(codebase.top_files(5))\`.`,
@@ -1473,6 +2213,7 @@ export function App(props: AppProps): React.ReactElement {
           try {
             const idx = await replHandle.bridge.index({ repoPath: cwd });
             if (idx.ok) {
+              setIndexedFiles(idx.file_count);
               reloadParts.push(`codebase: ${idx.file_count} files, ${idx.symbol_count} symbols`);
             }
           } catch { reloadParts.push('codebase: reindex failed'); }
@@ -1500,11 +2241,15 @@ export function App(props: AppProps): React.ReactElement {
 - \`/model\` — interactive model picker (or \`/model opus high\`)
 - \`/model cheap deepseek\` — assign a model to a slot
 - \`/config\` — show model routing (which model handles what)
-- \`/effort high|medium|low\` — change effort level
+- \`/effort max|high|medium|low\` — change effort level
 - \`/cost\` — token usage
 - \`/tools\` — list tools
 - \`/vault\` — vault status
 - \`/brain\` — project brain
+- \`/compose <task>\` — force compose mode for a real-work request
+- \`/quick <question>\` — force quick mode for a trivial question
+- \`/headless <task>\` — launch a separate compose-wired headless session
+- \`/scratch show\` — show the active compose request scratch
 - \`/research "query"\` — deep multi-source research
 - \`/index [path]\` — index codebase graph (default: cwd)
 - \`/signature [codebase|vault] [lean|standard|deep|max] [tokens]\` — preview ambient signature
@@ -1686,7 +2431,7 @@ export function App(props: AppProps): React.ReactElement {
           role: 'assistant', text: `Unknown command: ${cmd}`,
         }]);
     }
-  }, [vault, projectBrain, router, registry, tokenCount, vaultNoteCount]);
+  }, [vault, projectBrain, router, registry, tokenCount, vaultNoteCount, replHandle, getReplHandle]);
 
   // ── Render ──────────────────────────────────────────────────────────
   return (
@@ -1714,7 +2459,7 @@ export function App(props: AppProps): React.ReactElement {
       </Box>
 
       {/* Pinned bottom: model picker OR input + status */}
-      <Box flexDirection="column" flexShrink={0}>
+      <Box flexDirection="column" flexShrink={0} marginTop={1}>
         {/* Permission dialog takes priority over everything */}
         {/* Dialogs in priority order: plan exit > permission > ask > resume > model picker > input */}
         {showPlanApproval && planApprovalData ? (
@@ -1741,6 +2486,13 @@ export function App(props: AppProps): React.ReactElement {
           <AskDialog
             question={pendingAsk.question}
             onSubmit={(answer) => {
+              session.log({
+                type: 'loop3_ask',
+                phase: 'resolved',
+                id: pendingAsk.id,
+                answer_chars: answer.length,
+                timestamp: Date.now(),
+              });
               replHandle.bridge.resolveAsk(pendingAsk.id, answer);
               setPendingAsk(null);
             }}
@@ -1748,6 +2500,13 @@ export function App(props: AppProps): React.ReactElement {
               // Cancel contract is empty string, not a sentinel. The model
               // can branch on `if not answer:` to detect user refusal. See
               // body/speak.py ask() docstring for the Python-side guarantee.
+              session.log({
+                type: 'loop3_ask',
+                phase: 'cancelled',
+                id: pendingAsk.id,
+                answer_chars: 0,
+                timestamp: Date.now(),
+              });
               replHandle.bridge.resolveAsk(pendingAsk.id, '');
               setPendingAsk(null);
             }}
@@ -1808,17 +2567,27 @@ export function App(props: AppProps): React.ReactElement {
               isLoading={isLoading}
               onQueue={handleQueue}
               pendingCount={pendingCount}
+              onSteer={handleSteer}
+              steerCount={steerCount}
             />
             <StatusBar
+              cwd={cwd}
+              gitBranch={gitBranch}
+              indexedFiles={indexedFiles}
+              sessionTitle={sessionTitle}
               model={router.info.model}
+              provider={router.info.name}
               effort={router.effort}
               tokenCount={tokenCount}
               contextWindow={router.current.contextWindow}
-              vaultNotes={vaultNoteCount}
+              inputTokens={trackerRef.current.totals.inputTokens}
+              outputTokens={trackerRef.current.totals.outputTokens}
+              cost={trackerRef.current.totals.cost}
               isLoading={isLoading}
               permissionMode={permissionMode}
-              sessionTitle={sessionTitle}
               taskMode={taskMode}
+              bodyStale={bodyStale}
+              composeMode={currentRequestMode}
             />
           </>
         )}
@@ -1851,8 +2620,9 @@ function getToolDisplayName(name: string, input: Record<string, unknown>): strin
       return 'WebSearch';
     case 'WebFetch':
       return 'WebFetch';
-    case 'Agent':
-      return `Agent(${(input.description as string | undefined)?.slice(0, 30) ?? 'task'})`;
+    case 'code':
+      return 'code';
+    // Agent case removed 2026-05-03 — AgentTool deleted; default returns name.
     default:
       return name;
   }
@@ -1867,8 +2637,7 @@ function getToolSummary(name: string, input: Record<string, unknown>): string {
       return (input.query as string | undefined)?.slice(0, 60) ?? '';
     case 'WebFetch':
       return (input.url as string | undefined)?.slice(0, 60) ?? '';
-    case 'Agent':
-      return '';
+    // Agent case removed 2026-05-03 — AgentTool deleted.
     default:
       // For file tools, the path is already in the display name
       if (input.query) return (input.query as string).slice(0, 60);
@@ -1958,8 +2727,34 @@ function formatToolResult(toolName: string, output: string, isError: boolean): s
     case 'ProjectSearch':
       return lines[0]?.slice(0, 200) ?? output.slice(0, 200);
 
-    case 'Agent':
-      return lines[0]?.slice(0, 200) ?? 'Agent completed';
+    // Agent case removed 2026-05-03 — AgentTool deleted; default formats it.
+
+    case 'code': {
+      // code output is structured as `# cell N: id (Xms)` headers + cell
+      // stdout/stderr/exception, with a footer like `(1234ms total · 2 cells)`.
+      // Showing only first-line + (N chars) — the old default behavior — was
+      // hiding the actual cell content from the user when a model wrote
+      // synthesis or diagnostics inside a cell. Strip header/footer noise and
+      // surface the body content directly. The preview can wrap multi-line in
+      // the messages.tsx Text node, so newlines are fine.
+      if (lines.length === 0) return '(no output)';
+      const bodyLines = lines.filter(l =>
+        !/^#\s*cell\s+\d+(:|\s)/i.test(l) // strip "# cell 1: id (Xms)" headers
+        && !/^\(\s*\d+ms total/.test(l)   // strip aggregate footer
+      );
+      const body = bodyLines.join('\n').trim();
+      const PREVIEW_CAP = 800;
+      if (body.length === 0) {
+        // Cells ran but produced no body content — fall back to header summary.
+        const header = lines[0] ?? '';
+        return header.slice(0, 200);
+      }
+      const planSummary = summarizePlanCreateText(body);
+      if (planSummary) return planSummary;
+      if (body.length <= PREVIEW_CAP) return body;
+      const hidden = body.length - PREVIEW_CAP;
+      return `${body.slice(0, PREVIEW_CAP)}\n… (${hidden} more chars — full output went to the model)`;
+    }
 
     default: {
       // Generic: first line, truncated

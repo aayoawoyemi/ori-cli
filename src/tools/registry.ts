@@ -11,7 +11,8 @@ import { GlobTool } from './glob.js';
 import { GrepTool } from './grep.js';
 import { WebFetchTool } from './webFetch.js';
 import { WebSearchTool } from './webSearch.js';
-import { AgentTool } from './agent.js';
+// AgentTool removed 2026-05-03 â€” see vault note 'aries-cli composition failure root cause analysis'.
+// Subagent delegation was a fork-and-pray escape hatch; code is the single workspace now.
 import { VaultSearchTool } from './vaultSearch.js';
 import { VaultReadTool } from './vaultRead.js';
 import { VaultAddTool } from './vaultAdd.js';
@@ -19,7 +20,7 @@ import { VaultExploreTool } from './vaultExplore.js';
 import { VaultWarmthTool } from './vaultWarmth.js';
 import { ProjectSearchTool } from './projectSearch.js';
 import { ProjectSaveTool } from './projectSave.js';
-import { ReplTool } from './repl.js';
+import { CODE_TOOL_NAME, CodeTool } from './code.js';
 import type { ReplHandle } from '../repl/setup.js';
 import type { PlanContext, PlanApprovalResult } from './planTypes.js';
 import { EnterPlanModeTool } from './enterPlanMode.js';
@@ -42,15 +43,15 @@ export class ToolRegistry {
 
   /** Get all tool definitions to send to the model.
    *
-   * Repl is sorted first so it sits at the top of the model's tool schema.
+   * code is sorted first so it sits at the top of the model's tool schema.
    * Anthropic models have measurable primacy bias — putting the preferred
-   * action verb first shifts routing toward Repl over Bash for navigation.
+   * action verb first shifts routing toward code over Bash for navigation.
    */
   definitions(): ToolDefinition[] {
     const all = Array.from(this.tools.values()).map(t => t.definition());
-    const repl = all.filter(t => t.name === 'Repl');
-    const rest = all.filter(t => t.name !== 'Repl');
-    return [...repl, ...rest];
+    const code = all.filter(t => t.name === CODE_TOOL_NAME);
+    const rest = all.filter(t => t.name !== CODE_TOOL_NAME);
+    return [...code, ...rest];
   }
 
   /** Get all registered tools. */
@@ -77,8 +78,7 @@ export function createCoreRegistry(options?: { replEnabled?: boolean; webSearch?
   // Web tools
   registry.register(new WebFetchTool());
   registry.register(new WebSearchTool(options?.webSearch));
-  // Subagent
-  registry.register(new AgentTool());
+  // AgentTool removed 2026-05-03 — code is the single workspace.
   return registry;
 }
 
@@ -102,29 +102,29 @@ export function registerMemoryTools(
 }
 
 /**
- * Register the Repl tool. Enables code-acting via Python body.
+ * Register the code tool. Enables code-acting via Python body.
  * The getHandle closure allows the tool to check bridge liveness at call time
  * (restart-on-crash is transparent to the tool).
  */
-export function registerReplTool(
+export function registerCodeTool(
   registry: ToolRegistry,
   getHandle: () => ReplHandle | null,
 ): void {
-  registry.register(new ReplTool(getHandle));
+  registry.register(new CodeTool(getHandle));
 }
 
 /**
  * Destructive strip — removes every tool that codemode replaces with a
- * namespace primitive inside the Repl body. Used by bench only (bench/
+ * namespace primitive inside the code body. Used by bench only (bench/
  * quick.ts, bench/compare.ts) so the HARNESS-MANDATORY variant tests the
  * same architecture that ships by default. The main CLI path does NOT
  * call this — it uses runtime filtering at src/loop.ts:266 instead, so
  * research/plan/explore modes can keep their own tool allowlists from a
  * shared registry.
  *
- * Why codemode removes every one of these: each has a Repl-namespace
- * replacement. Bash → shell.run, Edit/Write → fs.edit/fs.write, Read/
- * Grep/Glob → fs.read/codebase.search/fs.glob, WebFetch/WebSearch →
+ * Why codemode removes every one of these: each has a code-namespace
+ * replacement. Bash -> shell.run, Edit/Write -> fs.edit/fs.write, Read/
+ * Grep/Glob -> fs.read/codebase.search/fs.glob, WebFetch/WebSearch ->
  * web.fetch/web.search, Vault* → vault.* methods, Project* → project
  * primitives (or vault for insights). The model composes these inside
  * Python; no top-level escape hatches.
@@ -150,13 +150,13 @@ export function registerPlanTools(
 }
 
 export function stripNavigationTools(registry: ToolRegistry): void {
-  // Full codemode strip — every tool with a Repl-namespace replacement.
+  // Full codemode strip — every tool with a code-namespace replacement.
   // Kept in sync with CODEMODE_DEFAULT in src/loop.ts:266 (runtime filter
   // for the main CLI path). If either list changes, change both.
   const stripped = [
-    // Shell + filesystem — replaced by shell.run / fs.* inside Repl
+    // Shell + filesystem — replaced by shell.run / fs.* inside code
     'Bash', 'Edit', 'Write', 'Read', 'Grep', 'Glob',
-    // Web — replaced by web.fetch / web.search inside Repl
+    // Web — replaced by web.fetch / web.search inside code
     'WebFetch', 'WebSearch',
     // Vault — replaced by vault.* method suite (query_ranked/explore/add/read)
     'VaultSearch', 'VaultRead', 'VaultExplore', 'VaultWarmth', 'VaultAdd',

@@ -3,8 +3,11 @@
  *
  * Captures the request object passed to the SDK stream call so Batch 3 cannot
  * regress into invalid Anthropic shapes:
- *   - Claude shortcuts must use per-model max_tokens defaults, not effort caps.
- *   - thinking.budget_tokens must be omitted or clamped so max_tokens > budget.
+ *   - Claude shortcuts must respect the current effort cap and model ceiling.
+ *   - Adaptive-capable models must use Anthropic's adaptive thinking shape,
+ *     not the legacy budget_tokens shape.
+ *   - Legacy-thinking models must omit or clamp budget_tokens so
+ *     max_tokens > budget.
  */
 import { AnthropicProvider } from '../src/router/providers/anthropic.js';
 import { ModelRouter } from '../src/router/index.js';
@@ -78,7 +81,8 @@ function routerForShortcuts(): ModelRouter {
 }
 
 for (const [shortcut, expectedMax] of [
-  ['opus high', 128_000],
+  ['opus high', 64_000],
+  ['opus max', 128_000],
   ['sonnet high', 64_000],
   ['haiku high', 64_000],
 ] as const) {
@@ -99,19 +103,20 @@ const tiny = await captureAnthropicParams({
   maxTokens: 100,
 }, 1_500);
 check(
-  'forced tiny maxTokens omits thinking instead of 400ing',
-  !('thinking' in tiny),
+  'adaptive Opus uses adaptive thinking even with tiny maxTokens',
+  JSON.stringify(tiny.thinking) === JSON.stringify({ type: 'adaptive', display: 'summarized' }) &&
+    JSON.stringify(tiny.output_config) === JSON.stringify({ effort: 'high' }),
   `thinking=${JSON.stringify(tiny.thinking)}`,
 );
 
 const clamped = await captureAnthropicParams({
   provider: 'anthropic',
-  model: 'claude-opus-4-6',
+  model: 'claude-sonnet-4-5',
   apiKey: '',
   maxTokens: 1_500,
 }, 10_000);
 check(
-  'thinking clamps below max_tokens',
+  'legacy thinking clamps below max_tokens',
   JSON.stringify(clamped.thinking) === JSON.stringify({ type: 'enabled', budget_tokens: 1_499 }),
   `thinking=${JSON.stringify(clamped.thinking)}`,
 );
@@ -122,10 +127,11 @@ const normal = await captureAnthropicParams({
   apiKey: '',
 }, 10_000);
 check(
-  'normal Opus request keeps 128K max_tokens and 10K thinking',
+  'normal adaptive Opus request keeps 128K max_tokens and adaptive thinking',
   normal.max_tokens === 128_000 &&
-    JSON.stringify(normal.thinking) === JSON.stringify({ type: 'enabled', budget_tokens: 10_000 }),
-  `max_tokens=${normal.max_tokens} thinking=${JSON.stringify(normal.thinking)}`,
+    JSON.stringify(normal.thinking) === JSON.stringify({ type: 'adaptive', display: 'summarized' }) &&
+    JSON.stringify(normal.output_config) === JSON.stringify({ effort: 'high' }),
+  `max_tokens=${normal.max_tokens} thinking=${JSON.stringify(normal.thinking)} output_config=${JSON.stringify(normal.output_config)}`,
 );
 
 console.log(`\n${passed}/${passed + failed} Anthropic request-shape checks passed`);

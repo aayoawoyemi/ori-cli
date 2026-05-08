@@ -2,7 +2,405 @@
 
 Living document. Session-by-session evolution of what we're building, why, and what's next. Read top-to-bottom for arc; jump to "Current Plan" for what to execute.
 
-Last updated: 2026-04-19 (end-of-day). **Codemode pivot — A1-A5 shipped. Active plan now lives in [CODEMODE_ROADMAP.md](CODEMODE_ROADMAP.md).** Token-fix pass below is retained as historical prep work, not the active focus.
+Last updated: 2026-05-08 (late PM). **SWE-Bench-Lite n=3 post-substrate-fix: 3/3 pass parity vs Claude Code, 30× aggregate token efficiency, 2.1× faster mean wall.** The composition thesis is now validated on real GitHub bugs graded by real test suites — not curated internal tasks. Active plan and the comprehensive design live in [CODEMODE_ROADMAP.md](CODEMODE_ROADMAP.md).
+
+---
+
+## Ori Mnemos Filesystem: memory as workspace (2026-05-08, late PM)
+
+The execution-layer data is now strong enough to move the next question up the stack. Compose Loop shows that structured, long-form coding tasks improve when the model works inside a stateful runtime instead of spraying isolated tool calls. The next leverage point is memory shape: Ori already exposes memory through an API, but the old vault interface is still too stateless. It answers "retrieve notes" more than "navigate and maintain a working memory substrate."
+
+New architecture note: [`ori_manemos_filesystem.md`](ori_manemos_filesystem.md). The filename keeps the session's wording; the concept is **Ori Mnemos Filesystem / MnemosFS**.
+
+The split:
+
+- **Ori API**: transport.
+- **Vault**: old retrieval interface, useful but stateless.
+- **MnemosFS**: memory as a structured, navigable workspace.
+
+Target shape:
+
+```text
+mnemos://brain/notes/...
+mnemos://projects/aries/runs/...
+mnemos://projects/aries/scratch/...
+mnemos://projects/aries/decisions/...
+mnemos://projects/aries/artifacts/...
+mnemos://projects/aries/lessons/...
+```
+
+Aries Core should eventually compose over memory the same way it composes over code:
+
+```python
+mem.search("compose loop gate failures")
+mem.read("mnemos://projects/aries/decisions/compose-loop.md")
+mem.write("mnemos://projects/aries/lessons/no-mimicable-rewrites.md", text)
+mem.link(a, b, relation="caused_by")
+```
+
+This is the bridge between the two findings:
+
+- **Compose Loop** proves models do better when work happens inside a stateful runtime.
+- **MnemosFS** gives that runtime a durable, structured brain instead of a stateless recall API.
+
+The long-context thesis becomes: infinite context is not a bigger prompt; it is memory management. Hot context is only L1. Scratch files, run logs, notes, artifacts, lessons, and handles are lower levels of the hierarchy. Compaction should not just summarize and discard. It should spill state into durable memory objects, leave handles behind, and let the model rehydrate only what the current goal needs.
+
+Codex's auto-compaction feels better because it turns context pressure into routine lifecycle management instead of a cliff. Aries should adopt that posture, but with MnemosFS underneath: compact to files/handles, not just prose summaries. Later, a small memory-curator loop can inspect memories, discard stale hot context, fetch relevant handles, and promote scratch into durable notes. That is metacognition as filesystem maintenance, not vibes.
+
+Vault note added for retrieval: `notes/ori-mnemos-filesystem-memory-as-workspace-next-ori-build-2026-05-08.md`. It is linked from `notes/index.md` so a future query like "What do we build next for Ori?" should surface this node.
+
+Next build sequence:
+
+1. Specify MnemosFS object model and URI layout.
+2. Add read/search/write/link primitives in Aries as a thin body-side wrapper over existing Ori API/vault storage.
+3. Promote compose scratch files into `mnemos://projects/<project>/runs/` and `lessons/`.
+4. Replace crude compaction with handle-based spill and rehydrate.
+5. Add an optional memory-curator loop only after the file substrate exists.
+
+---
+
+## SWE-Bench-Lite validation + past-action mimicry fix (2026-05-08, late PM)
+
+### Headline
+
+```
+                      aries          claude-code    aries advantage
+psf__requests-3362   ✓ 29.8K/196s   ✓ 213K/89s     7.1× cheaper, 2.2× slower
+pylint-5859          ✓ 36.1K/148s   ✓ 413K/252s    11.4× cheaper, 1.7× faster
+pytest-7220          ✓ 10.4K/71s    ✓ 1.66M/323s   159.6× cheaper, 4.5× faster
+
+Pass rate            3/3            3/3
+Mean tokens          25.4K          762.5K         (30× cheaper aggregate)
+Mean wall            104s           222s           (2.1× faster mean)
+Cell composition     70%            —
+State reuse          70%            —
+Useful ops/cell      3.90           —
+```
+
+`bench/swe-lite/results/SUMMARY.md` is auto-generated. Full per-task telemetry (tokens, tools, compose closure, FTP/PTP rates, diff lines, token ratio vs CC) lives in `bench/swe-lite/results/<task>-<cli>.json`. Each aries run also preserves its session log to `<task>-aries-cli.session.jsonl` so the metrics remain reproducible from disk.
+
+### The substrate finding — past-action prose rewrite caused mimicry collapse
+
+Earlier in the day the same n=3 bench failed psf__requests-3362 (model bailed without making any edit). Root cause discovered by reading the failed session log: the harness's `rewriteCompletedReplToolPairsInPlace` in `src/loop3/agent.ts` was collapsing completed `tool_use` + `tool_result` pairs into prose for cache stability:
+
+```
+assistant: <prior text>\n\nExecuted Python (toolu_X):\n```python\n<code>\n```
+user: Observation (ok, toolu_X):\n<output>
+```
+
+After 2-3 successful turns the model had been shown its own output as prose so many times that it learned the format and emitted it directly — the "hallucinated `toolu_X` ID" in turn 4 of the failed run was the literal output of `renderAssistantTranscript` being replayed by the model as prose. Not a hallucination, **mimicry**.
+
+Fix: switch the rewrite to XML-wrapped, namespace-distinct from the model's compose blocks:
+
+```
+<repl_call id="toolu_X">
+<code><![CDATA[
+<code>
+]]></code>
+</repl_call>
+
+<repl_observation id="toolu_X" status="ok">
+<output><![CDATA[
+<output>
+]]></output>
+</repl_observation>
+```
+
+Three properties:
+1. Anthropic models read XML as data, not as a format to emit (they emit via tool_use blocks).
+2. Different namespace from compose's `<compose_preflight>` / `<compose_update>` — no cross-confusion.
+3. Still pure text — caches just as well.
+
+Before the fix: psf__requests-3362 → ✗ 9.6K tok / 0 cells edited / hallucinated tool call as prose / no diff / FTP 0/1.
+After the fix: psf__requests-3362 → ✓ 29.8K tok / 4 composed cells / 5 cross-cell state reuses / requests/utils.py +1/-1 / FTP 1/1 + PTP 29/29.
+
+**This is a publishable architectural finding on its own.** Sister rule to "dead-category" (no corrective prose): **no mimicable rewrites** — agent harnesses must never show the model output that's confusable with the model's own emission format.
+
+### Natural-text steering canonical (Alt+S removed)
+
+Previously: typing during a run + Enter steered, Alt+S also steered (redundant alias). Now: only natural-text. Removed Alt+S handler in `src/ui/input.tsx`; the comment + JSDoc updated to reflect that **typing IS the gesture**, no modifier required. Latch logic simplified back to Alt+V (paste) only. Smokes still green.
+
+### Paper-readiness gap (still open)
+
+| Need | Status |
+|---|---|
+| n ≥ 20 across 6+ repos | Have 3 (post-fix), need 17 more |
+| Cross-model (Opus + Haiku alongside Sonnet) | Sonnet only |
+| Pre-compose / V1 / V2 ablation on SAME tasks | Have on bench/2026-04, need on SWE-Bench-Lite |
+| Statistical reporting (Wilcoxon signed-rank, IQR) | Mean only |
+| Failure attribution taxonomy | Manual today |
+| Replication artifact (pinned SHA + tasks.json hash + README) | Not packaged |
+
+Vault note with full plan: `brain/notes/compose-loop-paper-needs-n20-cross-model-ablation-plus-past-action-prose-rewrite-is-the-load-bearing-substrate-mechanism-finding.md`. Three-track timeline (substrate fix today / n=20 expansion this week / cross-model + ablation next week) → publishable artifact in ~3-4 weeks.
+
+### Next move
+
+Expand `bench/swe-lite/run-batch.ts` TASKS array from 3 to 12-15 across marshmallow / click / flask / requests / pylint / pytest / sphinx-doc. Run on the post-fix dist. Decide based on the n=15 distribution whether to commit to the full paper push.
+
+---
+
+## Compose architecture breakthrough (2026-05-08)
+
+The model does not manually call `scratch.append(...)` most of the time. Instead:
+
+```text
+model emits <compose_preflight> / <compose_update>
+        |
+        v
+Loop3 parses those blocks
+        |
+        v
+ComposeController records them
+        |
+        v
+Loop3 syncs them into body scratch
+        |
+        v
+body/scratch.py writes the request .md file
+        |
+        v
+next model turn sees that markdown injected back into context
+```
+
+So the model updates the markdown file by emitting structured visible blocks. The harness turns those into scratch-file writes.
+
+### Architecture diagram
+
+```text
+User request
+   |
+   v
+Request Router
+classifyRequestMode()
+quick / compose / goal
+   |
+   +-- quick
+   |     |
+   |     v
+   |   Loop3 without compose discipline
+   |
+   +-- compose / goal
+         |
+         v
+   Request Setup
+   - new request_id
+   - bridge.configure(session_id, request_id, mode)
+   - scratch_start()
+   - create .aries/tmp/requests/<session>-<request>.md
+         |
+         v
+   Dynamic System Prompt
+   stable prompt
+   + compose protocol
+   + volatile scratch contents every turn
+         |
+         v
+   Model Turn
+   emits text:
+   <compose_preflight>
+   purpose: ...
+   primitives: ...
+   cell_kind: ...
+   </compose_preflight>
+         |
+         v
+   ComposeController
+   - parses preflight/update XML
+   - tracks repl_count
+   - tracks scout_count
+   - tracks last result status
+   - gates Repl calls
+         |
+         +-- allowed
+         |     |
+         |     v
+         |   Repl executes Python cell
+         |     |
+         |     v
+         |   result status recorded
+         |
+         +-- rejected / exempted
+               |
+               v
+            structural telemetry
+            ComposeGate / compose_gate_exempt
+         |
+         v
+   Scratch Sync
+   preflight -> scratch.set("preflight", ...)
+   update    -> scratch.append("findings", ...)
+         |
+         v
+   Markdown Scratch File
+   .aries/tmp/requests/<session>-<request>.md
+         |
+         v
+   Next Turn
+         |
+         v
+   Final
+   model should call done(answer)
+   scratch_close()
+   request_completed telemetry
+```
+
+What this means: the new architecture is not "tell the model to plan." It is:
+
+```text
+make the model's plan/update artifacts visible,
+persist them in a live markdown substrate,
+then show that substrate back every turn.
+```
+
+That is exactly the visibility thesis. The model sees its own working document evolve, and the gate makes Repl execution depend on that visible document discipline.
+
+This is a real Aries breakthrough, not because XML tags or a markdown scratch file are individually novel, but because the harness finally closes the loop:
+
+```text
+model emits intent/update
+harness parses it
+harness writes durable request state
+harness shows it back next turn
+harness gates action based on it
+telemetry proves whether it happened
+```
+
+Before this, the model was told once to plan carefully, use state, compose cells, and close phases. Under pressure it ignored that prose. Now the model sees a live substrate every turn, and the Repl gate makes the substrate behavior consequential.
+
+Bench evidence says the behavior changed:
+
+```text
+05-vault-warmth:
+old-ish headless: 243K tokens, 9 tools, no compose telemetry
+new compose headless: 53K tokens, 6 tools, real preflight/update telemetry
+V2 runs: done() path moved from 0/10 to 6/10
+```
+
+The important breakthrough: **composition discipline is now observable, enforceable, and measurable.** Before this, failures were vibes and transcripts. Now failures become counters: gates, exemptions, scratch contents, done rate, repair loops, scout budgets, and state reuse.
+
+If the next validation lands on SWE-Bench-Lite, the paper claim becomes concrete: **Compose sub-loops with structural gates convert traditional tool fanout into amortized REPL composition, achieving N.x token efficiency on SWE-Bench-Lite without a latency penalty.** That is a real claim with a real mechanism. The dead-category rule is central: no corrective prose, no "please do X"; only typed structural rejections and visible state transitions. That design principle earned the wins, and it is publishable on its own.
+
+### UI and headless integration
+
+The same compose architecture is now exposed in both daily-driver surfaces:
+
+- Interactive UI: normal requests auto-route through quick/compose/goal. Compose/goal requests create a request scratch, inject the live markdown into the dynamic system prompt, gate Repl calls through `ComposeController`, compact-render `<compose_preflight>` / `<compose_update>` as receipts, show `compose scratch+gate` in the status bar, and support `/scratch show`.
+- Headless CLI: `ori --headless "<task>"` runs the same Loop3 + compose controller + scratch + dynamic prompt path used by the bench runner. This is the surface for browser automation, external coding agents, and larger eval harnesses.
+- Interactive-to-headless bridge: `/headless <task>` launches a separate child headless Aries session from inside the UI and prints the final result back into the current timeline. The child run owns its own session log and request scratch, so it can be used as an early "UI agent delegates to headless worker" primitive before terminal polish.
+
+### UX direction: run workspace, not transcript
+
+The screenshot dogfood makes the product direction concrete: the terminal transcript should not be the product. The product is the live working document/run workspace that the model and user co-edit around. Chat remains the command surface, but the durable interface is the evolving run state: plan, preflight, findings, current step, files touched, diff, verification, gates, and final commit.
+
+This is the same argument as the vault note `the-chatbot-is-the-wrong-interface-for-an-agent...`: a linear chatbot forces the backend to pretend the conversation is the work. Compose scratch proves the opposite shape. The working document is the substrate; the transcript is just one view.
+
+Near-term implication: keep the CLI/terminal for v1, but treat it as a run cockpit. Show steps and status from scratch/telemetry, let the user pause/interject/edit the plan, and make `/scratch show` evolve into an actual always-visible workspace pane. Medium-term, this may become an HTML/Tauri-style document UI or IDE-like workspace, but the first invariant is interface-level, not framework-level: the user should see and steer the plan unfolding, not watch raw chat scroll by.
+
+Open product question: when a plan exists, does the model actually follow it and reuse prior primitives/state, or does it merely render plan-looking text while improvising? The next dogfood should explicitly inspect whether preflight/update entries are reflected in subsequent Repl cells and whether final answers cite the scratch/plan state.
+
+Interactive dogfood friction surfaced 2026-05-08: compose mode can still feel like "language about work" when the UI renders protocol receipts inside a transcript and the model falls through to prose. One concrete gate bug was fixed immediately: commit-only exemption now handles multi-line `done({...})` and `answer = {...}; done(answer)` cells, while still rejecting hidden work primitives inside the answer object. The larger UX lesson remains: final commit, current plan, and scratch state should be represented as run-workspace state, not as another fragile chat turn.
+
+## Compose sub-loop bench validation (2026-05-08)
+
+Two-week build cycle (Tier 0 — Tier 5) shipped against the plan at `~/.claude/plans/from-code-dont-take-zany-kurzweil.md`. The compose sub-loop is now active in both interactive and headless paths, and the first 10-task head-to-head bench against Claude Code lands.
+
+### The 10-task headline
+
+| | Aries (compose-loop active) | Claude Code | Aries advantage |
+|---|---|---|---|
+| Pass rate | **9/10** | 7/10 | +2 tasks |
+| Mean tokens | **26,307** | 168,918 | **6.4× fewer** (84% reduction) |
+| Mean tools | **2.5** | 4.1 | 39% fewer |
+| Mean wall | 64.6s | 40.9s | -58% (slower; trade accepted) |
+
+Higher pass rate, dramatically cheaper, fewer tool round-trips. Wall time is the only regression — structural cost of preflight emission + scratch IO + per-turn context regeneration. Acceptable for non-realtime use.
+
+### Per-task token ratios vs Claude Code (the standout entries)
+
+| Task | Aries tokens | Claude tokens | Ratio |
+|---|---|---|---|
+| 05-vault-warmth-trace | 33,654 | **547,069** | **16.3×** |
+| 09-pi-tool-count | 19,948 | 192,500 | 9.7× |
+| 10-pi-agent-loop | 13,095 | 121,237 | 9.3× |
+| 01-cache-break-trace | 41,752 | 250,616 | 6.0× |
+
+Full matrix: [`bench/2026-04/runs/2026-05-08/SUMMARY.md`](bench/2026-04/runs/2026-05-08/SUMMARY.md).
+
+### Compose telemetry (proves the mechanism is firing on real model behavior)
+
+- 10/10 requests classified compose — auto-router heuristics work on bench prompt distribution
+- **100% preflight coverage** — model emits `<compose_preflight>` before every Repl in compose mode
+- **2 gate rejections, both `update_required`** — discipline catches real lapses (the model did try to skip updates twice across 10 tasks)
+- 0 `preflight_required`, 0 `scout_budget_exceeded` — protocol is internalized; budget is sized correctly
+- 68% composition rate, 71% state reuse — both load-bearing metrics moved hard
+- 4.08 useful ops/cell — packing density healthy across the suite
+- Cell kinds: 6 scout, 1 verify, 1 repair across 10 tasks — full 4-stage template being self-applied
+
+### The composition thesis progression on 05-vault-warmth-trace
+
+Same task, same model class, three architectural states across two weeks:
+
+| State | Tokens | Cells | Composed | Wall |
+|---|---|---|---|---|
+| Pre-Tier-0 (stale body, no wall, no compose) | 710,430 | 13 | 8% (1/13) | 133s |
+| Post-Tier 0-3 (headless still bypassed compose) | 243,258 | 9 | 78% (7/9) | 165s |
+| Post-Codex-headless-wiring (full compose loop) | **53,600** | 6 | **100% (6/6)** | 110s |
+
+**13.4× total token reduction** from the same prompt on the same model. Composition rate 8% → 78% → 100%. State reuse 0% → 47% → 71% across the architectural progression. This is the empirical validation of the composition thesis as a structural advantage of the harness, not just a tuning win.
+
+### What didn't fully land
+
+- **0/10 structured `done()` commits.** Model is producing correct answers (9/10 graded pass) but ending in natural-text mode instead of `done(value)`. The compose protocol teaches preflight/update but doesn't sufficiently emphasize commit. Tier 7 (completion audit) is the planned fix.
+- **The one Aries failure (07-pi-parallel-tool)** found the right answer but the gate rejected the final cell for `update_required` after a repair pass. Model dropped to natural-text completion instead of structured commit, grader missed pattern match. **Comprehensive fix designed in CODEMODE_ROADMAP.** Claude Code also failed 07.
+- **Wall time regression** is real but expected. Sources: bridge composeStart op, per-turn scratch read for prompt injection, model output overhead from preflight blocks.
+- **Codemode protocol risk: narrated tool use.** On a later SWE-style task, Claude Code's tool-use protocol did not trigger the failure: it fired 10 actual tool calls and won. Aries' codemode prompt shape, because it centers Python code blocks, may make the model more likely under uncertainty to slip into narrating Python instead of emitting a real `tool_use` block. The failure shape is: model writes `Executed Python (toolu_...)` plus fenced Python as assistant prose, Loop3 sees no action, and the request terminates naturally. This is a real substrate risk even when compose preflight/update are correct. Preferred hardening: detect and log `loop3_hallucinated_tool_use` structurally; do not auto-execute the narrated code.
+  - **Patched 2026-05-08:** Loop3 no longer rewrites past Repl actions as `Executed Python (...)` prose. Completed Repl history is archived as `<repl_call>` / `<repl_observation>` XML-style records with CDATA payloads, including session resume reconstruction. This preserves cache-stable text history while removing the mimicable assistant-action format.
+
+### Files driving this validation
+
+- New: `src/compose/router.ts`, `src/compose/controller.ts`, `src/compose/parser.ts`, `src/compose/scratch.ts`, `body/scratch.py`, `body/version.py`, `scripts/wall_diagnostic_smoke.ts`, `scripts/compose_router_smoke.ts`, `scripts/scratch_substrate_smoke.ts`, `scripts/compose_loop_smoke.ts`, `scripts/compose_prompt_smoke.ts`, `scripts/compose_bench_parser_smoke.ts`
+- Modified for compose-loop wiring: `src/loop3/agent.ts` (gate + parser hooks), `src/ui/app.tsx` (auto-router + lifecycle), `src/index.ts` (headless lifecycle), `src/repl/bridge.ts` (compose ops + body version), `src/prompt.ts` (split system prompt), `body/server.py` (scratch primitives + footer + sync ops), `body/schema.py` (scratch.* registration), `bench/2026-04/runner/parsers.ts` (compose rollups)
+
+### What this evidence supports
+
+1. **The composition thesis is empirically validated, n=10.** Six months of arguing about "should the harness force composition" → measured 6-16× efficiency advantage at higher pass rate against the strongest comparable agent.
+2. **Visibility-not-telling is the right design law.** Every architectural step that made state visible to the model (smolagents replay, scratch injection, compose protocol blocks) delivered measurable lift. Every step that tried to TELL the model what to do (Loop2 corrective prose, the original `#goal` prompt addition) failed.
+3. **Structural discipline catches real model lapses without over-firing.** 2 gates per 10 tasks is the right order of magnitude. Higher would mean the discipline is brittle; zero would mean it's cosmetic.
+
+### What this evidence does NOT yet support
+
+1. **Long-running tasks** (>5 min): all 10 bench tasks complete <2 min each. Compose loop's behavior on a 30-min investigation is unmeasured.
+2. **Variance**: n=1 per task. Second pass would tell us if wins are stable.
+3. **Cross-session continuity**: compose is per-request. Goal mode (Codex-style continuation) is still deferred.
+4. **Quality at the deep end**: passed 9/10 on regex graders; real-world correctness on multi-file refactors is a different bar.
+
+---
+
+## Planning note - CLI stack future todo (2026-05-05)
+
+Added [notes/aries-ori-cli-stack-future-todo-2026-05-05.md](notes/aries-ori-cli-stack-future-todo-2026-05-05.md) as the non-detailed, future-facing todo list for the Aries/Ori CLI stack.
+
+Current framing: build Aries CLI into the daily-driver coding agent, let Ori Nous emerge from tested runtime primitives, and keep Ori Mnemos as the durable memory substrate. The work should be driven by model-behavior testing from real sessions: completion, Repl composition, memory retrieval, failure recovery, cost, turns, and wall time.
+
+Near sequence: stabilize Loop3, build real evals, promote the capability manifest, then add Goal mode, handle-based eviction, and a model testing harness. Defer sub-agent lifecycle until handles exist.
+
+---
+
+## RLM boundary decision (2026-05-05)
+
+Added [notes/aries-rlm-belongs-in-cli-runtime-not-mnemos-mcp-memory-2026-05-05.md](notes/aries-rlm-belongs-in-cli-runtime-not-mnemos-mcp-memory-2026-05-05.md).
+
+Decision: RLM orchestration belongs in Aries/Ori CLI runtime, not Ori Mnemos MCP memory. Mnemos stores durable notes, traces, summaries, handles, and recall. Aries/Nous owns inference-time control flow: `rlm_call`, `rlm_batch`, schema outputs, parent-goal-aware compression, and later handle/artifact routing. Keep Loop3's outer surface narrow (`model -> Repl(code) -> body primitives -> tool_result`); expose RLM as body primitives rather than adding new Loop3 action kinds or moving orchestration into the memory server.
+
+---
+
+## Loop3 composition + body API hardening (2026-05-05)
+
+Added [notes/loop3-composition-and-body-api-hardening-2026-05-05.md](notes/loop3-composition-and-body-api-hardening-2026-05-05.md).
+
+Decision: composition is forced by affordance, not prose. Keep one outer action (`Repl(code)`), persistent state, stable namespace APIs, bounded results, and a clean `done(value)` commit path. Do not add corrective retry messages or micro-call scolding.
+
+Next hardening focus before Goal mode: capability manifest, return-shape normalization, typed/actionable errors, schema tests, accurate `api.stub()` / `api.describe()`, consistent path semantics, output caps/handles, and focused body smoke tests. Aries should work well without Goal mode unless more dogfood proves otherwise.
 
 ---
 

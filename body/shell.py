@@ -1,5 +1,5 @@
 # File: body/shell.py
-# Purpose: Shell execution primitive exposed to the model inside the Repl
+# Purpose: Shell execution primitive exposed to the model inside code
 #   namespace. Wraps the TS child_process.exec — the model writes
 #   `result = shell.run("npm test")` and gets back {stdout, stderr, code,
 #   duration_ms}. Replaces the need for a top-level Bash tool entirely.
@@ -7,15 +7,15 @@
 #   - Shell class, instantiated once at server startup as module-global SHELL
 #   - run(cmd, timeout=30, cwd=None) — blocks on bridge, returns dict
 #   - resolve(id, result) — called by server.py main loop on shell_response
-# Role: Registered under the name "shell" in the Repl namespace by
+# Role: Registered under the name "shell" in the code namespace by
 #   _build_namespace. Mirrors vault.py / research.py / fs.py callback pattern
 #   line-for-line. Same threading.Event blocking, same stdout_lock protection,
-#   same request_id/pending shape. See ORI.md "callback pattern" rule.
+#   same request_id/pending shape. See ARIES.md "callback pattern" rule.
 #
 # Design note on the zigzag problem:
 #   The top-level Bash tool has elaborate blocklists (cat/grep/find blocked
-#   when Repl is on, sed/awk blocked always, etc.) to stop the model from
-#   zigzagging between Bash and Repl for navigation tasks. shell.run does
+#   when code is on, sed/awk blocked always, etc.) to stop the model from
+#   zigzagging between Bash and code for navigation tasks. shell.run does
 #   NOT need those blocks. The model is already inside Python when it calls
 #   shell.run — there's no zigzag to prevent. It called shell.run because
 #   it genuinely wanted shell (build, test, git, install). Don't replicate
@@ -246,6 +246,15 @@ class Shell:
         # takes 30s, we wait 40s for a response (gives TS time to kill a
         # stuck process and send back partial output).
         result = self._call("run", args, timeout=timeout + 10.0)
+
+        # Schema-tolerance alias — model's natural guess from
+        # subprocess/Bun/Node muscle memory is `result["exit_code"]`. The
+        # canonical field is `code` (matches `cmd /c` and `/bin/sh -c`
+        # exit-status convention). Mirror it so both reads succeed without
+        # a recovery turn. Mirrors the body/codebase.py:336 text/snippet
+        # alias pattern.
+        if isinstance(result, dict) and "code" in result and "exit_code" not in result:
+            result["exit_code"] = result["code"]
 
         # 2026-04-25 — failure-time unix-ism hint. Only fires when the
         # command FAILED (non-zero exit) AND a unix-ism was detected in

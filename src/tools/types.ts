@@ -9,6 +9,7 @@ import type { SessionEntry } from '../session/storage.js';
 // telemetry. Added 2026-04-22 for the composition measurement experiment.
 export interface TurnStats {
   replCalls: number;
+  replCellCount: number;    // total cells executed across all Repl calls this turn; added 2026-05-03
   anyComposed: boolean;
   anyMicro: boolean;
   committed: boolean;

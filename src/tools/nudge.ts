@@ -1,6 +1,6 @@
 /**
- * Contextual REPL nudges — appended to tool results when usage patterns
- * suggest REPL composition would be more efficient.
+ * Contextual code nudges — appended to tool results when usage patterns
+ * suggest code-substrate composition would be more efficient.
  *
  * Nudges fire at the moment of decision, right in the tool result the model
  * is about to reason over. Not a system prompt instruction 10K tokens away.
@@ -27,10 +27,10 @@ export function resetNudgeCounters(): void {
 }
 
 /**
- * Inspect tool results and append contextual REPL hints when patterns
+ * Inspect tool results and append contextual code hints when patterns
  * suggest composition would be more efficient. Mutates results in place.
  *
- * Only fires when REPL is enabled — no point nudging toward a tool
+ * Only fires when code is enabled — no point nudging toward a tool
  * the model doesn't have.
  */
 export function applyNudges(results: ToolResult[], replEnabled: boolean): void {
@@ -53,7 +53,7 @@ function detectNudge(result: ToolResult): string | null {
   if (name === 'Grep' || name === 'Glob') {
     const lineCount = output.split('\n').filter(l => l.trim()).length;
     if (lineCount >= 15) {
-      return `${lineCount}+ matches across multiple files. Consider: Repl → codebase.search() → cluster_by_file() → rlm_batch() for synthesis.`;
+      return `${lineCount}+ matches across multiple files. Consider: code -> codebase.search() -> cluster_by_file() -> rlm_batch() for synthesis.`;
     }
   }
 
@@ -61,7 +61,7 @@ function detectNudge(result: ToolResult): string | null {
   if (name === 'Read') {
     readCountThisTurn++;
     if (readCountThisTurn >= 3) {
-      return `${readCountThisTurn} sequential reads this turn. codebase.get_context() can fetch multiple files in one Repl call.`;
+      return `${readCountThisTurn} sequential reads this turn. codebase.get_context() can fetch multiple files in one code call.`;
     }
   }
 
@@ -69,7 +69,7 @@ function detectNudge(result: ToolResult): string | null {
   if (name === 'Read') {
     const lineCount = output.split('\n').length;
     if (lineCount > 200) {
-      return `Large file (${lineCount} lines). Repl → codebase.get_context(file, [target_lines], window=5) for focused slices.`;
+      return `Large file (${lineCount} lines). code -> codebase.get_context(file, [target_lines], window=5) for focused slices.`;
     }
   }
 

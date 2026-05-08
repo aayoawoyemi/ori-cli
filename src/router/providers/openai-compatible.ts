@@ -23,12 +23,23 @@
  *   apiKey: 'sk-...'
  */
 
-import type { ModelProvider, Message, ToolDefinition, StreamEvent, ContentBlock } from '../types.js';
-import type { ModelConfig } from '../../config/types.js';
+import type { ModelProvider, Message, ToolDefinition, StreamEvent, ContentBlock, EffortLevel, SystemPromptInput } from '../types.js';
+import type { ModelConfig, CacheConfig } from '../../config/types.js';
 import {
   OpenAILocalOAuthSource,
   type OpenAIOAuthCredentials,
 } from '../../auth/openAILocalOAuth.js';
+import {
+  buildCacheMarker,
+  detectOpenRouterCacheFormat,
+  injectOpenAIShapeCacheBreakpoints,
+  resolveCacheRetention,
+  shouldEmitPromptCacheKey,
+  type CacheRetention,
+} from '../cache.js';
+import { resolveThinkingFormat, type ThinkingFormat } from '../thinking-formats.js';
+import { sanitizeMessages, sanitizeSystemPrompt } from '../../utils/sanitize.js';
+import { renderSystemPrompt } from '../../prompt.js';
 
 // ── Message Conversion ─────────────────────────────────────────────────────
 
@@ -133,6 +144,14 @@ interface SSEChunk {
         id?: string;
         function?: { name?: string; arguments?: string };
       }>;
+      // Reasoning fields. Different models name them differently:
+      //   - GLM 5+, Kimi, DeepSeek R1, Qwen 3 → `reasoning_content`
+      //   - Some OpenAI-compat shims        → `reasoning` or `reasoning_text`
+      // The thinking-format table tells us which to scan; this type makes
+      // them recognized so the parser can extract whichever the model emits.
+      reasoning_content?: string | null;
+      reasoning?: string | null;
+      reasoning_text?: string | null;
     };
     finish_reason?: string | null;
   }>;
@@ -144,6 +163,16 @@ interface SSEChunk {
     prompt_tokens_details?: {
       cached_tokens?: number;
     };
+    /**
+     * OpenRouter sometimes echoes upstream Anthropic cache fields directly
+     * when routing to anthropic/* models — `cache_creation_input_tokens`
+     * (write count) and `cache_read_input_tokens` (read count). These are
+     * not standard OpenAI fields; reading them lets us surface cache writes
+     * in our `usage` event for OpenRouter+anthropic/ routes. Optional
+     * everywhere else.
+     */
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
   };
 }
 
@@ -152,6 +181,8 @@ interface SSEChunk {
 interface OpenAICompatibleProviderOptions {
   allowLocalOAuth?: boolean;
   oauthSource?: OpenAILocalOAuthSource;
+  /** Prompt-cache retention policy (threaded from ModelRouter via factory). */
+  cache?: CacheConfig;
 }
 
 export class OpenAICompatibleProvider implements ModelProvider {
@@ -164,6 +195,24 @@ export class OpenAICompatibleProvider implements ModelProvider {
   private useOAuth: boolean;
   private oauthSource: OpenAILocalOAuthSource | null = null;
   private oauthCreds: OpenAIOAuthCredentials | null = null;
+  /**
+   * Prompt-cache retention. ENV (ARIES_CACHE_RETENTION / PI_CACHE_RETENTION)
+   * beats config beats default 'short'. Captured at construction.
+   */
+  private readonly cacheRetention: CacheRetention;
+  /**
+   * Session ID for prompt_cache_key affinity. Set once after construction
+   * by ModelRouter.setSessionId. Null until set — provider gracefully
+   * skips emission of prompt_cache_key when null (some test paths or
+   * subagent invocations may construct the provider directly).
+   */
+  private sessionId: string | null = null;
+  /**
+   * Effort level for the next stream call. Drives `reasoning_effort` on
+   * OpenAI gpt-5/o3 (mapped through the thinking-format table). Default
+   * 'high' matches router default — guarantees deep thinking on hard tasks.
+   */
+  private effort: EffortLevel = 'high';
 
   constructor(config: ModelConfig, options: OpenAICompatibleProviderOptions = {}) {
     this.model = config.model;
@@ -171,6 +220,9 @@ export class OpenAICompatibleProvider implements ModelProvider {
     this.maxTokens = config.maxTokens ?? 16_384;
     this.name = `openai-compatible:${config.model}`;
     this.useOAuth = config.auth === 'oauth';
+    // resolveCacheRetention also reads the env override so users can flip
+    // retention without touching YAML — same affordance as pi.
+    this.cacheRetention = resolveCacheRetention(options.cache?.retention);
 
     // Resolve base URL: explicit config > provider-specific default
     const providerDefaults: Record<string, { url: string; envKey: string }> = {
@@ -219,9 +271,45 @@ export class OpenAICompatibleProvider implements ModelProvider {
     }
   }
 
+  /**
+   * Stash the session ID for prompt_cache_key emission. Called by
+   * ModelRouter.setSessionId once at startup, then idempotently for any
+   * provider that gets re-created later (model override, slot reassignment,
+   * transient vision proxy). Effective on the NEXT stream() call.
+   */
+  setSessionId(id: string): void {
+    this.sessionId = id;
+  }
+
+  /**
+   * Set the effort level for the next stream call. Used by the thinking-format
+   * table for models that take an explicit reasoning_effort param (gpt-5,
+   * o3, o4-mini). Models without an effort knob ignore the value.
+   */
+  setEffort(effort: EffortLevel): void {
+    this.effort = effort;
+  }
+
+  /**
+   * Capability bit for prompt-cache helpers. True when the wire endpoint
+   * is known to honor:
+   *   - 1h TTL on cache_control (ttl: '1h'), AND
+   *   - prompt_cache_retention: '24h' on the request body.
+   *
+   * Native OpenAI claims long-TTL support. OpenRouter+anthropic/ inherits
+   * Anthropic's long-TTL support since OpenRouter forwards the markers.
+   * Everything else: false (graceful degradation — DeepSeek/Moonshot/Groq/
+   * Ollama still get plain 5min ephemeral on 'long' rather than 1h).
+   */
+  private get supportsLongTtl(): boolean {
+    if (this.baseUrl.includes('api.openai.com')) return true;
+    if (this.baseUrl.includes('openrouter.ai') && this.model.startsWith('anthropic/')) return true;
+    return false;
+  }
+
   async *stream(
     messages: Message[],
-    systemPrompt: string,
+    systemPrompt: SystemPromptInput,
     tools: ToolDefinition[],
     signal?: AbortSignal,
   ): AsyncGenerator<StreamEvent> {
@@ -231,8 +319,41 @@ export class OpenAICompatibleProvider implements ModelProvider {
       this.apiKey = this.oauthCreds.accessToken;
     }
 
-    const oaiMessages = toOAIMessages(messages, systemPrompt);
+    // Sanitize unpaired UTF-16 surrogates BEFORE serialization. JSON.stringify
+    // happily emits lone surrogate code units; OpenAI-compatible upstreams
+    // typically reject the resulting JSON payload (and the symptom — request
+    // failing on a fetched-content round-trip — looks identical to Anthropic's
+    // `invalid high surrogate` error). See src/utils/sanitize.ts header.
+    messages = sanitizeMessages(messages);
+    const renderedSystemPrompt = sanitizeSystemPrompt(renderSystemPrompt(systemPrompt));
+
+    const oaiMessages = toOAIMessages(messages, renderedSystemPrompt);
     const oaiTools = toOAITools(tools);
+
+    // ── Prompt-cache plumbing ───────────────────────────────────────────
+    //
+    // (1) OpenRouter+anthropic/ — inject Anthropic-style cache_control
+    //     markers into the OpenAI message shape (system block, last tool,
+    //     last user/assistant text). OpenRouter forwards these to Anthropic
+    //     upstream and prompt caching engages. Pre-fix this path sent zero
+    //     markers and lost caching entirely. cache.ts:detectOpenRouterCacheFormat
+    //     decides; cache.ts:injectOpenAIShapeCacheBreakpoints does the work.
+    //
+    // (2) prompt_cache_key / prompt_cache_retention — gated emission on
+    //     the request body. Pi-exact gating
+    //     (cache.ts:shouldEmitPromptCacheKey): OpenAI direct gets it on
+    //     short+long; OpenRouter+anthropic/ only on long; everything else
+    //     only on long if the endpoint claims long-TTL support.
+    const cacheMarker = buildCacheMarker(this.cacheRetention, this.supportsLongTtl);
+    if (detectOpenRouterCacheFormat(this.baseUrl, this.model) === 'anthropic') {
+      injectOpenAIShapeCacheBreakpoints(oaiMessages, oaiTools, cacheMarker);
+    }
+
+    // Resolve thinking format for this (baseUrl, model) pair. Different
+    // reasoning models use different conventions for enabling thinking and
+    // surfacing reasoning content; the table tells us which params to send
+    // and which delta fields to scan. See router/thinking-formats.ts.
+    const thinkingFormat: ThinkingFormat = resolveThinkingFormat(this.baseUrl, this.model);
 
     const body: Record<string, unknown> = {
       model: this.model,
@@ -241,6 +362,18 @@ export class OpenAICompatibleProvider implements ModelProvider {
       stream: true,
       stream_options: { include_usage: true },
     };
+
+    // Apply per-model thinking params (e.g. GLM's `thinking: {type: 'enabled'}`
+    // + `clear_thinking: false`, Qwen's `enable_thinking: true`, OpenAI's
+    // `reasoning_effort`). No-op when the format has no body mutation.
+    thinkingFormat.applyToBody?.(body, this.effort);
+
+    if (this.sessionId && shouldEmitPromptCacheKey(this.baseUrl, this.cacheRetention, this.supportsLongTtl)) {
+      body.prompt_cache_key = this.sessionId;
+      if (this.cacheRetention === 'long' && this.supportsLongTtl) {
+        body.prompt_cache_retention = '24h';
+      }
+    }
 
     if (oaiTools.length > 0) {
       body.tools = oaiTools;
@@ -289,6 +422,11 @@ export class OpenAICompatibleProvider implements ModelProvider {
     let inputTokens = 0;
     let outputTokens = 0;
     let cacheReadTokens = 0;
+    // OpenRouter+anthropic/ echoes Anthropic cache fields directly in usage.
+    // Track cache writes here so the bench harness can see when long-TTL
+    // caching is actually paying off — pre-fix this was always 0 because
+    // we sent zero markers and the upstream never wrote anything.
+    let cacheWriteTokens = 0;
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -317,15 +455,44 @@ export class OpenAICompatibleProvider implements ModelProvider {
             continue;
           }
 
-          // Usage (some providers send this in the final chunk)
+          // Usage (some providers send this in the final chunk).
+          // Prefer the OpenAI-standard `prompt_tokens_details.cached_tokens`
+          // for cache reads. Fall back to OpenRouter's echoed Anthropic
+          // field `cache_read_input_tokens` when the standard field is
+          // missing — some OpenRouter routes only surface the upstream name.
+          // Cache writes come solely from the echoed Anthropic field; OpenAI
+          // doesn't expose write counts at all.
           if (chunk.usage) {
             inputTokens = chunk.usage.prompt_tokens ?? 0;
             outputTokens = chunk.usage.completion_tokens ?? 0;
-            cacheReadTokens = chunk.usage.prompt_tokens_details?.cached_tokens ?? 0;
+            cacheReadTokens =
+              chunk.usage.prompt_tokens_details?.cached_tokens
+              ?? chunk.usage.cache_read_input_tokens
+              ?? 0;
+            cacheWriteTokens = chunk.usage.cache_creation_input_tokens ?? 0;
           }
 
           const choice = chunk.choices?.[0];
           if (!choice?.delta) continue;
+
+          // Reasoning content (GLM 5+, Kimi, DeepSeek R1, Qwen 3, etc).
+          // Different models name the field differently — the thinking format
+          // tells us which to scan, in priority order. First non-empty wins.
+          // Yielded as `thinking` events so the UI renders them as dim italic
+          // (parity with Anthropic's thinking blocks). Without this, GLM's
+          // entire reasoning stream was being silently dropped on the floor —
+          // model still ran in non-thinking mode (without applyToBody) AND
+          // any reasoning the model DID emit was invisible to the user.
+          if (thinkingFormat.readDeltaFields.length > 0) {
+            const deltaAny = choice.delta as unknown as Record<string, unknown>;
+            for (const field of thinkingFormat.readDeltaFields) {
+              const reasoning = deltaAny[field];
+              if (typeof reasoning === 'string' && reasoning.length > 0) {
+                yield { type: 'thinking', content: reasoning };
+                break;
+              }
+            }
+          }
 
           // Text content
           if (choice.delta.content) {
@@ -389,6 +556,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
       outputTokens,
       totalTokens: inputTokens + outputTokens,
       cacheReadTokens,
+      cacheWriteTokens,
     };
     yield { type: 'done' };
   }

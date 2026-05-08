@@ -1,6 +1,6 @@
 """
 NAMESPACE_SIGNATURES — the single authoritative source of primitive signatures
-and return shapes for the Repl namespace. Three sinks read from this table:
+and return shapes for the code namespace. Three sinks read from this table:
 
   1. body/server.py:_format_first_turn_banner — generates the Shapes block
      shown in the first-turn banner, filtered to primitives actually bound
@@ -59,6 +59,12 @@ NAMESPACE_SIGNATURES: dict[str, dict[str, str]] = {
                    "returns": "{ok, replacements, ...}"},
     "fs.patch":   {"sig": "(path, edits, replace_all=False)",
                    "returns": "{ok, results, ...}"},
+    "fs.grep":    {"sig": "(pattern, path, ignore_case=False, literal=False, context=0)",
+                   "returns": "list[{line, text}]  # 1-indexed line numbers"},
+    "fs.rgrep":   {"sig": "(pattern, path='.', glob_pattern='*', ignore_case=False, literal=False, limit=100, hidden=False)",
+                   "returns": "list[{file, line, text}]  # recursive; respects skip set (node_modules/.git/dist/build/.aries)"},
+    "fs.tree":    {"sig": "(path='.', max_depth=3, show_hidden=False)",
+                   "returns": "str  # ascii directory tree"},
 
     # ── vault (body/vault.py) ───────────────────────────────────────────
     # All vault retrievals share the {results: [...], ...} envelope. Access
@@ -114,7 +120,7 @@ NAMESPACE_SIGNATURES: dict[str, dict[str, str]] = {
     # get_context chains are common). Shapes below match the real return
     # types; tuple-returning methods are explicit about [(x, y), ...].
     "codebase.search":              {"sig": "(query, limit=50)",
-                                     "returns": "list[{file, line, snippet}]"},
+                                     "returns": "list[{file, line, snippet, text}]  # text is alias for snippet"},
     "codebase.find_symbol":         {"sig": "(name)",
                                      "returns": "list[{file, line, kind}]"},
     "codebase.get_context":         {"sig": "(file_path, line_numbers=None, window=5)",
@@ -161,6 +167,8 @@ NAMESPACE_SIGNATURES: dict[str, dict[str, str]] = {
                   "returns": "{stdout, stderr, code}"},
 
     # ── web (body/web.py) ───────────────────────────────────────────────
+    "web.read":   {"sig": "(url, max_length=50000)",
+                   "returns": "str  # reader-mode page text/markdown (alias for web.fetch)"},
     "web.fetch":  {"sig": "(url, max_length=50000)",
                    "returns": "str"},
     "web.search": {"sig": "(query, max_results=10)",
@@ -204,6 +212,68 @@ NAMESPACE_SIGNATURES: dict[str, dict[str, str]] = {
     # ── session control (body/server.py) ───────────────────────────────
     "reindex": {"sig": "(repo_path)",
                 "returns": "None  # rebuilds codebase graph"},
+
+    # ── namespace inspector (this file + body/server.py) ─────────────────
+    "api.list":     {"sig": "(query='')",
+                     "returns": "list[{name, sig, returns, cost, effects}]"},
+    "api.search":   {"sig": "(query)",
+                     "returns": "list[{name, sig, returns, cost, effects}]"},
+    "api.describe": {"sig": "(primitive)",
+                     "returns": "{name, sig, returns, cost, effects}  # or {error, suggestions}"},
+    "api.costs":    {"sig": "()",
+                     "returns": "{summary, groups}  # cost tier -> primitives"},
+    "api.stub":     {"sig": "()",
+                     "returns": "str  # generated Python .pyi-style namespace stub"},
+
+    # ── goal planning + Stay Spanner (body/plan.py + body/spanner.py) ───
+    "plan.create":       {"sig": "(goal, intent='', layers=None, slug=None)",
+                          "returns": "{ok, path, goal, layer_count, phase_count, warnings}"},
+    "plan.read":         {"sig": "()",
+                          "returns": "str  # current plan markdown"},
+    "plan.append_layer": {"sig": "(name, phases, rationale='', layer_id=None)",
+                          "returns": "{ok, layer, warnings}"},
+    "plan.enter_phase":  {"sig": "(phase_id)",
+                          "returns": "{ok, phase}  # marks phase active for telemetry"},
+    "plan.exit_phase":   {"sig": "(phase_id=None, outputs=None)",
+                          "returns": "{ok, phase} | {error, missing_produces_state, phase}  # rejects when produces_state keys are absent"},
+    "plan.status":       {"sig": "()",
+                          "returns": "{active, goal, path, active_phase_id, layer_count, phase_count, composition_policy, state_contracts, warnings}"},
+    "spanner.escalate":  {"sig": "(reason, layers=None, tier='planned')",
+                          "returns": "{tier, reason, layers}  # model-declared escalation"},
+    "spanner.status":    {"sig": "()",
+                          "returns": "{tier, reason, layers}"},
+
+    # durable state handoff (body/state.py)
+    "state.put":      {"sig": "(key, value, note='')",
+                       "returns": "{ok, key, summary, note, updated_at}  # JSON-only durable session handoff"},
+    "state.get":      {"sig": "(key, default=None)",
+                       "returns": "JSON value | default"},
+    "state.has":      {"sig": "(key)",
+                       "returns": "bool"},
+    "state.list":     {"sig": "(prefix='')",
+                       "returns": "list[str]  # stored keys"},
+    "state.delete":   {"sig": "(key)",
+                       "returns": "{ok, key, deleted}"},
+    "state.receipts": {"sig": "(prefix='')",
+                       "returns": "list[{key, summary, note, updated_at}]"},
+
+    # ── compose sub-loop scratch (body/scratch.py) ────────────────────
+    # Per-request markdown notebook. Created by the harness when compose
+    # mode is selected; the model can also call scratch.start to displace.
+    # Sections: interpretation, plan, preflight, findings, verification,
+    # repair, final. append() adds a timestamped entry; set() replaces.
+    "scratch.start":   {"sig": "(intent, user_request='', mode='compose')",
+                        "returns": "{ok, path, intent, mode}  # creates per-request scratch markdown"},
+    "scratch.read":    {"sig": "()",
+                        "returns": "str  # full scratch markdown contents"},
+    "scratch.status":  {"sig": "()",
+                        "returns": "{active, path?, intent?, mode?, char_count?, sections_filled?, sections_empty?}"},
+    "scratch.append":  {"sig": "(section, text)",
+                        "returns": "{ok, section, mode, path}  # append-only entry; section in {interpretation,plan,preflight,findings,verification,repair,final}"},
+    "scratch.set":     {"sig": "(section, text)",
+                        "returns": "{ok, section, mode, path}  # replace section contents"},
+    "scratch.close":   {"sig": "()",
+                        "returns": "{ok, existed, path}  # delete the scratch file"},
 }
 
 
@@ -236,6 +306,237 @@ def get(primitive: str) -> dict[str, str] | None:
     import surface small and makes future refactors (e.g., lazy loading
     from a JSON file) a single-callsite change."""
     return NAMESPACE_SIGNATURES.get(primitive)
+
+
+# ── Generated Python API stub + inspector metadata ────────────────────────
+# Level 1 #8/#9 (2026-05-03): the code namespace should be inspectable from
+# inside Python itself. The model should not spend turns reverse-engineering
+# `dir(fs)`, guessing return shapes, or learning costs by stepping on them.
+# These helpers are generated from NAMESPACE_SIGNATURES so the same source
+# drives: first-turn banner, traceback enrichment, api.stub(), api.describe(),
+# and composition/cost telemetry in body/shape.py.
+
+_CLASS_NAMES = {
+    "api": "Api",
+    "fs": "Fs",
+    "vault": "Vault",
+    "codebase": "Codebase",
+    "shell": "Shell",
+    "web": "Web",
+    "research": "Research",
+    "plan": "Plan",
+    "spanner": "Spanner",
+    "state": "State",
+    "scratch": "Scratch",
+}
+
+
+def _annotation_from_returns(returns: str) -> str:
+    """Best-effort Python annotation for the generated stub.
+
+    NAMESPACE_SIGNATURES intentionally stores human-readable return shapes,
+    not machine schemas. The stub only needs to be parseable and helpful, so
+    we collapse rich shapes like `list[{file, line}]` to `list[dict]` while
+    preserving scalars. The exact shape remains as an inline comment.
+    """
+    shape = returns.split("#", 1)[0].strip()
+    if shape.startswith("None"):
+        return "None"
+    if shape.startswith("str"):
+        return "str"
+    if shape.startswith("dict") or shape.startswith("{"):
+        return "dict"
+    if shape.startswith("list[str]"):
+        return "list[str]"
+    if shape.startswith("list["):
+        return "list[dict]"
+    if shape.startswith("tuple["):
+        return "tuple"
+    if "|" in shape:
+        return "object"
+    return "object"
+
+
+def _method_sig(sig: str, include_self: bool) -> str:
+    inner = sig[1:-1].strip() if sig.startswith("(") and sig.endswith(")") else sig
+    if not include_self:
+        return sig
+    if inner:
+        return f"(self, {inner})"
+    return "(self)"
+
+
+def _sorted_primitives(primitives=None) -> list[str]:
+    if primitives is None:
+        return sorted(NAMESPACE_SIGNATURES)
+    allowed = set(primitives)
+    return sorted(p for p in NAMESPACE_SIGNATURES if p in allowed)
+
+
+def render_python_stub(primitives=None) -> str:
+    """Return a generated .pyi-style stub for the visible code namespace."""
+    keys = _sorted_primitives(primitives)
+    grouped: dict[str, list[str]] = {}
+    bare: list[str] = []
+    for primitive in keys:
+        if "." in primitive:
+            ns_name, _method = primitive.split(".", 1)
+            grouped.setdefault(ns_name, []).append(primitive)
+        else:
+            bare.append(primitive)
+
+    lines: list[str] = [
+        "# Generated from body/schema.py:NAMESPACE_SIGNATURES.",
+        "# Exact return shapes are preserved as comments after each signature.",
+        "",
+    ]
+
+    for ns_name in sorted(grouped):
+        class_name = _CLASS_NAMES.get(ns_name, "".join(part.title() for part in ns_name.split("_")))
+        lines.append(f"class {class_name}:")
+        for primitive in grouped[ns_name]:
+            method = primitive.split(".", 1)[1]
+            entry = NAMESPACE_SIGNATURES[primitive]
+            annotation = _annotation_from_returns(entry["returns"])
+            sig = _method_sig(entry["sig"], include_self=True)
+            lines.append(f"    def {method}{sig} -> {annotation}: ...  # {entry['returns']}")
+        lines.append("")
+        lines.append(f"{ns_name}: {class_name}")
+        lines.append("")
+
+    for primitive in bare:
+        entry = NAMESPACE_SIGNATURES[primitive]
+        annotation = _annotation_from_returns(entry["returns"])
+        lines.append(f"def {primitive}{entry['sig']} -> {annotation}: ...  # {entry['returns']}")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def primitive_cost_effect(primitive: str) -> tuple[str, list[str]]:
+    """Classify a primitive by cost tier and side-effect family.
+
+    This is intentionally coarse. The model needs to know whether a call is
+    local/free vs. LLM/network/shell/bridge-expensive, not a micro-priced USD
+    estimate. Runtime token dollars still live in TS UsageTracker; this is
+    substrate-level routing metadata used by api.costs() and code footers.
+    """
+    if primitive.startswith("api."):
+        return "local", ["inspect"]
+    if primitive.startswith("rlm_"):
+        return "llm", ["reason"]
+    if primitive.startswith("web."):
+        return "network", ["read"]
+    if primitive == "shell.run":
+        return "shell", ["exec"]
+    if primitive == "done":
+        return "local", ["commit"]
+    if primitive == "ask":
+        return "blocking", ["prompt"]
+    if primitive == "say":
+        return "local", ["voice"]
+    if primitive.startswith("plan."):
+        return "local", ["plan"]
+    if primitive.startswith("spanner."):
+        return "local", ["telemetry"]
+    if primitive.startswith("state."):
+        if primitive in ("state.put", "state.delete"):
+            return "local", ["state", "write"]
+        return "local", ["state", "read"]
+    if primitive.startswith("scratch."):
+        if primitive in ("scratch.start", "scratch.append", "scratch.set", "scratch.close"):
+            return "local", ["scratch", "write"]
+        return "local", ["scratch", "read"]
+    if primitive == "reindex" or primitive == "codebase.refresh_files":
+        return "local", ["index", "write"]
+    if primitive.startswith("vault.add"):
+        return "mcp", ["write"]
+    if primitive.startswith("vault."):
+        return "mcp", ["read"]
+    if primitive.startswith("research.save"):
+        return "network", ["write"]
+    if primitive.startswith("research."):
+        return "network", ["read"]
+    if primitive.startswith(("fs.write", "fs.edit", "fs.patch", "fs.edit_lines")):
+        return "bridge", ["write"]
+    if primitive.startswith(("fs.", "codebase.")):
+        return "local", ["read"]
+    return "local", ["read"]
+
+
+def primitive_metadata(primitive: str) -> dict:
+    """Return inspector metadata for one primitive."""
+    entry = NAMESPACE_SIGNATURES.get(primitive)
+    if entry is None:
+        return {}
+    cost, effects = primitive_cost_effect(primitive)
+    return {
+        "name": primitive,
+        "sig": entry["sig"],
+        "returns": entry["returns"],
+        "cost": cost,
+        "effects": effects,
+    }
+
+
+class NamespaceApi:
+    """Runtime inspector for the visible code namespace.
+
+    Bound as `api` in body/server.py. The visible-primitives callback is
+    supplied by the server so api.stub()/api.list() stay honest about the
+    current session: vault/research/rlm only appear when actually connected.
+    """
+
+    def __init__(self, visible_primitives=None):
+        self._visible_primitives = visible_primitives
+
+    def _names(self) -> list[str]:
+        if self._visible_primitives is None:
+            return _sorted_primitives()
+        return _sorted_primitives(self._visible_primitives())
+
+    def list(self, query: str = "") -> list[dict]:
+        """List visible primitives with signatures, return shapes, and cost."""
+        q = (query or "").lower()
+        rows: list[dict] = []
+        for name in self._names():
+            meta = primitive_metadata(name)
+            haystack = f"{name} {meta.get('sig', '')} {meta.get('returns', '')}".lower()
+            if q and q not in haystack:
+                continue
+            rows.append(meta)
+        return rows
+
+    def search(self, query: str) -> list[dict]:
+        """Search visible primitives by name/signature/return-shape text."""
+        return self.list(query)
+
+    def describe(self, primitive: str) -> dict:
+        """Describe one primitive, with suggestions on miss."""
+        name = str(primitive)
+        visible = self._names()
+        if name in visible:
+            return primitive_metadata(name)
+        q = name.lower()
+        suggestions = [p for p in visible if q in p.lower() or p.lower() in q][:8]
+        return {
+            "error": f"unknown or unavailable primitive: {name}",
+            "suggestions": suggestions,
+        }
+
+    def costs(self) -> dict:
+        """Group visible primitives by coarse cost tier."""
+        groups: dict[str, list[str]] = {}
+        for name in self._names():
+            cost, _effects = primitive_cost_effect(name)
+            groups.setdefault(cost, []).append(name)
+        return {
+            "summary": {cost: len(names) for cost, names in sorted(groups.items())},
+            "groups": {cost: sorted(names) for cost, names in sorted(groups.items())},
+        }
+
+    def stub(self) -> str:
+        """Return generated Python signatures for the visible namespace."""
+        return render_python_stub(self._names())
 
 
 # Namespace version hash — pulled forward from A.9.1 (gotcha invalidation).

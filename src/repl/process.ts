@@ -64,7 +64,7 @@ export class ReplProcess {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
       cwd: this.opts.cwd,
-      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+      env: { ...process.env, PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
       // POSIX: detached gives the child its own process group so killTree()
       // can take down the whole subtree via process.kill(-pid). Windows
       // doesn't support this without breaking stdio piping; we use

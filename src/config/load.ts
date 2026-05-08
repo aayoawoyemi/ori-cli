@@ -107,6 +107,17 @@ export function loadConfig(cwd: string): AriesConfig {
     }
   }
 
+  // Cache retention env override. Applied after YAML merges so a user can
+  // flip retention for a single session without editing YAML — same affordance
+  // pi gives via PI_CACHE_RETENTION (we accept that name as a fallback for
+  // muscle memory). Validates against the three known values; silently
+  // ignores garbage rather than crashing the CLI on a stray env typo.
+  const retEnv = process.env.ARIES_CACHE_RETENTION ?? process.env.PI_CACHE_RETENTION;
+  if (retEnv === 'short' || retEnv === 'long' || retEnv === 'none') {
+    const cacheBlock = ((config as Record<string, unknown>).cache ??= {}) as Record<string, unknown>;
+    cacheBlock.retention = retEnv;
+  }
+
   return config as unknown as AriesConfig;
 }
 

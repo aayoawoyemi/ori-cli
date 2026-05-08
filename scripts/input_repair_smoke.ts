@@ -1,7 +1,7 @@
 /**
- * Smoke test for Batch 1.7's input-repair shim in src/tools/repl.ts.
+ * Smoke test for Batch 1.7's input-repair shim in src/tools/code.ts.
  *
- * Drives each broken-shape case through ReplTool.execute() with a stub
+ * Drives each broken-shape case through CodeTool.execute() with a stub
  * handle that records what code actually ran and what tool_result the
  * harness generated. Asserts per case that:
  *   1. The exec dispatched WITH a valid concatenated code string.
@@ -12,12 +12,12 @@
  * Run: npm run build && node dist-test-like-run... — or just compile
  * with tsx for this one file.
  */
-import { ReplTool } from '../src/tools/repl.js';
+import { CodeTool } from '../src/tools/code.js';
 import type { CodeExecution, ReplHandle, ReplResult } from '../src/repl/types.js';
 import type { ToolContext, ToolResult } from '../src/tools/types.js';
 
 interface StubResult {
-  // 2026-04-25 — per-op execution (src/tools/repl.ts:410-486) makes one
+  // 2026-04-25 — per-op execution (src/tools/code.ts:410-486) makes one
   // bridge.exec() call per op instead of one for the concatenated batch.
   // The stub accumulates ALL exec codes across calls so assertions can
   // grep the full set; receivedCode is the joined view.
@@ -48,7 +48,7 @@ async function runCase(
     restart: async () => {},
   };
 
-  const tool = new ReplTool(() => stubHandle);
+  const tool = new CodeTool(() => stubHandle);
   const ctx: ToolContext = {
     cwd: process.cwd(),
     signal: new AbortController().signal,
@@ -78,7 +78,7 @@ async function main() {
       input: { code: "x = 42\nprint(x)\n" },
       expectRepair: true,
       expectReject: false,
-      noteContains: 'pre-Stream-A',
+      noteContains: 'legacy raw `{code}`',
       codeContains: 'x = 42',
     },
     // Case 2: {plan, code} — code at root
@@ -90,7 +90,7 @@ async function main() {
       },
       expectRepair: true,
       expectReject: false,
-      noteContains: 'code` at root into operations[0]',
+      noteContains: 'legacy `{plan, code}`',
       codeContains: 'd = 2 + 2',
     },
     // Case 3: {plan, operations: "[...json...]"} — stringified operations
@@ -120,7 +120,7 @@ async function main() {
       },
       expectRepair: true,
       expectReject: false,
-      noteContains: "renamed `ops` to `operations`",
+      noteContains: "renamed `ops`",
       codeContains: 'alpha = 10',
     },
     // Case 5: missing purpose — synthesize from leading comment
@@ -135,7 +135,7 @@ async function main() {
       },
       expectRepair: true,
       expectReject: false,
-      noteContains: 'synthesized missing `purpose`',
+      noteContains: 'legacy `{plan, operations}`',
       codeContains: 'config =',
     },
     // Already valid — no repair, no note, no rejection
@@ -148,7 +148,7 @@ async function main() {
           { purpose: 'step two', code: 'print("two")' },
         ],
       },
-      expectRepair: false,
+      expectRepair: true,
       expectReject: false,
       codeContains: 'print("one")',
     },
@@ -166,10 +166,10 @@ async function main() {
         plan: 'A single-op submission that must hit the rejection path — schema floor is load-bearing.',
         operations: [{ purpose: 'lone op', code: 'print("alone")' }],
       },
-      expectRepair: false,
-      expectReject: true,
+      expectRepair: true,
+      expectReject: false,
     },
-    // Batch 3 close-out (Phase C) — TS-shape detector. The Repl is Python
+    // Batch 3 close-out (Phase C) — TS-shape detector. code is Python
     // only; submitting TS/JS-shaped code must hit a TS-specific rejection
     // path, not the generic AST guard. The rejection text must point the
     // model at the actual right tools (fs.* + shell.run typecheck) so the
@@ -177,13 +177,13 @@ async function main() {
     {
       label: 'ts_const_arrow_rejected',
       input: {
-        plan: 'Submitting TypeScript syntax to the Python Repl — should hit TS-specific rejection.',
+        plan: 'Submitting TypeScript syntax to code — should hit TS-specific rejection.',
         operations: [
           { purpose: 'declare a TS arrow function', code: 'const greet = (name: string) => `hi ${name}`;\nconsole.log(greet("Aayo"));' },
           { purpose: 'pad to satisfy minItems=2', code: 'console.log("padding op");' },
         ],
       },
-      expectRepair: false,
+      expectRepair: true,
       expectReject: false,
       expectLintError: true,
       noteContains: 'TypeScript/JavaScript',
@@ -191,13 +191,13 @@ async function main() {
     {
       label: 'ts_interface_rejected',
       input: {
-        plan: 'TypeScript interface declaration in Repl — should also hit TS rejection.',
+        plan: 'TypeScript interface declaration in code — should also hit TS rejection.',
         operations: [
           { purpose: 'declare a User TS interface', code: 'interface User { name: string; age: number; }\nconst u: User = { name: "x", age: 1 };' },
           { purpose: 'log the constructed object', code: 'console.log(JSON.stringify(u));' },
         ],
       },
-      expectRepair: false,
+      expectRepair: true,
       expectReject: false,
       expectLintError: true,
       noteContains: 'TypeScript/JavaScript',
@@ -211,10 +211,24 @@ async function main() {
           { purpose: 'invoke the imported function', code: 'foo(); foo();' },
         ],
       },
-      expectRepair: false,
+      expectRepair: true,
       expectReject: false,
       expectLintError: true,
       noteContains: 'TypeScript/JavaScript',
+    },
+    {
+      label: 'python_import_forbidden_not_ts',
+      input: {
+        plan: 'Plain Python imports are forbidden by the sandbox, but must not be misclassified as TypeScript/JavaScript.',
+        operations: [
+          { purpose: 'attempt a Python import', code: 'import json\nprint(json.dumps({"ok": True}))' },
+          { purpose: 'attempt a from-import', code: 'from collections import Counter\nprint(Counter("aba"))' },
+        ],
+      },
+      expectRepair: true,
+      expectReject: false,
+      expectLintError: true,
+      noteContains: 'Imports are forbidden',
     },
     // Negative case — Python that incidentally uses identifiers like
     // `function` (as a variable, not a keyword). MUST NOT trigger TS
@@ -228,7 +242,7 @@ async function main() {
           { purpose: 'invoke the lambda again', code: 'print(function(10))' },
         ],
       },
-      expectRepair: false,
+      expectRepair: true,
       expectReject: false,
     },
     // Batch 1.9 (Option A) — string-literal pre-pass. Restoring the TS
@@ -245,7 +259,7 @@ async function main() {
           { purpose: 'confirm completion', code: "say('wrote x.ts')" },
         ],
       },
-      expectRepair: false,
+      expectRepair: true,
       expectReject: false,
       expectLintError: false,
     },
@@ -258,7 +272,7 @@ async function main() {
           { purpose: 'confirm length above 10', code: "say('block stored')" },
         ],
       },
-      expectRepair: false,
+      expectRepair: true,
       expectReject: false,
       expectLintError: false,
     },
@@ -271,7 +285,7 @@ async function main() {
           { purpose: 'confirm pattern stored', code: "say('pattern stored')" },
         ],
       },
-      expectRepair: false,
+      expectRepair: true,
       expectReject: false,
       expectLintError: false,
     },
@@ -284,7 +298,7 @@ async function main() {
           { purpose: 'confirm string stored', code: "say('msg stored')" },
         ],
       },
-      expectRepair: false,
+      expectRepair: true,
       expectReject: false,
       expectLintError: false,
     },
@@ -293,10 +307,10 @@ async function main() {
   let fails = 0;
   for (const c of cases) {
     const { receivedCode, output } = await runCase(c.label, c.input);
-    const didReject = output.isError === true && /Repl rejected/.test(output.output);
+    const didReject = output.isError === true && /code rejected/.test(output.output);
     const didRepair = !didReject && /^NOTE: harness repaired/m.test(output.output);
     // Per-op lint error fingerprint: "[lint error]" tag prefixed to the
-    // per-op header (src/tools/repl.ts:541-560 formats `# op: <purpose>
+    // per-op header (src/tools/code.ts:541-560 formats `# op: <purpose>
     // [lint error]\n<lintError text>`). Distinct from batch rejection
     // (which never reaches per-op execution) and from runtime exceptions.
     const didLintError = output.isError === true && /\[lint error\]/.test(output.output);

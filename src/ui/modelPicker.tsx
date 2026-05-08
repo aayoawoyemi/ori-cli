@@ -9,9 +9,14 @@ const EFFORT_SYMBOLS: Record<EffortLevel, string> = {
   low: figures.effortLow,
   medium: figures.effortMedium,
   high: figures.effortHigh,
+  // 'max' was added to EffortLevel in router/index.ts on 2026-05-01
+  // (full-capacity tier: 128K maxTokens, 100K thinking budget). Reusing the
+  // 'high' glyph rather than introducing a new figure since the picker UI
+  // doesn't yet need to visually distinguish max from high.
+  max: figures.effortHigh,
 };
 
-const EFFORT_LEVELS: EffortLevel[] = ['low', 'medium', 'high'];
+const EFFORT_LEVELS: EffortLevel[] = ['low', 'medium', 'high', 'max'];
 
 function cycleEffort(current: EffortLevel, direction: 'left' | 'right'): EffortLevel {
   const idx = EFFORT_LEVELS.indexOf(current);
@@ -84,8 +89,10 @@ const MODEL_FAMILIES: ModelFamily[] = [
     name: 'Open Models (direct APIs)',
     description: 'DashScope, Moonshot, Groq, DeepSeek',
     models: [
-      { value: 'deepseek', label: 'DeepSeek V3', description: '128K', supportsEffort: false, defaultEffort: 'medium' },
-      { value: 'deepseek-r1', label: 'DeepSeek R1', description: '128K - Reasoning', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash', description: '1M ctx · $0.14/$0.28', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'deepseek-v4-pro',   label: 'DeepSeek V4 Pro',   description: '1M ctx · $1.74/$3.48', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'deepseek', label: 'DeepSeek (V4 Flash alias)', description: '1M ctx', supportsEffort: false, defaultEffort: 'medium' },
+      { value: 'deepseek-r1', label: 'DeepSeek R1 (V4 Flash alias)', description: '1M ctx', supportsEffort: false, defaultEffort: 'medium' },
       { value: 'qwen3.6', label: 'Qwen3.6-Plus', description: '131K - DashScope', supportsEffort: false, defaultEffort: 'medium' },
       { value: 'qwen3', label: 'Qwen3 235B', description: '131K - DashScope', supportsEffort: false, defaultEffort: 'medium' },
       { value: 'kimi', label: 'Kimi K2', description: '128K - Moonshot', supportsEffort: false, defaultEffort: 'medium' },

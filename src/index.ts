@@ -10,20 +10,23 @@ import { loadConfig } from './config/load.js';
 import { ModelRouter, isReplCapableModel } from './router/index.js';
 import type { EffortLevel } from './router/index.js';
 import { createCoreRegistry, registerMemoryTools } from './tools/registry.js';
-import { buildSystemPrompt } from './prompt.js';
+import { buildComposeRequestSystemPrompt, buildSystemPrompt } from './prompt.js';
 import { OriVault, findVault } from './memory/vault.js';
 import { readExperienceLog } from './memory/experienceLog.js';
 import { ProjectBrain } from './memory/projectBrain.js';
 import { SessionStorage } from './session/storage.js';
+import { UsageTracker } from './telemetry/tracker.js';
 import { detectExistingSetup } from './onboarding/detect.js';
 import { runOnboarding } from './onboarding/index.js';
 import { App } from './ui/app.js';
 import type { VaultIdentity } from './memory/vault.js';
-import type { Message } from './router/types.js';
+import type { Message, SystemPromptInput } from './router/types.js';
 import type { AriesConfig } from './config/types.js';
 import { assembleWarmContext } from './memory/warmContext.js';
 import { setupReplBridge, type ReplHandle } from './repl/setup.js';
-import { registerReplTool } from './tools/registry.js';
+import { registerCodeTool } from './tools/registry.js';
+import { ComposeController } from './compose/controller.js';
+import { classifyRequestMode, newRequestId } from './compose/router.js';
 import { checkForUpdate, getLocalVersion } from './update/check.js';
 import { printUpdateNotification } from './update/notify.js';
 import type { UpdateResult } from './update/check.js';
@@ -188,8 +191,24 @@ async function compileAmbientSignatures(
       : 'cwd is the vault (vault-only mode)';
     options.log?.(`codebase signature: skipped (${reason})`);
   } else try {
-    const idxResult = await replHandle.bridge.index({ repoPath: options.cwd });
-    if (idxResult.ok) {
+    // 2026-05-03: startup indexing moved out of signature compilation for
+    // headless. Pre-fix, includeInHeadless=false meant the bridge existed
+    // but CODEBASE stayed as the not-ready stub; the first benchmark task
+    // burned 23 model turns / 432K total tokens retrying codebase.search.
+    // Signature compilation should consume an already-ready index when
+    // present, and only index as a fallback for older / interactive paths
+    // that haven't done readiness-gated startup indexing yet.
+    let stats = await replHandle.bridge.codebaseStats();
+    if ('error' in stats && stats.error) {
+      const idxResult = await replHandle.bridge.index({ repoPath: options.cwd });
+      if (!idxResult.ok) {
+        options.log?.(`codebase signature: index failed (${idxResult.error ?? 'unknown'})`, true);
+        stats = { error: idxResult.error ?? 'index failed' };
+      } else {
+        stats = await replHandle.bridge.codebaseStats();
+      }
+    }
+    if (!('error' in stats) || !stats.error) {
       const sig = await replHandle.bridge.codebaseSignature(
         options.signature.codebase.level,
         options.signature.codebase.maxTokens,
@@ -235,6 +254,7 @@ let maxTurns = 50;
 let continueSession = false;
 let resumeArg: string | undefined;
 let sessionName: string | undefined;
+let headlessFlag = false;
 
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--model' || args[i] === '-m') {
@@ -258,6 +278,7 @@ ${chalk.bold('Ori CLI')} - Memory-native coding agent
 ${chalk.dim('Usage:')}
   ori                      Start interactive session
   ori "prompt here"        Single prompt, then interactive
+  ori --headless "task"    Run one compose-wired headless task and print result
   ori --model opus         Use a specific model slot
   ori -c                   Continue most recent session
   ori -r                   Resume a session (interactive picker)
@@ -268,6 +289,7 @@ ${chalk.dim('Options:')}
   -c, --continue           Continue most recent session
   -r, --resume [query]     Resume session by ID, title, or number
   -n, --name <title>       Name this session
+  --headless               Run one prompt without the terminal UI
   -h, --help               Show this help
   --version                Show version
 
@@ -280,6 +302,7 @@ ${chalk.dim('In-session commands:')}
   /tools                   List available tools
   /vault                   Show vault status
   /brain                   Show project brain contents
+  /headless <task>         Launch a separate compose-wired headless session
   /help                    Show commands
   /exit                    Exit
 `);
@@ -289,6 +312,8 @@ ${chalk.dim('In-session commands:')}
     process.exit(0);
   } else if (args[i] === '--read-only') {
     readOnlyMode = true;
+  } else if (args[i] === '--headless') {
+    headlessFlag = true;
   } else if (args[i] === '--max-turns') {
     maxTurns = parseInt(args[++i], 10);
   } else if (!args[i].startsWith('-')) {
@@ -298,15 +323,26 @@ ${chalk.dim('In-session commands:')}
 
 const config = loadConfig(cwd);
 process.env.TZ = config.timezone;
-const isSubagent = process.env.ARIES_SUBAGENT === '1';
+const isHeadless = headlessFlag || process.env.ARIES_HEADLESS === '1';
+// Loop3 is the default runtime as of 2026-05-06. Legacy loop (the original
+// `agentLoop` from src/loop.ts with 14+ top-level tools) is opt-in via
+// ARIES_LEGACY_LOOP=1 for fallback during the post-flip shakedown. Loop2
+// remains an explicit opt-in escape hatch for headless bench reruns that
+// reference its specific event types. Precedence: legacy > loop2 > loop3.
+const useLegacyLoop = process.env.ARIES_LEGACY_LOOP === '1';
+const useLoop2Headless = isHeadless && process.env.ARIES_LOOP2 === '1' && !useLegacyLoop;
+const useLoop3Headless = isHeadless && !useLegacyLoop && !useLoop2Headless;
+if (!isHeadless && process.env.ARIES_LOOP2 === '1' && !useLegacyLoop) {
+  console.error(chalk.yellow('ARIES_LOOP2=1 is currently headless-only; interactive mode is using Loop3 (the default).'));
+}
 
 // Fire update check early — non-blocking, resolves in background
-const updateCheckPromise: Promise<UpdateResult | null> = isSubagent
+const updateCheckPromise: Promise<UpdateResult | null> = isHeadless
   ? Promise.resolve(null)
   : checkForUpdate().catch(() => null);
 
 const detection = detectExistingSetup(cwd, config.vault.path);
-if (!isSubagent && detection.isFirstRun) {
+if (!isHeadless && detection.isFirstRun) {
   const result = await runOnboarding();
   config.agent.name = result.agentName;
   if (result.vaultPath) {
@@ -328,10 +364,25 @@ const vaultPath = config.vault.path || findVault();
 // etc.). The 2026-04-29 diagnosis found 11 zombies on the user's machine,
 // each holding ~270MB of embedding model weights. Without the reaper, every
 // crash compounds the leak.
-if (!isSubagent) {
+if (!isHeadless) {
   const reaped = reapOrphans(['ori-memory', 'serve --mcp']);
   if (reaped > 0) {
     console.log(chalk.dim(`  reaped ${reaped} orphaned ori-memory subprocess${reaped === 1 ? '' : 'es'}`));
+  }
+  // Compose sub-loop: sweep orphan request-scratch markdown files (>24h old).
+  // Belt-and-suspenders for sessions that crashed without normal teardown.
+  // The per-request close is the primary cleanup path; this catches the
+  // residue. Sync cleanup since file IO is fast and we want it to fire even
+  // on signal-based exits.
+  try {
+    const { sweepOrphanScratches } = await import('./compose/scratch.js');
+    const sweptCount = sweepOrphanScratches(cwd, 24);
+    if (sweptCount > 0) {
+      console.log(chalk.dim(`  swept ${sweptCount} orphan request-scratch file${sweptCount === 1 ? '' : 's'}`));
+    }
+  } catch {
+    // Sweeper failure should never block startup. Stale files just persist
+    // until the next successful sweep.
   }
 }
 
@@ -349,20 +400,20 @@ if (vaultPath) {
     vaultIdentity = await vault.loadIdentity();
     const status = await vault.status();
     vaultNoteCount = status?.noteCount;
-    if (!isSubagent) {
+    if (!isHeadless) {
       console.log(chalk.dim(`Vault: ${vaultPath} (${vaultNoteCount ?? '?'} notes)`));
     }
 
     try {
       const orientResult = await vault.orient() as { data?: { summary?: string } } | null;
-      if (!isSubagent && orientResult?.data?.summary) {
+      if (!isHeadless && orientResult?.data?.summary) {
         console.log(chalk.dim(`  ${orientResult.data.summary.split('\n')[0]}`));
       }
     } catch {
       // non-fatal
     }
   } catch {
-    if (!isSubagent) {
+    if (!isHeadless) {
       console.log(chalk.dim(`Vault: ${vaultPath} (connection failed - running without vault)`));
     }
     vault = null;
@@ -374,7 +425,7 @@ if (config.projectBrain.enabled) {
   projectBrain = new ProjectBrain(cwd);
   projectBrain.init();
   projectBrain.load();
-  if (!isSubagent && projectBrain.count > 0) {
+  if (!isHeadless && projectBrain.count > 0) {
     console.log(chalk.dim(`Project brain: ${projectBrain.count} memories`));
   }
 }
@@ -423,7 +474,12 @@ if (continueSession) {
   }
 }
 
-const router = new ModelRouter(config.models, config.experimental, config.features);
+const router = new ModelRouter(config.models, config.experimental, config.features, config.cache);
+// Propagate the session ID to providers so OpenAI-compatible requests can
+// emit `prompt_cache_key` for cache affinity. Anthropic native is a no-op
+// (no client-supplied affinity field on the wire). Idempotent — also
+// applied to any later-created provider via ModelRouter.buildProvider.
+router.setSessionId(session.sessionId);
 let replHandleRef: ReplHandle | null = null;
 
 // Resolve 'auto': enable REPL only if the active model is capable
@@ -435,11 +491,11 @@ const registry = createCoreRegistry({ replEnabled, webSearch: config.webSearch, 
 registerMemoryTools(registry, vault, projectBrain);
 
 if (replEnabled) {
-  registerReplTool(registry, () => replHandleRef);
+  registerCodeTool(registry, () => replHandleRef);
 }
 
 const warmContext = await assembleWarmContext(vault, vaultIdentity);
-if (!isSubagent && warmContext) {
+if (!isHeadless && warmContext) {
   console.log(chalk.dim('  warm context loaded'));
 }
 
@@ -452,34 +508,55 @@ if (modelOverride) {
   }
 }
 
-if (isSubagent) {
+function unescapeXmlText(value: string): string {
+  return value
+    .replaceAll('&quot;', '"')
+    .replaceAll('&apos;', "'")
+    .replaceAll('&gt;', '>')
+    .replaceAll('&lt;', '<')
+    .replaceAll('&amp;', '&');
+}
+
+function extractLoop2ExecutionOutput(xml: string): string {
+  const doneMatches = [...xml.matchAll(/<done>([\s\S]*?)<\/done>/g)];
+  if (doneMatches.length > 0) {
+    return unescapeXmlText(doneMatches[doneMatches.length - 1]![1] ?? '');
+  }
+  const sayMatches = [...xml.matchAll(/<say>([\s\S]*?)<\/say>/g)];
+  if (sayMatches.length > 0) {
+    return sayMatches.map((m) => unescapeXmlText(m[1] ?? '')).join('\n');
+  }
+  return '';
+}
+
+if (isHeadless) {
   if (!promptArg) {
-    process.stderr.write('Subagent requires a prompt argument\n');
+    process.stderr.write('Headless requires a prompt argument\n');
     process.exit(1);
   }
 
   let subCodebaseSignatureMd: string | undefined;
   let subVaultSignatureMd: string | undefined;
   let subRepl: ReplHandle | null = null;
-  // Use shouldIndexCodebase so the subagent's mini-bridge respects the same
-  // vault-only collision rule as the main bridge. Without this, a subagent
+  // Use shouldIndexCodebase so the headless's mini-bridge respects the same
+  // vault-only collision rule as the main bridge. Without this, a headless
   // launched while cwd == vault would re-trigger markdown-as-code indexing
   // on every fork.
   const isProject = shouldIndexCodebase(cwd, vaultPath ?? undefined);
 
-  // ── Subagent Repl bridge lifecycle (2026-04-27) ─────────────────────────
+  // ── Headless Repl bridge lifecycle (2026-04-27) ─────────────────────────
   // Pre-fix this block was double-broken:
-  //   1. Gated on `config.signature.includeInSubagents` — so when signatures
+  //   1. Gated on `config.signature.includeInHeadless` — so when signatures
   //      were off, the bridge was never created at all, but the Repl tool
   //      stayed registered and codemode's default filter (loop.ts:384-388)
   //      still exposed it to the model.
   //   2. When the bridge WAS created, it was shut down inside the finally
   //      block immediately after signature compile, BEFORE the agent loop
   //      ran. Plus the local `subRepl` was never assigned to the module-
-  //      level `replHandleRef` that ReplTool.getHandle() closes over —
+  //      level `replHandleRef` that CodeTool.getHandle() closes over —
   //      so even during signature compile the tool registry couldn't see
-  //      it. End result: every subagent Repl call hit the "REPL not
-  //      available" rejection at src/tools/repl.ts:386, and the system
+  //      it. End result: every headless Repl call hit the "REPL not
+  //      available" rejection at src/tools/code.ts:386, and the system
   //      prompt was hardcoded to claim replEnabled=false (line 466 below).
   //
   // The bench (bench/2026-04/runs/2026-04-27/02-repl-failure-audit-aries-cli)
@@ -496,10 +573,11 @@ if (isSubagent) {
   if (replEnabled) {
     try {
       const rlm = resolveRlmConfig(config.repl.rlmModel);
-      subRepl = await setupReplBridge({
-        config: config.repl,
-        cwd,
-        vaultPath: vaultPath ?? undefined,
+        subRepl = await setupReplBridge({
+          config: config.repl,
+          cwd,
+          stateDir: join(session.dir, session.sessionId, 'state'),
+          vaultPath: vaultPath ?? undefined,
         rlmApiKey: rlm.rlmApiKey,
         rlmBaseUrl: rlm.rlmBaseUrl,
         rlmModel: rlm.rlmModel,
@@ -508,13 +586,57 @@ if (isSubagent) {
         trimVaultReturns: config.signature.trimVaultReturns,
       });
       if (subRepl) {
-        // Wire into the module-level ref so ReplTool.getHandle() (closure
+        // Wire into the module-level ref so CodeTool.getHandle() (closure
         // over replHandleRef at line 390/394) returns this bridge during
         // the agent loop. This is the line whose absence pre-fix turned
         // every Repl call into "REPL not available" even when the bridge
         // was momentarily alive for signature compile.
         replHandleRef = subRepl;
-        if (config.signature.includeInSubagents) {
+        // Headless readiness gate: if this is a source project, do not let
+        // the first model turn start until CODEBASE is real. Before this,
+        // indexing only happened as a side effect of ambient-signature
+        // compilation. When `signature.includeInHeadless` was false, the
+        // model saw `code` plus the codebase namespace but hit the
+        // _CodebaseNotReady stub on its first search. On 2026-05-04 that
+        // produced a successful-but-bad bench cell: 23 code calls and
+        // 432,906 total tokens for a one-hop read-only question. This gate
+        // makes index readiness a substrate invariant instead of a prompt
+        // convention or model-visible retry lesson.
+        if (isProject) {
+          session.log({ type: 'codebase_index', stage: 'start', timestamp: Date.now() });
+          const idx = await subRepl.bridge.index({ repoPath: cwd });
+          if (!idx.ok) {
+            const message = idx.error ?? 'unknown index failure';
+            session.log({
+              type: 'codebase_index',
+              stage: 'error',
+              message,
+              timestamp: Date.now(),
+            });
+            process.stderr.write(`Headless startup error: codebase index failed: ${message}\n`);
+            try { await subRepl.shutdown(); } catch { /* best effort */ }
+            replHandleRef = null;
+            process.exit(1);
+          } else {
+            session.log({
+              type: 'codebase_index',
+              stage: 'ready',
+              file_count: idx.file_count,
+              symbol_count: idx.symbol_count,
+              edge_count: idx.edge_count,
+              elapsed_ms: idx.elapsed_ms,
+              timestamp: Date.now(),
+            });
+          }
+        } else {
+          session.log({
+            type: 'codebase_index',
+            stage: 'skipped',
+            reason: !isProjectDirectory(cwd) ? 'no project detected' : 'cwd is vault-only',
+            timestamp: Date.now(),
+          });
+        }
+        if (config.signature.includeInHeadless) {
           try {
             const sigs = await compileAmbientSignatures(subRepl, {
               cwd,
@@ -525,14 +647,14 @@ if (isSubagent) {
             subVaultSignatureMd = sigs.vaultSignatureMd;
           } catch {
             // Signature compile is best-effort. Failure here just means the
-            // subagent enters the loop without ambient signatures — the
+            // headless enters the loop without ambient signatures — the
             // bridge stays up and the Repl tool keeps working.
           }
         }
       }
     } catch {
       // Fresh-context fallback is intentional. If bridge setup throws, the
-      // subagent runs without Repl: replEnabled in the system prompt becomes
+      // headless runs without Repl: replEnabled in the system prompt becomes
       // false (computed below from `!!subRepl`) and the model will skip Repl
       // composition. Better than crashing on a transient body-spawn glitch.
       if (subRepl) {
@@ -543,7 +665,7 @@ if (isSubagent) {
     }
   }
 
-  const subagentSystemPrompt = buildSystemPrompt({
+  const headlessSystemPrompt = buildSystemPrompt({
     cwd,
     config,
     vaultPath: vaultPath ?? undefined,
@@ -554,55 +676,359 @@ if (isSubagent) {
     codebaseSignature: subCodebaseSignatureMd,
     vaultSignature: subVaultSignatureMd,
     replEnabled: !!subRepl,
+    loop2: useLoop2Headless,
+    loop3: useLoop3Headless,
     experienceLog: readExperienceLog(cwd),
   });
 
   const { agentLoop } = await import('./loop.js');
-  const messages: Message[] = [{ role: 'user', content: promptArg }];
+  const { agentLoop2 } = await import('./loop2.js');
+  const { agentLoop3 } = await import('./loop3/agent.js');
+  const { AnthropicToolUseAdapter } = await import('./loop3/adapters/anthropic.js');
+  const headlessClassification = classifyRequestMode(promptArg);
+  const headlessRequestId = newRequestId();
+  const headlessIsComposeRequest =
+    useLoop3Headless && (headlessClassification.mode === 'compose' || headlessClassification.mode === 'goal');
+  const headlessModelInput = useLoop3Headless ? headlessClassification.cleanedText : promptArg;
+  const headlessComposeController = useLoop3Headless
+    ? new ComposeController({
+        mode: headlessClassification.mode,
+        requestId: headlessRequestId,
+        onEvent: (e) => session.log({ ...e, timestamp: Date.now() } as any),
+      })
+    : null;
+  const messages: Message[] = [{ role: 'user', content: headlessModelInput }];
+  session.log({ type: 'user', content: promptArg, timestamp: Date.now() });
+  if (useLoop3Headless) {
+    session.log({
+      type: 'request_mode_selected' as any,
+      request_id: headlessRequestId,
+      mode: headlessClassification.mode,
+      reason: headlessClassification.reason,
+      matched_trigger: headlessClassification.matchedTrigger,
+      input_chars: promptArg.length,
+      timestamp: Date.now(),
+    } as any);
+  }
+
+  // Headless is the old subagent/bench execution path. The interactive UI
+  // wires UsageTracker in app.tsx, but headless used to only write the
+  // session JSONL. That left .aries/usage blind to bench/subtask turns and
+  // made Level-1 composition work unmeasurable from the same telemetry surface
+  // as normal sessions. Keep this local to headless so agentLoop stays a
+  // pure event source.
+  const usageTracker = new UsageTracker(session.sessionId, router.current.model);
+  const unsubscribeCheapCallUsage = router.onCheapCallUsage(({
+    provider,
+    model,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+  }) => {
+    usageTracker.markTurnStart();
+    usageTracker.recordTurn(model, provider, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens);
+  });
+
   let finalText = '';
-  // Capture the last successful Repl output as a fallback channel. A subagent
-  // that does all its work via Repl + done(value) emits zero assistant-text
+  let loop2CurrentText = '';
+  let loop2NaturalFinalText = '';
+  let loop3CurrentText = '';
+  let loop3NaturalFinalText = '';
+  let lastExecutionResult = '';
+  let lastDoneOutput = '';
+  // Capture the last successful code output as a fallback channel. A headless
+  // that does all its work via code + done(value) emits zero assistant-text
   // events — finalText stays empty and the parent would see "(no output)."
-  // The Repl tool_result's output_full contains say() narration (Batch 1.6
+  // The code tool_result's output_full contains say() narration (Batch 1.6
   // dual-write echoes say() into the exec-captured stdout) plus any print()
-  // output, so surfacing the last non-error Repl output gives the parent
-  // the subagent's actual work. See Batch 1.8 — this is the structural
+  // output, so surfacing the last non-error code output gives the parent
+  // the headless's actual work. See Batch 1.8 — this is the structural
   // companion to fixing vault.top's snippet lie: both are "the harness
   // isn't surfacing what it claims to surface" bugs.
-  let lastReplOutputFull = '';
+  let lastCodeOutputFull = '';
 
-  for await (const event of agentLoop({
-    messages,
-    systemPrompt: subagentSystemPrompt,
-    router,
-    registry,
-    toolContext: { cwd },
-    vault,
-    projectBrain,
-    session,
-    hooks: config.hooks,
-    permissionMode: readOnlyMode ? ('plan' as const) : ('accept' as const),
-    maxTurns,
-  })) {
-    if (event.type === 'text') finalText += event.content;
-    if (event.type === 'tool_result' && event.name === 'Repl' && !event.isError) {
-      const full = event.output_full ?? event.output;
-      if (full && full.trim()) lastReplOutputFull = full;
+  if (useLoop3Headless) {
+    if (subRepl?.bridge) {
+      try {
+        await subRepl.bridge.configure({
+          sessionId: session.sessionId,
+          requestId: headlessRequestId,
+          composeMode: headlessClassification.mode,
+        });
+        if (headlessIsComposeRequest) {
+          const intent = headlessClassification.cleanedText.split(/\r?\n/, 1)[0]?.slice(0, 120) ?? '';
+          await subRepl.bridge.composeStart({
+            intent,
+            userRequest: headlessClassification.cleanedText,
+            mode: headlessClassification.mode === 'goal' ? 'goal' : 'compose',
+          });
+          session.log({
+            type: 'scratch_created' as any,
+            request_id: headlessRequestId,
+            mode: headlessClassification.mode,
+            intent_chars: intent.length,
+            timestamp: Date.now(),
+          } as any);
+        }
+      } catch (err) {
+        session.log({
+          type: 'scratch_setup_error' as any,
+          request_id: headlessRequestId,
+          error: err instanceof Error ? err.message : String(err),
+          timestamp: Date.now(),
+        } as any);
+      }
     }
-    if (event.type === 'error') {
-      const msg = event.error instanceof Error ? event.error.message : String(event.error);
-      process.stderr.write(`Subagent error: ${msg}\n`);
+    const buildHeadlessLoopSystemPrompt = async (): Promise<SystemPromptInput> => {
+      if (!headlessIsComposeRequest) return headlessSystemPrompt;
+      let scratchContent = '';
+      let scratchError: string | undefined;
+      let verificationFilled = false;
+      if (subRepl?.bridge) {
+        try {
+          const scratch = await subRepl.bridge.composeRead();
+          scratchContent = scratch.content ?? '';
+          scratchError = scratch.error;
+          verificationFilled = Array.isArray(scratch.status?.sections_filled)
+            && scratch.status.sections_filled.includes('verification');
+        } catch (err) {
+          scratchError = err instanceof Error ? err.message : String(err);
+        }
+      } else {
+        scratchError = 'bridge unavailable';
+      }
+      return buildComposeRequestSystemPrompt(headlessSystemPrompt, {
+        mode: headlessClassification.mode === 'goal' ? 'goal' : 'compose',
+        requestId: headlessRequestId,
+        scratchContent,
+        scratchError,
+        verificationFilled,
+      });
+    };
+    const adapter = new AnthropicToolUseAdapter(router);
+    let headlessTerminatedVia: 'natural' | 'error' | 'abort' | 'max_turns' = 'natural';
+    try {
+      for await (const event of agentLoop3({
+        messages,
+        systemPrompt: buildHeadlessLoopSystemPrompt,
+        adapter,
+        replHandle: subRepl,
+        session,
+        estimateTokens: (m) => router.current.estimateTokens(m),
+        maxTurns,
+        composeController: headlessComposeController,
+      })) {
+        if (event.type === 'model_start') {
+          loop3CurrentText = '';
+          usageTracker.markTurnStart();
+        }
+        if (event.type === 'usage') {
+          usageTracker.recordTurn(
+            router.current.model,
+            router.current.name,
+            event.inputTokens,
+            event.outputTokens,
+            event.cacheReadTokens ?? 0,
+            event.cacheWriteTokens ?? 0,
+          );
+        }
+        if (event.type === 'turn_complete') {
+          if (event.cellCount === 0 && loop3CurrentText.trim()) {
+            loop3NaturalFinalText = loop3CurrentText;
+          }
+          usageTracker.patchLastTurn(event.cellCount > 0 ? 1 : 0, event.cellCount > 0 ? ['Repl'] : [], event.cellCount);
+        }
+        if (event.type === 'text') {
+          finalText += event.content;
+          loop3CurrentText += event.content;
+        }
+        if (event.type === 'action_executed') {
+          const parts = [
+            ...event.result.sayTexts,
+            event.result.stdout,
+            event.result.stderr,
+            event.result.exception,
+            event.result.rejectedReason,
+            event.result.runtime?.footer,
+          ].filter((v): v is string => typeof v === 'string' && v.trim().length > 0);
+          if (parts.length > 0) lastCodeOutputFull = parts.join('\n');
+        }
+        if (event.type === 'done_committed') {
+          if (typeof event.value === 'string') {
+            lastDoneOutput = event.value;
+          } else {
+            try {
+              lastDoneOutput = JSON.stringify(event.value, null, 2);
+            } catch {
+              lastDoneOutput = String(event.value);
+            }
+          }
+        }
+        if (event.type === 'error') {
+          headlessTerminatedVia = 'error';
+          const msg = event.error instanceof Error ? event.error.message : String(event.error);
+          process.stderr.write(`Headless error: ${msg}\n`);
+        }
+      }
+    } finally {
+      if (headlessIsComposeRequest && subRepl?.bridge) {
+        try {
+          await subRepl.bridge.composeClose();
+          session.log({
+            type: 'scratch_closed' as any,
+            request_id: headlessRequestId,
+            mode: headlessClassification.mode,
+            terminated_via: headlessTerminatedVia,
+            ...headlessComposeController?.telemetry(),
+            timestamp: Date.now(),
+          } as any);
+        } catch (err) {
+          session.log({
+            type: 'scratch_close_error' as any,
+            request_id: headlessRequestId,
+            error: err instanceof Error ? err.message : String(err),
+            timestamp: Date.now(),
+          } as any);
+        }
+      }
+      session.log({
+        type: 'request_completed' as any,
+        request_id: headlessRequestId,
+        mode: headlessClassification.mode,
+        terminated_via: headlessTerminatedVia,
+        ...headlessComposeController?.telemetry(),
+        timestamp: Date.now(),
+      } as any);
+    }
+  } else if (useLoop2Headless) {
+    for await (const event of agentLoop2({
+      messages,
+      systemPrompt: headlessSystemPrompt,
+      router,
+      replHandle: subRepl,
+      session,
+      maxTurns,
+    })) {
+      if (event.type === 'model_start') {
+        loop2CurrentText = '';
+        usageTracker.markTurnStart();
+      }
+      if (event.type === 'usage') {
+        usageTracker.recordTurn(
+          router.current.model,
+          router.current.name,
+          event.inputTokens,
+          event.outputTokens,
+          event.cacheReadTokens ?? 0,
+          event.cacheWriteTokens ?? 0,
+        );
+      }
+      if (event.type === 'turn_complete') {
+        if (event.toolCallCount === 0 && event.replCellCount === 0 && loop2CurrentText.trim()) {
+          loop2NaturalFinalText = loop2CurrentText;
+        }
+        usageTracker.patchLastTurn(event.toolCallCount, event.toolNames, event.replCellCount);
+      }
+      if (event.type === 'text') {
+        finalText += event.content;
+        loop2CurrentText += event.content;
+      }
+      if (event.type === 'execution_result' && event.content.trim()) {
+        lastExecutionResult = event.content;
+      }
+      if (event.type === 'done_committed') {
+        if (typeof event.value === 'string') {
+          lastDoneOutput = event.value;
+        } else {
+          try {
+            lastDoneOutput = JSON.stringify(event.value, null, 2);
+          } catch {
+            lastDoneOutput = String(event.value);
+          }
+        }
+      }
+      if (event.type === 'error') {
+        const msg = event.error instanceof Error ? event.error.message : String(event.error);
+        process.stderr.write(`Headless error: ${msg}\n`);
+      }
+    }
+  } else {
+    for await (const event of agentLoop({
+      messages,
+      systemPrompt: headlessSystemPrompt,
+      router,
+      registry,
+      toolContext: { cwd },
+      vault,
+      projectBrain,
+      session,
+      hooks: config.hooks,
+      permissionMode: readOnlyMode ? ('plan' as const) : ('accept' as const),
+      maxTurns,
+    })) {
+      if (event.type === 'model_start') {
+        usageTracker.markTurnStart();
+      }
+      if (event.type === 'usage') {
+        usageTracker.recordTurn(
+          router.current.model,
+          router.current.name,
+          event.inputTokens,
+          event.outputTokens,
+          event.cacheReadTokens ?? 0,
+          event.cacheWriteTokens ?? 0,
+        );
+      }
+      if (event.type === 'turn_complete') {
+        usageTracker.patchLastTurn(event.toolCallCount, event.toolNames, event.replCellCount);
+      }
+      if (event.type === 'text') finalText += event.content;
+      if (event.type === 'tool_result' && event.name === 'code' && !event.isError) {
+        const full = event.output_full ?? event.output;
+        if (full && full.trim()) lastCodeOutputFull = full;
+      }
+      if (event.type === 'error') {
+        const msg = event.error instanceof Error ? event.error.message : String(event.error);
+        process.stderr.write(`Headless error: ${msg}\n`);
+      }
+    }
+  }
+
+  unsubscribeCheapCallUsage();
+  const userMsgCount = messages.filter((m) => m.role === 'user').length;
+  session.touch(userMsgCount, usageTracker.totals.cost);
+  usageTracker.persistSessionSummary();
+
+  if (!useLoop2Headless && !lastDoneOutput) {
+    for (const entry of SessionStorage.readSession(session.path)) {
+      if (entry.type !== 'done_committed') continue;
+      const value = entry.value;
+      if (typeof value === 'string') {
+        lastDoneOutput = value;
+      } else {
+        try {
+          lastDoneOutput = JSON.stringify(value, null, 2);
+        } catch {
+          lastDoneOutput = String(value);
+        }
+      }
     }
   }
 
   // Prefer assistant-text as the summary channel when present; fall back to
-  // the last Repl output so codemode-native subagents (all work in Repl,
-  // final commit via done()) still surface their work to the parent.
-  const subagentOutput = finalText.trim() ? finalText : lastReplOutputFull;
-  process.stdout.write(subagentOutput);
+  // done(value), then the last code output so codemode-native headless runs
+  // surface their actual work. The done fallback closes the 2026-05-02 silent
+  // no-output gap where a task could commit via done() yet emit empty stdout.
+  const headlessOutput = useLoop3Headless
+    ? (lastDoneOutput || loop3NaturalFinalText || finalText || lastCodeOutputFull || '')
+    : useLoop2Headless
+      ? (lastDoneOutput || loop2NaturalFinalText || extractLoop2ExecutionOutput(lastExecutionResult) || '')
+      : (finalText.trim() ? finalText : (lastDoneOutput || lastCodeOutputFull));
+  process.stdout.write(headlessOutput);
 
   // Bridge shutdown happens AFTER the agent loop has fully drained — earlier
-  // shutdown is what made pre-fix subagents Repl-blind (see lifecycle
+  // shutdown is what made pre-fix headless runs Repl-blind (see lifecycle
   // comment above). Best-effort: if the body subprocess is already gone or
   // hanging, swallow the error and let the explicit process.exit reap it.
   if (subRepl) {
@@ -719,6 +1145,7 @@ async function main(): Promise<void> {
     warmContext,
     codebaseSignature: undefined,
     vaultSignature: undefined,
+    loop3: process.env.ARIES_LOOP3 === '1',
     replEnabled, // declare intent — REPL tool is registered even before bridge is ready
     experienceLog: readExperienceLog(cwd),
   });
@@ -744,11 +1171,16 @@ async function main(): Promise<void> {
       resumedMessages,
       initialResumePicker: resumeArg === '',
       experimental: config.experimental,
+      getReplHandle: () => replHandleRef,
     }),
     { exitOnCtrlC: false },
   );
 
-  // ── REPL bridge setup (background — doesn't block input) ──────────
+  // Re-emit parchment colors after Ink initializes — Ink's render() may
+  // reset terminal state on some platforms. OSC 10/11 are idempotent.
+  enterParchment();
+
+  // ── REPL bridge setup
   if (replEnabled) {
     (async () => {
       try {
@@ -763,6 +1195,7 @@ async function main(): Promise<void> {
         const handle = await setupReplBridge({
           config: config.repl,
           cwd,
+          stateDir: join(session.dir, session.sessionId, 'state'),
           vaultPath: vaultPath ?? undefined,
           rlmApiKey: rlm.rlmApiKey,
           rlmBaseUrl: rlm.rlmBaseUrl,
@@ -863,6 +1296,3 @@ main().catch((err) => {
   console.error(chalk.red(`Fatal: ${err.message}`));
   process.exit(1);
 });
-
-
-

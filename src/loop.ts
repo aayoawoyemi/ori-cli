@@ -1,5 +1,5 @@
 import { resolve } from 'node:path';
-import type { Message, ToolCall, ToolDefinition, ContentBlock } from './router/types.js';
+import type { Message, ToolCall, ToolDefinition, ContentBlock, SystemPromptInput } from './router/types.js';
 import type { ModelRouter } from './router/index.js';
 import type { ToolRegistry } from './tools/registry.js';
 import type { ToolContext, TurnStats } from './tools/types.js';
@@ -29,16 +29,23 @@ import { runCompaction, pruneToolOutputs } from './memory/compact.js';
 import { applyNudges, resetNudgeCounters } from './tools/nudge.js';
 import { getPlanModeSparseReminder } from './tools/planInstructions.js';
 
-// ── Loop Events (yielded to the UI) ────────────────────────────────────────
+const CODE_TOOL_NAME = 'code';
+
+function isCodeToolName(name: string | undefined): boolean {
+  // New sessions expose only `code`. `Repl` remains here solely so old
+  // persisted assistant tool_use history can be scanned during resume.
+  return name === CODE_TOOL_NAME || name === 'Repl';
+}
 
 export type PermissionMode = 'default' | 'accept' | 'plan' | 'research' | 'yolo';
 export type PermissionDecision = 'allow' | 'deny' | 'always';
 
 export type LoopEvent =
   | { type: 'model_start'; turn: number; model: string }
+  | { type: 'provider_event'; stage: 'request_start' | 'first_event' | 'backoff' | 'request_error'; provider: string; model: string; attempt?: number; elapsedMs?: number; backoffMs?: number; reason?: string; message?: string }
   | { type: 'text'; content: string }
   | { type: 'tool_call'; toolCall: ToolCall }
-  // `output` is truncated for UI streaming (500 chars); `output_full` carries
+  // `output` is truncated for UI streaming (4000 chars); `output_full` carries
   // the complete tool output for consumers that need the whole thing —
   // primarily the subagent branch in src/index.ts, which folds Repl outputs
   // (containing say() narration + stdout) into the child process stdout so
@@ -53,7 +60,10 @@ export type LoopEvent =
   | { type: 'plan_complete'; steps: ToolCall[]; explanation: string }
   | { type: 'usage'; inputTokens: number; outputTokens: number; totalTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
   | { type: 'compact'; summary: string; savedCount: number; pruneOnly: boolean }
-  | { type: 'turn_complete'; turn: number; tokenEstimate: number }
+  | { type: 'turn_complete'; turn: number; tokenEstimate: number;
+      // Tool telemetry â€” populated after execution completes.
+      // Picked up by app.tsx â†’ tracker.patchLastTurn. Added 2026-05-03.
+      toolCallCount: number; toolNames: string[]; replCellCount: number }
   // Batch 3 — surfaced when the provider observed stop_reason=max_tokens
   // (or context_window). The handler in the stream consumer below appends
   // a [harness:cutoff] marker to the assistant message so the next turn's
@@ -63,6 +73,7 @@ export type LoopEvent =
   // error message rather than queuing a next-turn reminder, because the
   // model handles continuation more naturally when the cue lives in its
   // own most-recent output.
+  | { type: 'thinking'; content: string }
   | { type: 'cutoff_warning'; reason: 'max_tokens' | 'context_window'; message: string }
   // Batch 3 addendum — surfaced when the recovery loop auto-continues after
   // a max_tokens cutoff. Mirrors Claude Code's max_output_tokens_recovery
@@ -74,7 +85,7 @@ export type LoopEvent =
 
 export interface LoopParams {
   messages: Message[];
-  systemPrompt: string;
+  systemPrompt: SystemPromptInput;
   router: ModelRouter;
   registry: ToolRegistry;
   toolContext: ToolContext;
@@ -92,8 +103,7 @@ export interface LoopParams {
   alwaysAllowTools?: Set<string>;
   /** Identity context for conditioned retrieval (e.g., "Aries, building TypeScript agent harness") */
   identityContext?: string;
-  /** Max concurrent subagent processes (default: 5) */
-  maxSubagents?: number;
+
   /**
    * Called after Edit/Write tools complete with the list of mutated file paths.
    * Used for post-edit codebase graph refresh.
@@ -112,6 +122,16 @@ export interface LoopParams {
   permissionModeRef?: { current: PermissionMode };
   /** Task mode: 'explore' restricts to Repl + VaultAdd + ProjectSave only. */
   taskMode?: 'normal' | 'explore';
+  /**
+   * 2026-05-01: Mid-turn steering queue. UI pushes typed-during-work text
+   * into `current` and fires `abortRef.current?.abort()`. The loop's catch
+   * block detects "abort with steering pending" and continues; the inner
+   * loop's top drains the queue as a synthetic user message before the
+   * next model call. Distinct from `pendingInputRef` (post-turn) which
+   * lives in the UI and feeds the NEXT agentLoop invocation, not this one.
+   * Optional — external callers (subagent fork) work unchanged when omitted.
+   */
+  steeringQueueRef?: { current: string[] };
 }
 
 // ── Result Budget ───────────────────────────────────────────────────────────
@@ -187,6 +207,7 @@ function classifyToolRejection(result: ToolExecutionResult): { tsOrJsInPythonRep
   const output = result.output.trim();
   const toolPrefix = new RegExp(`^${escapeRegExp(result.name)} rejected:`, 'i');
   const isRejected =
+    /^code rejected:/i.test(output) ||
     /^Repl rejected:/i.test(output) ||
     /^Vault rejected:/i.test(output) ||
     /^AST guard rejected:/i.test(output) ||
@@ -195,9 +216,54 @@ function classifyToolRejection(result: ToolExecutionResult): { tsOrJsInPythonRep
 
   return {
     tsOrJsInPythonRepl:
-      result.name === 'Repl' &&
+      isCodeToolName(result.name) &&
       /TypeScript\/JavaScript|TypeScript|JavaScript|Python runtime/i.test(output),
   };
+}
+
+// ── Generalized forced-continuation primitive ────────────────────────────
+// 2026-05-01: extracted from the inline research-mode (was L791-839) and
+// plan-mode (was L842-857) blocks, which had near-identical structure: scan
+// messages → compute boolean → if condition AND counter < cap → push
+// assistant + reminder + bump counter + `continue`.
+//
+// The helper makes the pattern reusable. The new done()-based exit decision
+// in the loop uses the same primitive (taskNudgeUsed counter, "if complete
+// call done(), if not continue" reminder) — so research/plan/text-only-no-
+// done() all flow through one mechanism.
+//
+// Counter storage is a local Record<string, number> on the agentLoop scope
+// (replaces the previous `(params as unknown as Record<string, unknown>)`
+// hack that mutated shared params). Local scope is correct: counters are
+// per-task, not per-session.
+//
+// Returns true when continuation was injected (caller does `continue`).
+// Returns false when condition was unmet OR cap was hit (caller falls
+// through to the next gate / exit decision).
+function forceContinuation(opts: {
+  name: string;
+  condition: boolean;
+  reminder: string;
+  maxRetries: number;
+  counters: Record<string, number>;
+  messages: Message[];
+  assistantText: string;
+  session: { log?: (entry: Record<string, unknown>) => void } | null;
+}): boolean {
+  if (!opts.condition) return false;
+  const cur = opts.counters[opts.name] ?? 0;
+  if (cur >= opts.maxRetries) return false;
+  opts.counters[opts.name] = cur + 1;
+  opts.messages.push({ role: 'assistant', content: opts.assistantText });
+  opts.messages.push({ role: 'user', content: opts.reminder });
+  opts.session?.log?.({
+    type: 'forced_continuation',
+    gate: opts.name,
+    attempt: cur + 1,
+    maxRetries: opts.maxRetries,
+    timestamp: Date.now(),
+  });
+  return true;
 }
 
 function buildRepeatedRejectionReminder(toolName: string, state: ToolRejectionState): string {
@@ -207,9 +273,9 @@ function buildRepeatedRejectionReminder(toolName: string, state: ToolRejectionSt
 
   if (state.tsOrJsInPythonRepl) {
     return `<system-reminder>${base}\n\n` +
-      `Specific correction: Repl is Python only. For TypeScript harness/source-code work, use Python Repl to ` +
+      `Specific correction: code runs Python. For TypeScript harness/source-code work, use code to ` +
       `read/edit files via fs.* and validate with shell.run("npm run typecheck") or shell.run("npx tsx <file>"). ` +
-      `Do not submit TypeScript syntax to Repl again.</system-reminder>`;
+      `Do not submit TypeScript syntax to code again.</system-reminder>`;
   }
 
   return `<system-reminder>${base}\n\n` +
@@ -234,15 +300,15 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     onPermissionRequest,
     alwaysAllowTools,
     identityContext,
-    maxSubagents = 5,
     onFileMutated,
     planFilePathRef,
     permissionModeRef,
     taskMode = 'normal',
+    steeringQueueRef,
   } = params;
 
   const allTools: ToolDefinition[] = registry.definitions();
-  const replEnabled = allTools.some(t => t.name === 'Repl');
+  const replEnabled = allTools.some(t => t.name === CODE_TOOL_NAME);
   const contextLimit = router.current.contextWindow;
   const compactTokenThreshold = Math.floor(contextLimit * compactThreshold);
   let turnCount = 0;
@@ -263,6 +329,25 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
   // the identical bad shape for another turn.
   const toolRejectionStates = new Map<string, ToolRejectionState>();
   let repeatedToolRejectionReminder: string | null = null;
+  // 2026-05-01: forced-continuation counters (replaces the (params as unknown
+  // as Record<...>) hack). Keyed by gate name (research/plan/task-nudge),
+  // value = number of forced re-invocations this loop run. Local scope is
+  // correct: counters reset per agentLoop call, not per session.
+  const forcedContinuationCounters: Record<string, number> = {};
+  // 2026-05-01: One-shot per task. Text-only response without done() →
+  // inject "if done call done(), if not continue" reminder once. Second
+  // text-only response after the nudge → exit clean (assume conversational
+  // or genuinely complete). Reset on user steering (steering redefines the
+  // task, so the nudge budget refreshes).
+  let taskNudgeUsed = false;
+  // 2026-05-01 (follow-up): Structural conversational/task gate. The earlier
+  // suppressNudge() heuristic guessed at conversational mode by reply length
+  // and future-tense markers — a 1200-char philosophical reply with no
+  // future-tense triggered the nudge, and the model dumped a stub done() to
+  // silence the harness. Replaced with this flag: only nudge if the model
+  // actually used Repl during this user request and then trailed off without
+  // committing. Per-task scope: reset on steering drain (user redefined task).
+  let replCalledInRequest = false;
 
   // Reset doom loop tracking on new user input
   resetDoomLoop();
@@ -270,7 +355,43 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
   while (turnCount < maxTurns) {
     turnCount++;
 
-    // ── Turn-scoped shape aggregator ─────────────────────────────────
+    // ── STEERING DRAIN (top of every iteration) ──────────────────────
+    // 2026-05-01: Pi-pattern mid-turn steering. When the user types
+    // during work, the UI pushes the text into steeringQueueRef AND
+    // fires abortRef.abort(). The catch on the model stream below
+    // detects "abort with steering pending" and falls through to the
+    // top of the next iteration — here. We drain the queue, prepend
+    // as a single user message wrapped with a marker, and reset the
+    // task-nudge counter (steering redefines "the task," so the nudge
+    // budget should refresh).
+    //
+    // Distinct from the post-turn pendingInputRef on the UI side, which
+    // batches typed-during-work input and fires it as a NEW handleSubmit
+    // after the current turn completes. That path is for "queue this
+    // for later"; steering is for "interrupt and adapt now."
+    if (steeringQueueRef && steeringQueueRef.current.length > 0) {
+      const drained = steeringQueueRef.current.splice(0);
+      const combined = drained.length === 1
+        ? drained[0]!
+        : drained.join('\n\n---\n\n');
+      messages.push({
+        role: 'user',
+        content: `<system-reminder>User steered mid-turn — adjust course.</system-reminder>\n\n${combined}`,
+      });
+      session?.log({ type: 'steering_drained', count: drained.length, timestamp: Date.now() });
+      taskNudgeUsed = false; // user redefined the task; refresh nudge budget
+    replCalledInRequest = false; // task boundary moves; new gate also resets
+    }
+
+    // Per-request reset. replCalledInRequest gates the done() nudge â€” it must
+    // be false at the start of each request so a Repl call from a prior turn
+    // doesn't bleed through and trigger the nudge on a purely conversational reply.
+    // Steering drain above also resets it (task boundary); this covers the normal
+    // turn-by-turn case. 2026-05-02: added after nudge misfired on a conversational
+    // search response that followed a Repl-heavy prior turn.
+    replCalledInRequest = false;
+
+    //
     // Fresh per turn iteration. Tools (currently only Repl) mutate this
     // in place via ToolContext.turnStats. Logged as a `turn_metrics`
     // session event at both exit paths below — after tool execution
@@ -278,6 +399,7 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     // schema-enforced Repl composition measurement.
     const turnStats: TurnStats = {
       replCalls: 0,
+      replCellCount: 0,
       anyComposed: false,
       anyMicro: false,
       committed: false,
@@ -342,7 +464,7 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     let activeTools: ToolDefinition[];
     if (taskMode === 'explore') {
       activeTools = allTools.filter(t =>
-        t.name === 'Repl' || t.name === 'VaultAdd' || t.name === 'ProjectSave'
+        t.name === CODE_TOOL_NAME || t.name === 'VaultAdd' || t.name === 'ProjectSave'
       );
     } else if (permissionMode === 'plan') {
       activeTools = allTools.filter(t => {
@@ -359,7 +481,7 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       // let the model bypass the curated research pipeline. For targeted URL
       // drill-down, the model uses `research.fetch(url)` in the Repl namespace.
       const RESEARCH_ALLOWED = new Set([
-        'Repl', 'Read', 'Grep', 'Glob', 'ProjectSave',
+        CODE_TOOL_NAME, 'Read', 'Grep', 'Glob', 'ProjectSave',
         'VaultSearch', 'VaultRead', 'VaultExplore', 'VaultWarmth', 'ProjectSearch',
       ]);
       activeTools = allTools.filter(t => RESEARCH_ALLOWED.has(t.name));
@@ -377,15 +499,10 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       // research/plan/explore branches above), each mode's tool set is
       // independent and research/plan/explore keep working unchanged.
       //
-      // Why keep Agent in the allowlist: subagent delegation is its own
-      // architectural capability (spawns a fresh context), not a file-nav
-      // escape hatch. Repl composition and Agent delegation are
-      // complementary, not alternatives.
-      //
-      // See CODEMODE_ROADMAP.md §A8 and the all-righty-okay-so-lexical-
-      // island plan for the full rationale.
+      // Agent removed 2026-05-03. Repl is the single workspace â€” no
+      // fork-and-pray escape hatch. See vault note on composition failure.
       const CODEMODE_DEFAULT = new Set([
-        'Repl', 'EnterPlanMode', 'ExitPlanMode', 'Agent',
+        CODE_TOOL_NAME, 'EnterPlanMode', 'ExitPlanMode',
       ]);
       activeTools = allTools.filter(t => CODEMODE_DEFAULT.has(t.name));
     }
@@ -402,7 +519,7 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       }
       if (lastUserIdx >= 0 && typeof budgetedMessages[lastUserIdx]!.content === 'string') {
         const content = budgetedMessages[lastUserIdx]!.content as string;
-        const reminder = `<system-reminder>RESEARCH mode. Repl-only via \`research.*\`: discover, ingest, fetch, extract, synthesize, save. Pipeline: discover → ingest → extract → synthesize → save. Pick 5-10 sources from each discover, not all. \`research.save(slug)\` is REQUIRED to exit.</system-reminder>`;
+        const reminder = `<system-reminder>RESEARCH mode. code-only via \`research.*\`: discover, ingest, fetch, extract, synthesize, save. Pipeline: discover → ingest → extract → synthesize → save. Pick 5-10 sources from each discover, not all. \`research.save(slug)\` is REQUIRED to exit.</system-reminder>`;
         budgetedMessages[lastUserIdx] = {
           ...budgetedMessages[lastUserIdx]!,
           content: `${wrapSynthetic('research-mode', reminder)}\n\n${content}`,
@@ -418,7 +535,7 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       }
       if (lastUserIdx >= 0 && typeof budgetedMessages[lastUserIdx]!.content === 'string') {
         const content = budgetedMessages[lastUserIdx]!.content as string;
-        const reminder = `<system-reminder>EXPLORE mode. Repl, VaultAdd, ProjectSave only. No file mods, no shell. For changes: Alt+Z to exit.</system-reminder>`;
+        const reminder = `<system-reminder>EXPLORE mode. code, VaultAdd, ProjectSave only. No file mods, no shell. For changes: Alt+Z to exit.</system-reminder>`;
         budgetedMessages[lastUserIdx] = {
           ...budgetedMessages[lastUserIdx]!,
           content: `${wrapSynthetic('explore-mode', reminder)}\n\n${content}`,
@@ -502,9 +619,21 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     try {
       for await (const event of router.stream(budgetedMessages, systemPrompt, activeTools, signal)) {
         switch (event.type) {
+          case 'provider_event':
+            session?.log({ ...event, timestamp: Date.now() });
+            yield event;
+            break;
+
           case 'text':
             assistantText += event.content;
             yield { type: 'text', content: event.content };
+            break;
+
+          case 'thinking':
+            // 2026-05-01: Forward extended thinking to the UI.
+            // Not appended to assistantText â€” thinking is ephemeral display,
+            // not part of the persisted assistant response.
+            yield { type: 'thinking', content: event.content };
             break;
 
           case 'tool_use_start':
@@ -575,6 +704,16 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     if (toolCalls.length > 0) {
       messages.push(buildAssistantMessage(assistantText, toolCalls));
 
+      // Structural gate for the text-only task-nudge. ANY Repl attempt this
+      // request marks "task in progress." If the model later trails off in
+      // text without done(), the nudge fires; if no Repl this request, it's
+      // a pure conversational turn and the nudge stays silent regardless of
+      // reply length. Tracked on the model's call list (not approved-only)
+      // because a denied Repl is still a task-shaped intent.
+      if (toolCalls.some(tc => tc.name === CODE_TOOL_NAME)) {
+        replCalledInRequest = true;
+      }
+
       session?.log({ type: 'assistant', content: assistantText, timestamp: Date.now() });
       for (const tc of toolCalls) {
         session?.log({ type: 'tool_call', id: tc.id, name: tc.name, input: tc.input, timestamp: Date.now() });
@@ -611,7 +750,7 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
         // but this catches edge cases (subagents, tool schema leaks).
         if (permissionMode === 'research') {
           const RESEARCH_ALLOWED = new Set([
-            'Repl', 'Read', 'Grep', 'Glob', 'ProjectSave',
+            CODE_TOOL_NAME, 'Read', 'Grep', 'Glob', 'ProjectSave',
             'VaultSearch', 'VaultRead', 'VaultExplore', 'VaultWarmth', 'ProjectSearch',
           ]);
           if (RESEARCH_ALLOWED.has(tc.name)) {
@@ -619,7 +758,7 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
           } else {
             deniedResults.push({
               id: tc.id, name: tc.name,
-              output: `Tool ${tc.name} is not available in research mode. Use the research.* namespace in the Repl instead (research.discover, research.ingest, research.extract, research.synthesize, research.fetch, research.save). Alt+M to exit research mode.`,
+              output: `Tool ${tc.name} is not available in research mode. Use the research.* namespace in code instead (research.discover, research.ingest, research.extract, research.synthesize, research.fetch, research.save). Alt+M to exit research mode.`,
               isError: true,
             });
           }
@@ -656,11 +795,29 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
         }
       }
 
-      // Execute approved tools
+      // Execute approved tools. Pass a steering-drain getter so executeTools
+      // can interrupt the batch mid-execution if the user types into the
+      // steering queue (Pi-parity Batch 4). When mid-batch steering fires,
+      // remaining tools are marked skipped and the captured messages are
+      // injected as the next user turn (handled below).
       let executedResults: { id: string; name: string; output: string; isError: boolean }[] = [];
+      let midBatchSteering: string[] | undefined;
       if (approvedCalls.length > 0) {
+        const drainSteering = (): string[] => {
+          if (!steeringQueueRef || steeringQueueRef.current.length === 0) return [];
+          return steeringQueueRef.current.splice(0);
+        };
         try {
-          executedResults = await executeTools(approvedCalls, registry, turnCtx, hooks, vault?.vaultPath, maxSubagents);
+          const execResult = await executeTools(
+            approvedCalls,
+            registry,
+            turnCtx,
+            hooks,
+            vault?.vaultPath,
+            drainSteering,
+          );
+          executedResults = execResult.results;
+          midBatchSteering = execResult.steeringMessages;
         } catch (err) {
           // Never leave orphaned tool_use in history. Synthesize an error
           // result for every approved call so the conversation stays valid.
@@ -746,7 +903,7 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
             type: 'tool_result',
             id: result.id,
             name: result.name,
-            output: result.output.slice(0, 500),
+            output: result.output.slice(0, 4000),
             // Full output for subagent capture / anyone who needs the complete
             // tool result. UI consumers should keep reading `output` (short).
             output_full: result.output,
@@ -760,6 +917,29 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
             timestamp: Date.now(),
           });
         }
+      }
+
+      // ── Mid-batch steering: inject as next user message ──────────────
+      // Pi-parity Batch 4. If executeTools captured steering messages
+      // mid-batch (user typed during the tool run, abort fired), push
+      // them as the next user message and reset the nudge budget. The
+      // model's next assistant turn sees the steering before continuing.
+      if (midBatchSteering && midBatchSteering.length > 0) {
+        const combined =
+          midBatchSteering.length === 1
+            ? midBatchSteering[0]!
+            : midBatchSteering.join('\n\n---\n\n');
+        messages.push({
+          role: 'user',
+          content: `<system-reminder>User steered mid-batch — adjust course. Remaining tools in the batch were skipped.</system-reminder>\n\n${combined}`,
+        });
+        session?.log({
+          type: 'steering_drained',
+          count: midBatchSteering.length,
+          timestamp: Date.now(),
+        });
+        taskNudgeUsed = false;
+        replCalledInRequest = false;
       }
 
       // Log turn_metrics before continuing to next turn. Captures the
@@ -780,8 +960,11 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
     }
 
     // ── Research mode Gate 2: force continuation if research started but not saved ──
+    // Routed through the generalized forceContinuation helper. Same logic as
+    // pre-2026-05-01: scan prior Repl ops for research.discover/ingest/...
+    // without research.save — when present, inject reminder and continue
+    // (max 2 retries). The helper handles the bookkeeping.
     if (permissionMode === 'research') {
-      // Detect "research in progress" by scanning prior Repl tool calls for research.* usage.
       let researchStarted = false;
       let researchSaved = false;
       for (const m of messages) {
@@ -797,7 +980,7 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
             name?: string;
             input?: { code?: string; operations?: Array<{ code?: string }> };
           };
-          if (tu.name !== 'Repl' || !tu.input) continue;
+          if (!isCodeToolName(tu.name) || !tu.input) continue;
           let code = '';
           if (Array.isArray(tu.input.operations)) {
             code = tu.input.operations
@@ -815,35 +998,32 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
           }
         }
       }
-      if (researchStarted && !researchSaved) {
-        const forcedKey = '__researchForcedContinuations';
-        const forced = ((params as unknown as Record<string, unknown>)[forcedKey] as number) ?? 0;
-        if (forced < 2) {
-          (params as unknown as Record<string, unknown>)[forcedKey] = forced + 1;
-          messages.push({ role: 'assistant', content: assistantText });
-          messages.push({
-            role: 'user',
-            content: `<system-reminder>You started research but haven't saved it yet. Call \`research.save(session)\` in the Repl to persist the artifact and exit research mode, or continue with research.discover/ingest/extract/synthesize if you're not done. Do not end the turn with text only — research mode requires an artifact.</system-reminder>`,
-          });
-          turnCount++;
-          continue;
-        }
+      if (forceContinuation({
+        name: 'research',
+        condition: researchStarted && !researchSaved,
+        reminder: `<system-reminder>You started research but haven't saved it yet. Call \`research.save(session)\` in code to persist the artifact and exit research mode, or continue with research.discover/ingest/extract/synthesize if you're not done. Do not end the turn with text only — research mode requires an artifact.</system-reminder>`,
+        maxRetries: 2,
+        counters: forcedContinuationCounters,
+        messages, assistantText,
+        session: session ? { log: (e) => session.log(e as never) } : null,
+      })) {
+        turnCount++;
+        continue;
       }
     }
 
     // ── Plan mode Gate 2: force continuation if model dumps text without ExitPlanMode ──
+    // Same generalized primitive as research mode above.
     if (permissionMode === 'plan' && planFilePath) {
-      // Model responded with text only — it must call ExitPlanMode or AskUserQuestion to end.
-      // Inject a system nudge and continue the loop (max 2 forced continuations).
-      const forcedKey = '__planForcedContinuations';
-      const forced = ((params as unknown as Record<string, unknown>)[forcedKey] as number) ?? 0;
-      if (forced < 2) {
-        (params as unknown as Record<string, unknown>)[forcedKey] = forced + 1;
-        messages.push({ role: 'assistant', content: assistantText });
-        messages.push({
-          role: 'user',
-          content: `<system-reminder>You're still in plan mode. Write your plan to the plan file and call ExitPlanMode, or ask the user a question with AskUserQuestion. Do not end turns with text only.</system-reminder>`,
-        });
+      if (forceContinuation({
+        name: 'plan',
+        condition: true,
+        reminder: `<system-reminder>You're still in plan mode. Write your plan to the plan file and call ExitPlanMode, or ask the user a question with AskUserQuestion. Do not end turns with text only.</system-reminder>`,
+        maxRetries: 2,
+        counters: forcedContinuationCounters,
+        messages, assistantText,
+        session: session ? { log: (e) => session.log(e as never) } : null,
+      })) {
         turnCount++;
         continue;
       }
@@ -916,6 +1096,9 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
           type: 'turn_complete',
           turn: turnCount,
           tokenEstimate: estimateTokens(messages),
+          toolCallCount: toolCalls.length,
+          toolNames: toolCalls.map(tc => tc.name),
+          replCellCount: turnStats.replCellCount,
         };
         continue;
       }
@@ -927,8 +1110,51 @@ export async function* agentLoop(params: LoopParams): AsyncGenerator<LoopEvent> 
       });
     }
 
+    // ── DONE() / TASK-NUDGE EXIT DECISION ────────────────────────────
+    // 2026-05-01: replaces the unconditional `return` that made every
+    // text-only response the loop terminator (the "chat-bot that can call
+    // tools" shape). Three branches:
+    //
+    //   1. done() committed → exit clean. Model self-signaled completion.
+    //   2. text-only AND nudge unused AND model has used Repl this request
+    //      AND the reply isn't a question → inject "if complete call done(),
+    //      if not continue" and loop again.
+    //   3. otherwise (conversational reply, nudge already used, or task
+    //      never started via Repl) → exit.
+    //
+    // Branch 2 gating, follow-up edit: the earlier content heuristic
+    // (`suppressNudge()`) guessed conversational mode by length + future-
+    // tense markers and false-positived on long reflective replies — model
+    // emitted a stub done() to silence the reminder. Replaced with
+    // `replCalledInRequest`: a structural signal of "model attempted task
+    // work this request." If no Repl this request, no nudge no matter what
+    // the reply looks like; if Repl has fired and now the model trails off
+    // in text without committing, that's the abandoned-work case the nudge
+    // exists for. Trailing-`?` check skips nudge on questions (model is
+    // asking, not abandoning).
+    if (turnStats.committed === true) {
+      // Branch 1: done() fired. Clean exit.
+      session?.log({ type: 'task_done', turn: turnCount, timestamp: Date.now() });
+    } else if (
+      toolCalls.length === 0 &&
+      !taskNudgeUsed &&
+      replCalledInRequest &&
+      !assistantText.trim().endsWith('?')
+    ) {
+      // Branch 2: nudge once, then loop. The assistant message was already
+      // pushed at L926; now we just append the user reminder.
+      taskNudgeUsed = true;
+      messages.push({
+        role: 'user',
+        content: '<system-reminder>Your last response was text-only without calling done(). If your task is complete, call done(value) in code to commit. If not complete, continue with the next concrete step.</system-reminder>',
+      });
+      session?.log({ type: 'task_nudge_injected', turn: turnCount, text_length: assistantText.length, timestamp: Date.now() });
+      yield { type: 'turn_complete', turn: turnCount, tokenEstimate: estimateTokens(messages), toolCallCount: toolCalls.length, toolNames: toolCalls.map(tc => tc.name), replCellCount: turnStats.replCellCount };
+      continue;
+    }
+
     const finalTokens = estimateTokens(messages);
-    yield { type: 'turn_complete', turn: turnCount, tokenEstimate: finalTokens };
+    yield { type: 'turn_complete', turn: turnCount, tokenEstimate: finalTokens, toolCallCount: toolCalls.length, toolNames: toolCalls.map(tc => tc.name), replCellCount: turnStats.replCellCount };
 
     return;
   }

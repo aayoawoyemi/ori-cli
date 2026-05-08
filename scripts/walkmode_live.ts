@@ -3,7 +3,7 @@
  *
  * The normal `ori "prompt"` path renders Ink and requires a real TTY. Codex's
  * command runner is not a TTY, so this script exercises the same runtime core
- * directly: ModelRouter -> agentLoop -> ReplTool -> setupReplBridge -> Python
+ * directly: ModelRouter -> agentLoop -> code tool -> setupReplBridge -> Python
  * body/vault bridge. It is intentionally narrow and live: it calls the
  * configured model provider and connected vault.
  */
@@ -12,7 +12,7 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { loadConfig } from '../src/config/load.js';
 import { ModelRouter, isReplCapableModel } from '../src/router/index.js';
-import { createCoreRegistry, registerMemoryTools, registerReplTool } from '../src/tools/registry.js';
+import { createCoreRegistry, registerMemoryTools, registerCodeTool } from '../src/tools/registry.js';
 import { buildSystemPrompt } from '../src/prompt.js';
 import { OriVault, findVault } from '../src/memory/vault.js';
 import { ProjectBrain } from '../src/memory/projectBrain.js';
@@ -117,7 +117,7 @@ async function main(): Promise<void> {
   const replEnabled = config.repl.enabled === 'auto'
     ? isReplCapableModel(router.info.model)
     : config.repl.enabled;
-  if (!replEnabled) throw new Error(`Repl is not enabled for model ${router.info.model}`);
+  if (!replEnabled) throw new Error(`code is not enabled for model ${router.info.model}`);
 
   let replHandle: ReplHandle | null = null;
   const registry = createCoreRegistry({
@@ -126,7 +126,7 @@ async function main(): Promise<void> {
     getHandle: () => replHandle,
   });
   registerMemoryTools(registry, vault, projectBrain);
-  registerReplTool(registry, () => replHandle);
+  registerCodeTool(registry, () => replHandle);
 
   const rlm = resolveRlmConfig(config.repl.rlmModel);
   replHandle = await setupReplBridge({
@@ -150,7 +150,7 @@ async function main(): Promise<void> {
       }
     },
   });
-  if (!replHandle) throw new Error('Repl handle was not created');
+  if (!replHandle) throw new Error('code handle was not created');
 
   const warmContext = await assembleWarmContext(vault, vaultIdentity);
   const systemPrompt = buildSystemPrompt({
@@ -194,7 +194,7 @@ async function main(): Promise<void> {
       } else if (event.type === 'tool_call') {
         console.log(`\n[tool_call] ${event.toolCall.name}`);
       } else if (event.type === 'tool_result') {
-        if (event.name === 'Repl') replCalls++;
+        if (event.name === 'code') replCalls++;
         if (event.output_full?.includes('bridge request timed out')) bridgeTimeouts++;
         console.log(`\n[tool_result] ${event.name} isError=${event.isError}`);
         console.log((event.output_full ?? event.output).slice(0, 1200));

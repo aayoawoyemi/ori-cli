@@ -7,13 +7,14 @@
  *   const result = await bridge.exec({ code: "print('hello')" });
  *   await bridge.shutdown();
  */
-import { resolve, dirname, sep, join } from 'node:path';
+import { resolve, dirname, sep, join, relative } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { writeFileSync, mkdirSync, readFileSync, appendFileSync } from 'node:fs';
+import { writeFileSync, mkdirSync, readFileSync, readdirSync, appendFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { ReplProcess } from './process.js';
-import { fuzzyFind, generateDiff } from '../tools/edit.js';
+import { nearMissFind, fuzzyFind, generateDiff } from '../tools/edit.js';
 import { captureSnapshot } from '../tools/snapshot.js';
 import { WebFetchTool } from '../tools/webFetch.js';
 import { WebSearchTool } from '../tools/webSearch.js';
@@ -35,6 +36,8 @@ import type {
   RlmConfigResult,
   SignatureLevel,
   ResearchConnectResult,
+  BodyInfo,
+  ScratchStatus,
 } from './types.js';
 // OriVault needs a value import (not type-only) because Fix 1B auto-creates
 // a project vault inline via `new OriVault(path)` in ensureProjectVault.
@@ -57,6 +60,60 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // Default server path: <repo>/body/server.py
 const DEFAULT_SERVER = resolve(__dirname, '../../body/server.py');
 const DEFAULT_PYTHON = process.platform === 'win32' ? 'python' : 'python3';
+const DEFAULT_BODY_DIR = resolve(__dirname, '../../body');
+
+/**
+ * Recursively list .py files under bodyDir, skipping __pycache__ entries.
+ * Returns absolute paths in undefined order; caller sorts by relpath.
+ */
+function listBodyPyFiles(bodyDir: string, dir: string = bodyDir): string[] {
+  const out: string[] = [];
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const e of entries) {
+    if (e.name === '__pycache__') continue;
+    const full = join(dir, e.name);
+    if (e.isDirectory()) {
+      out.push(...listBodyPyFiles(bodyDir, full));
+    } else if (e.isFile() && e.name.endsWith('.py')) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
+/**
+ * Compute the SHA-256[:16] fingerprint over body/*.py source contents on disk.
+ *
+ * Mirrors body/version.py:_content_hash() exactly so the running body's
+ * compiled-in hash and the on-disk hash are directly comparable. Sort key is
+ * posix relpath (forward slashes, case-sensitive). For each file the hash
+ * absorbs: relpath + 0x00 + content + 0x00 0x00. Drift = mismatch.
+ */
+export function computeBodyContentHash(bodyDir: string = DEFAULT_BODY_DIR): string {
+  const files = listBodyPyFiles(bodyDir).sort((a, b) => {
+    const ra = relative(bodyDir, a).replace(/\\/g, '/');
+    const rb = relative(bodyDir, b).replace(/\\/g, '/');
+    return ra < rb ? -1 : ra > rb ? 1 : 0;
+  });
+  const h = createHash('sha256');
+  for (const path of files) {
+    const rel = relative(bodyDir, path).replace(/\\/g, '/');
+    h.update(rel, 'utf-8');
+    h.update(Buffer.from([0]));
+    try {
+      h.update(readFileSync(path));
+    } catch {
+      h.update('<unreadable>', 'utf-8');
+    }
+    h.update(Buffer.from([0, 0]));
+  }
+  return h.digest('hex').slice(0, 16);
+}
 
 type PendingResolver = (result: any) => void;
 
@@ -410,6 +467,10 @@ export class ReplBridge {
     vaultProject: string | null;
     mode: 'project+vault' | 'vault-only' | null;
     shell: string | null;
+    stateDir: string | null;
+    sessionId: string | null;
+    requestId: string | null;
+    composeMode: 'quick' | 'compose' | 'goal' | null;
     indexRequest: IndexRequest | null;
     vaultConnect: VaultConnectRequest | null;
     rlmConfig: RlmConfigRequest | null;
@@ -420,11 +481,21 @@ export class ReplBridge {
     vaultProject: null,
     mode: null,
     shell: null,
+    stateDir: null,
+    sessionId: null,
+    requestId: null,
+    composeMode: null,
     indexRequest: null,
     vaultConnect: null,
     rlmConfig: null,
     researchConnected: false,
   };
+  // Body version + content fingerprint captured from the most recent ping
+  // response. Cleared on body restart so the next pong re-captures fresh.
+  // The body computes contentHash at startup (body/version.py); we compare
+  // against the on-disk hash to detect when the running subprocess is stale.
+  private bodyInfo: BodyInfo | null = null;
+  private bodyDriftDetected: boolean = false;
   private vault: OriVault | null = null;
   // Project-local vault (Fix 1B — project-layered). Independent OriVault
   // pointed at <project>/.ori/. null when no project vault exists yet or
@@ -721,8 +792,84 @@ export class ReplBridge {
     this.process.write(JSON.stringify({ op: 'ping' }));
   }
 
-  private handlePong(): void {
+  private handlePong(msg?: any): void {
     this.lastPongAt = Date.now();
+    // Capture body version/hash on every pong. The heartbeat pings every
+    // few seconds, so bodyInfo stays fresh and survives body restarts
+    // (which produce a new pong with new startedAt + possibly new hash).
+    if (msg && typeof msg === 'object' && typeof msg.content_hash === 'string') {
+      this.bodyInfo = {
+        version: typeof msg.version === 'string' ? msg.version : '',
+        sha: typeof msg.sha === 'string' ? msg.sha : '',
+        contentHash: msg.content_hash,
+        startedAt: typeof msg.started_at === 'string' ? msg.started_at : '',
+      };
+      // Compare against on-disk source hash to detect drift. If the running
+      // body's compiled-in hash differs from what's on disk now, the body
+      // is stale (source was edited after body started). We cache the
+      // result so we don't re-walk body/*.py on every ping; reset on restart.
+      this.checkBodyDrift();
+    }
+  }
+
+  /**
+   * Body version + content fingerprint reported by the most recent ping.
+   * Null until first pong is received. Cleared on body restart so the next
+   * pong re-captures fresh info.
+   */
+  getBodyInfo(): BodyInfo | null {
+    return this.bodyInfo;
+  }
+
+  /**
+   * Wait for the heartbeat to capture body version info from the first pong.
+   * The heartbeat fires once per second, so this typically resolves within
+   * 1-2s of bridge.start(). Times out after `timeoutMs` and resolves null.
+   *
+   * Used by smokes that need to deterministically observe the body version
+   * without racing the heartbeat. Production code should subscribe to the
+   * body_drift event or poll getBodyInfo().
+   */
+  async awaitBodyInfo(timeoutMs: number = 5_000): Promise<BodyInfo | null> {
+    if (this.bodyInfo) return this.bodyInfo;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.bodyInfo) return this.bodyInfo;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return this.bodyInfo;
+  }
+
+  /**
+   * True if the running body subprocess is stale relative to on-disk source.
+   * Returns null when bodyInfo hasn't been captured yet (first ping pending).
+   */
+  isBodyStale(): boolean | null {
+    if (!this.bodyInfo) return null;
+    return this.bodyDriftDetected;
+  }
+
+  private checkBodyDrift(): void {
+    if (!this.bodyInfo) return;
+    let onDiskHash: string;
+    try {
+      onDiskHash = computeBodyContentHash();
+    } catch {
+      // Source files unreachable (npm install path? sandboxed?) — skip
+      // drift detection rather than emit false-positive drift events.
+      return;
+    }
+    const stale = onDiskHash !== this.bodyInfo.contentHash;
+    const wasStale = this.bodyDriftDetected;
+    this.bodyDriftDetected = stale;
+    if (stale && !wasStale) {
+      this.emit({
+        type: 'body_drift',
+        runningHash: this.bodyInfo.contentHash,
+        onDiskHash,
+        runningStartedAt: this.bodyInfo.startedAt,
+      });
+    }
   }
 
   private createProcess(): ReplProcess {
@@ -754,7 +901,7 @@ export class ReplBridge {
           // any future onLine branch that grew its own pong-shaped
           // message.
           if (msg.pong === true) {
-            this.handlePong();
+            this.handlePong(msg);
             return;
           }
 
@@ -906,6 +1053,11 @@ export class ReplBridge {
 
     this.restarting = true;
     this.restartCount++;
+    // Clear cached body info: the new process will report fresh version /
+    // contentHash / startedAt on its first pong. Drift state must reset too
+    // so we don't surface a false-positive against the just-killed process.
+    this.bodyInfo = null;
+    this.bodyDriftDetected = false;
     this.emit({ type: 'bridge_restart', reason, attempt: this.restartCount });
     this.appendDiagnostic({
       event: 'restart_start',
@@ -1101,10 +1253,16 @@ export class ReplBridge {
 
   /**
    * Verify the body is responsive. Cheap. Use for health checks.
+   *
+   * Also captures body version + content hash from the response so callers
+   * can detect drift via getBodyInfo() / isBodyStale(). The async heartbeat
+   * already does this on every pong; this public ping captures eagerly for
+   * callers that need fresh info (e.g. /scratch show the body version).
    */
   async ping(): Promise<boolean> {
     try {
       const r = await this.request({ op: 'ping' }, 5_000);
+      this.handlePong(r);
       return r.pong === true;
     } catch {
       return false;
@@ -1134,6 +1292,13 @@ export class ReplBridge {
     vaultProject?: string | null;
     mode?: 'project+vault' | 'vault-only';
     shell?: string;
+    stateDir?: string | null;
+    /** Compose sub-loop: stable session id, set on first configure of a session. */
+    sessionId?: string | null;
+    /** Compose sub-loop: per-request id, updated on every top-level user message. */
+    requestId?: string | null;
+    /** Compose sub-loop: auto-router classification ('quick' | 'compose' | 'goal'). */
+    composeMode?: 'quick' | 'compose' | 'goal' | null;
   }): Promise<void> {
     await this.request({
       op: 'configure',
@@ -1142,15 +1307,77 @@ export class ReplBridge {
       vault_project: cfg.vaultProject ?? null,
       mode: cfg.mode ?? null,
       shell: cfg.shell ?? null,
+      state_dir: cfg.stateDir ?? null,
+      session_id: cfg.sessionId ?? null,
+      request_id: cfg.requestId ?? null,
+      compose_mode: cfg.composeMode ?? null,
     }, 5_000);
     // Update bindings cache only after successful configure. Each field
     // overwrites the previous value — `configure` is the canonical setter
-    // for these five display globals, so the most recent call wins.
+    // for these display globals, so the most recent call wins.
     this.bindings.project = cfg.project ?? null;
     this.bindings.vaultGlobal = cfg.vaultGlobal ?? null;
     this.bindings.vaultProject = cfg.vaultProject ?? null;
     this.bindings.mode = cfg.mode ?? null;
     this.bindings.shell = cfg.shell ?? null;
+    this.bindings.stateDir = cfg.stateDir ?? null;
+    if (cfg.sessionId !== undefined) this.bindings.sessionId = cfg.sessionId;
+    if (cfg.requestId !== undefined) this.bindings.requestId = cfg.requestId;
+    if (cfg.composeMode !== undefined) this.bindings.composeMode = cfg.composeMode;
+  }
+
+  /**
+   * Compose sub-loop: create the per-request scratch markdown file. The
+   * harness calls this when a top-level user message gets routed to compose
+   * mode. Body computes the path from the configured session_id + request_id;
+   * make sure those have been set via configure() first.
+   */
+  async composeStart(args: { intent: string; userRequest: string; mode?: 'compose' | 'goal' }): Promise<{ ok: boolean; path?: string; error?: string }> {
+    const r = await this.request({
+      op: 'scratch_start',
+      intent: args.intent,
+      user_request: args.userRequest,
+      mode: args.mode ?? 'compose',
+    }, 5_000);
+    return r as { ok: boolean; path?: string; error?: string };
+  }
+
+  /**
+   * Compose sub-loop: delete the per-request scratch file. Idempotent.
+   * Called on terminal events (done committed, error, max_turns, abort)
+   * and on /reset. Safe to call when no scratch is active.
+   */
+  async composeClose(): Promise<{ ok: boolean; existed: boolean; path?: string }> {
+    const r = await this.request({ op: 'scratch_close' }, 5_000);
+    return r as { ok: boolean; existed: boolean; path?: string };
+  }
+
+  async composeStatus(): Promise<ScratchStatus> {
+    const r = await this.request({ op: 'scratch_status' }, 5_000);
+    return r as ScratchStatus;
+  }
+
+  async composeRead(): Promise<{ ok: boolean; content: string; status?: ScratchStatus; error?: string }> {
+    const r = await this.request({ op: 'scratch_read' }, 5_000);
+    return r as { ok: boolean; content: string; status?: ScratchStatus; error?: string };
+  }
+
+  async composeAppend(args: { section: string; text: string }): Promise<{ ok?: boolean; error?: string }> {
+    const r = await this.request({
+      op: 'scratch_append',
+      section: args.section,
+      text: args.text,
+    }, 5_000);
+    return r as { ok?: boolean; error?: string };
+  }
+
+  async composeSet(args: { section: string; text: string }): Promise<{ ok?: boolean; error?: string }> {
+    const r = await this.request({
+      op: 'scratch_set',
+      section: args.section,
+      text: args.text,
+    }, 5_000);
+    return r as { ok?: boolean; error?: string };
   }
 
   /**
@@ -1567,6 +1794,7 @@ export class ReplBridge {
     vaultProject: string | null;
     mode: 'project+vault' | 'vault-only' | null;
     shell: string | null;
+    stateDir: string | null;
     indexRequest: IndexRequest | null;
     vaultConnect: VaultConnectRequest | null;
     rlmConfig: RlmConfigRequest | null;
@@ -1578,6 +1806,7 @@ export class ReplBridge {
       vaultProject: this.bindings.vaultProject,
       mode: this.bindings.mode,
       shell: this.bindings.shell,
+      stateDir: this.bindings.stateDir,
       indexRequest: this.bindings.indexRequest
         ? { ...this.bindings.indexRequest }
         : null,
@@ -2260,7 +2489,35 @@ export class ReplBridge {
         const content = readFileSync(absPath, 'utf-8');
         const found = fuzzyFind(content, oldString);
         if (!found) {
-          throw new Error(`fs.edit: old not found in ${absPath} (tried all fuzzy strategies)`);
+          // Near-miss diagnostics: find closest regions and either auto-repair
+          // (>95% match, single candidate) or surface top 3 with diffs.
+          const nearMisses = nearMissFind(content, oldString, 3);
+          if (nearMisses.length > 0 && nearMisses[0].similarity >= 0.95) {
+            // Auto-repair: close enough to be unambiguous. Apply the edit
+            // using the actual region from the file, and warn the model.
+            const autoMatch = nearMisses[0];
+            const autoUpdated = content.replace(autoMatch.region, newString);
+            captureSnapshot(absPath, 'Edit');
+            writeFileSync(absPath, autoUpdated, 'utf-8');
+            const diff = generateDiff(autoMatch.region, newString, absPath);
+            return {
+              ok: true,
+              path: absPath,
+              diff,
+              strategy: `near-miss-auto (${Math.round(autoMatch.similarity * 100)}% match)`,
+              note: `Auto-repaired: your old string was ${Math.round(autoMatch.similarity * 100)}% similar to the actual content. Diff between what you sent and what was in the file:
+${autoMatch.diff}`,
+            };
+          }
+          // Below 95% or no candidates: surface diagnostics
+          let diagnostic = `fs.edit: old not found in ${absPath} (tried all fuzzy strategies).`;
+          if (nearMisses.length > 0) {
+            diagnostic += `\nNearest matches (read these diffs — - is what you sent, + is what’s in the file):`;
+            for (const nm of nearMisses) {
+              diagnostic += `\n\n[${Math.round(nm.similarity * 100)}% similar]:\n${nm.diff}`;
+            }
+          }
+          throw new Error(diagnostic);
         }
 
         // Uniqueness check — refuse ambiguous edits unless replace_all is set.
@@ -2338,6 +2595,48 @@ export class ReplBridge {
           path: absPath,
           applied,
           diff: generateDiff(original, working, absPath),
+        };
+      }
+
+      case 'edit_lines': {
+        // Line-range replacement. Unambiguous alternative to fuzzy edit()
+        // for large multi-line changes. Added 2026-05-01.
+        const rawPath = args.path as string;
+        const startLine = args.start as number;
+        const endLine = args.end as number;
+        const newContent = args.new_content as string;
+        if (!rawPath || typeof startLine !== 'number' || typeof endLine !== 'number' || typeof newContent !== 'string') {
+          throw new Error('fs.edit_lines: path, start, end, new_content required');
+        }
+        if (startLine < 1 || endLine < startLine) {
+          throw new Error(`fs.edit_lines: invalid range [${startLine}, ${endLine}] (1-indexed, start <= end)`);
+        }
+        const absPath = resolve(this.cwd, rawPath);
+        this.assertInsideWorkspace(absPath, 'fs.edit_lines');
+
+        const content = readFileSync(absPath, 'utf-8');
+        const lines = content.split('\n');
+        if (endLine > lines.length) {
+          throw new Error(`fs.edit_lines: end line ${endLine} exceeds file length (${lines.length} lines)`);
+        }
+
+        const oldRegion = lines.slice(startLine - 1, endLine).join('\n');
+        const newLines = [
+          ...lines.slice(0, startLine - 1),
+          ...newContent.split('\n'),
+          ...lines.slice(endLine),
+        ];
+        const updated = newLines.join('\n');
+
+        captureSnapshot(absPath, 'Edit');
+        writeFileSync(absPath, updated, 'utf-8');
+        const diff = generateDiff(oldRegion, newContent, absPath);
+        return {
+          ok: true,
+          path: absPath,
+          diff,
+          lines_removed: endLine - startLine + 1,
+          lines_added: newContent.split('\n').length,
         };
       }
 

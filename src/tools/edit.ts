@@ -189,6 +189,129 @@ export function generateDiff(oldText: string, newText: string, filePath: string)
   return result.join('\n');
 }
 
+
+// -- Near-miss diagnostics ----------------------------------------------------
+// When fuzzyFind returns null, this function finds the closest regions in
+// the file to what the model sent. Returns top 3 candidates with inline
+// diffs showing exactly where they diverge. Added 2026-05-01 alongside
+// the prompt streamline -- richer error messages replace heavy prompt rails.
+
+/** Simple string similarity (0-1). LCS-based ratio. */
+function stringSimilarity(a: string, b: string): number {
+  if (a === b) return 1;
+  if (a.length === 0 || b.length === 0) return 0;
+  const lcs = lcsLen(a, b);
+  return (2 * lcs) / (a.length + b.length);
+}
+
+/** LCS length. For large strings, uses line-level approximation. */
+function lcsLen(a: string, b: string): number {
+  if (a.length > 2000 || b.length > 2000) {
+    const aL = a.split('\n');
+    const bL = b.split('\n');
+    return lcsLenArr(aL, bL) * 40;
+  }
+  const m = a.length;
+  const n = b.length;
+  let prev = new Array(n + 1).fill(0);
+  let curr = new Array(n + 1).fill(0);
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      curr[j] = a[i - 1] === b[j - 1]
+        ? prev[j - 1] + 1
+        : Math.max(prev[j], curr[j - 1]);
+    }
+    [prev, curr] = [curr, prev.fill(0)];
+  }
+  return prev[n];
+}
+
+function lcsLenArr(a: string[], b: string[]): number {
+  const m = a.length;
+  const n = b.length;
+  let prev = new Array(n + 1).fill(0);
+  let curr = new Array(n + 1).fill(0);
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      curr[j] = a[i - 1] === b[j - 1]
+        ? prev[j - 1] + 1
+        : Math.max(prev[j], curr[j - 1]);
+    }
+    [prev, curr] = [curr, prev.fill(0)];
+  }
+  return prev[n];
+}
+
+/** Compact diff: show only diverging lines with +/- markers. */
+function compactDiff(expected: string, actual: string): string {
+  const expLines = expected.split('\n');
+  const actLines = actual.split('\n');
+  const result: string[] = [];
+  const maxLines = Math.max(expLines.length, actLines.length);
+
+  for (let i = 0; i < maxLines; i++) {
+    const exp = i < expLines.length ? expLines[i] : undefined;
+    const act = i < actLines.length ? actLines[i] : undefined;
+    if (exp === act) {
+      if (result.length > 0 || i < 2) result.push(`  ${act}`);
+    } else {
+      if (exp !== undefined) result.push(`- ${exp}`);
+      if (act !== undefined) result.push(`+ ${act}`);
+    }
+    if (result.length > 20) {
+      result.push('  ... (truncated)');
+      break;
+    }
+  }
+  return result.join('\n');
+}
+
+/**
+ * Find near-miss candidates when fuzzyFind returns null.
+ * Uses first-line anchoring + LCS-based scoring.
+ * Returns up to 3 candidates with similarity scores and compact diffs.
+ */
+export function nearMissFind(
+  content: string,
+  oldString: string,
+  maxResults: number = 3,
+): Array<{ region: string; similarity: number; diff: string }> {
+  const oldLines = oldString.split('\n');
+  const contentLines = content.split('\n');
+  if (oldLines.length === 0 || contentLines.length === 0) return [];
+
+  const anchor = oldLines.find(l => l.trim().length > 0) || oldLines[0];
+  const anchorTrimmed = anchor.trim().toLowerCase();
+  const anchorTokens = new Set(anchorTrimmed.split(/\s+/));
+
+  const candidates: Array<{ start: number; score: number }> = [];
+
+  for (let i = 0; i <= contentLines.length - 1; i++) {
+    const lineTrimmed = contentLines[i].trim().toLowerCase();
+    const lineTokens = lineTrimmed.split(/\s+/);
+    const overlap = lineTokens.filter(t => anchorTokens.has(t)).length;
+    if (anchorTokens.size > 0 && overlap / anchorTokens.size < 0.3) continue;
+
+    const regionEnd = Math.min(i + oldLines.length, contentLines.length);
+    const region = contentLines.slice(i, regionEnd).join('\n');
+    const score = stringSimilarity(oldString, region);
+    if (score > 0.3) {
+      candidates.push({ start: i, score });
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates.slice(0, maxResults).map(c => {
+    const regionEnd = Math.min(c.start + oldLines.length, contentLines.length);
+    const region = contentLines.slice(c.start, regionEnd).join('\n');
+    return {
+      region,
+      similarity: Math.round(c.score * 100) / 100,
+      diff: compactDiff(oldString, region),
+    };
+  });
+}
+
 // ── Edit Tool ───────────────────────────────────────────────────────────────
 
 export class EditTool implements Tool {
@@ -238,10 +361,22 @@ export class EditTool implements Tool {
       const found = fuzzyFind(content, oldString);
 
       if (!found) {
+        const nearMisses = nearMissFind(content, oldString, 3);
+        let diagnostic = `Error: old_string not found in ${filePath} (tried all fuzzy strategies).`;
+        if (nearMisses.length > 0) {
+          diagnostic += `
+Nearest matches (- is what you sent, + is what's in the file):`;
+          for (const nm of nearMisses) {
+            diagnostic += `
+
+[${Math.round(nm.similarity * 100)}% similar]:
+${nm.diff}`;
+          }
+        }
         return {
           id: '',
           name: this.name,
-          output: `Error: old_string not found in ${filePath} (tried 7 matching strategies)`,
+          output: diagnostic,
           isError: true,
         };
       }

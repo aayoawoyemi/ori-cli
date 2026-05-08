@@ -1,6 +1,8 @@
 import { GoogleGenAI, type Content, type Tool as GeminiTool, type Part } from '@google/genai';
-import type { ModelProvider, Message, ToolDefinition, StreamEvent, ContentBlock } from '../types.js';
+import type { ModelProvider, Message, ToolDefinition, StreamEvent, ContentBlock, SystemPromptInput } from '../types.js';
 import type { ModelConfig } from '../../config/types.js';
+import { sanitizeMessages, sanitizeSystemPrompt } from '../../utils/sanitize.js';
+import { renderSystemPrompt } from '../../prompt.js';
 
 /** Convert our messages to Gemini Content format. */
 function toGeminiContents(messages: Message[], toolNameById?: Map<string, string>): Content[] {
@@ -91,10 +93,15 @@ export class GoogleProvider implements ModelProvider {
 
   async *stream(
     messages: Message[],
-    systemPrompt: string,
+    systemPrompt: SystemPromptInput,
     tools: ToolDefinition[],
     signal?: AbortSignal,
   ): AsyncGenerator<StreamEvent> {
+    // Sanitize unpaired UTF-16 surrogates BEFORE serialization (see
+    // src/utils/sanitize.ts header for full rationale).
+    messages = sanitizeMessages(messages);
+    const renderedSystemPrompt = sanitizeSystemPrompt(renderSystemPrompt(systemPrompt));
+
     const contents = toGeminiContents(messages, this.toolNameById);
     const geminiTools = toGeminiTools(tools);
 
@@ -102,7 +109,7 @@ export class GoogleProvider implements ModelProvider {
       model: this.model,
       contents,
       config: {
-        systemInstruction: systemPrompt,
+        systemInstruction: renderedSystemPrompt,
         ...(geminiTools.length > 0 && { tools: geminiTools }),
       },
     });

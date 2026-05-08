@@ -91,7 +91,7 @@ def _unwrap_data(result: Any) -> Any:
 
 class Vault:
     """
-    The `vault` primitive exposed in the Repl namespace. Ori Mnemos memory
+    The `vault` primitive exposed in the code namespace. Ori Mnemos memory
     substrate — markdown-native persistent notes with wiki-links, warmth
     signals, and Q-value reranked retrieval.
 

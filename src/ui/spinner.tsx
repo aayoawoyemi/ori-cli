@@ -4,7 +4,7 @@ import { figures, colors } from './theme.js';
 
 // ── Color interpolation ──────────────────────────────────────────────────
 
-function lerpColor(a: string, b: string, t: number): string {
+export function lerpColor(a: string, b: string, t: number): string {
   const ah = a.replace('#', '');
   const bh = b.replace('#', '');
   const ar = parseInt(ah.slice(0, 2), 16);
@@ -19,8 +19,9 @@ function lerpColor(a: string, b: string, t: number): string {
   return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b_.toString(16).padStart(2, '0')}`;
 }
 
-// Attempt true 60fps. Falls back to whatever the runtime can sustain.
-const FRAME_MS = 16;
+// Ink redraws the whole terminal tree on every tick. Long Loop3 runs can have
+// many live segments, so keep ambient animation cheap instead of chasing 60fps.
+const FRAME_MS = 150;
 
 // ── Spinner ──────────────────────────────────────────────────────────────
 // Single ring character. Breathes between near-invisible walnut shadow

@@ -8,12 +8,12 @@
  *
  * Why this task: multi-file coordinated edit. Blast-radius awareness is the
  * harness's thesis. Bare tool-calling must grep â†’ read each file â†’ edit each.
- * REPL harness can do `codebase.find_symbol('tickTurn')` + `show_dependents`
+ * code harness can do `codebase.find_symbol('tickTurn')` + `show_dependents`
  * in one call, then edit deterministically.
  *
  * Variants:
- *   BARE     â€” legacy tools only (Read/Glob/Grep/Edit/Write), no REPL, no signatures
- *   HARNESS  â€” REPL mandatory, codebase signature, Phase 8 tools available
+ *   BARE     â€” legacy tools only (Read/Glob/Grep/Edit/Write), no code, no signatures
+ *   HARNESS  â€” code mandatory, codebase signature, Phase 8 tools available
  *
  * Runs: 3 per (variant). Total: 6 runs.
  *
@@ -31,7 +31,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ModelRouter } from '../src/router/index.js';
 import {
-  createCoreRegistry, registerReplTool, stripNavigationTools,
+  createCoreRegistry, registerCodeTool, stripNavigationTools,
 } from '../src/tools/registry.js';
 import { buildSystemPrompt } from '../src/prompt.js';
 import { SessionStorage } from '../src/session/storage.js';
@@ -336,7 +336,7 @@ async function runVariant(
         rlmModel: router.info.model,
       });
       if (!replHandle) throw new Error('REPL bridge failed');
-      registerReplTool(registry, () => replHandle);
+      registerCodeTool(registry, () => replHandle);
       if (variant.stripLegacyNav) {
         // stripNavigationTools now strips the FULL codemode set (Bash,
         // Edit, Write, Read, Grep, Glob, Web*, Vault*, Project*) as of
@@ -409,7 +409,7 @@ async function runVariant(
         }
         turnInTok = 0; turnOutTok = 0; turnTools = [];
         // Estimate active tool count for this variant
-        activeToolCount = variant.useRepl ? 1 : 9; // REPL phase starts with 1 tool; bare has all
+        activeToolCount = variant.useRepl ? 1 : 9; // code phase starts with 1 tool; bare has all
         m.turns++;
       }
       if (event.type === 'text') finalText += event.content;
@@ -530,7 +530,7 @@ async function main() {
   console.log(`Model: ${modelInput}`);
   console.log(`Runs per (variant, task): ${runs}`);
   console.log(`Variants: ${VARIANTS.map(v => v.id).join(', ')}`);
-  console.log(`HARNESS-STRICT strips: Read, Grep, Glob, Bash (leaves Edit, Write, Repl)`);
+  console.log(`HARNESS-STRICT strips: Read, Grep, Glob, Bash (leaves Edit, Write, code)`);
   console.log('');
 
   const activeTasks = taskFilter ? TASKS.filter(t => t.id === taskFilter) : TASKS;
@@ -637,4 +637,3 @@ main().catch(err => {
   console.error('FATAL:', err);
   process.exit(1);
 });
-

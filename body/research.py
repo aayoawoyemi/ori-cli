@@ -26,7 +26,7 @@ class ResearchError(Exception):
 
 class Research:
     """
-    The `research` primitive exposed in the Repl namespace. Multi-stage
+    The `research` primitive exposed in the code namespace. Multi-stage
     research pipeline: discover → ingest → extract → synthesize → save.
 
     Backed by a TS-side engine that calls Arxiv/Semantic Scholar/OpenAlex/

@@ -8,8 +8,39 @@ export interface CodeExecution {
   timeout_ms?: number;
 }
 
+/**
+ * Body version + content fingerprint reported by the ping op.
+ *
+ * Computed once at body startup (body/version.py). The bridge captures this
+ * on every ping and compares contentHash against the on-disk source hash to
+ * detect drift — i.e. body subprocess running stale code because source was
+ * edited after the process started.
+ *
+ * version: human string from package.json or fallback
+ * sha:     short git rev-parse HEAD if available, else ""
+ * contentHash: SHA-256[:16] over canonical sorted body/*.py contents
+ * startedAt:   ISO-8601 UTC timestamp of body startup
+ */
+export interface BodyInfo {
+  version: string;
+  sha: string;
+  contentHash: string;
+  startedAt: string;
+}
+
 export interface ReplRejection {
   reason: string;
+}
+
+export interface ScratchStatus {
+  active: boolean;
+  path?: string;
+  intent?: string;
+  mode?: string;
+  char_count?: number;
+  sections_filled?: string[];
+  sections_empty?: string[];
+  error?: string;
 }
 
 export interface ReplResult {
@@ -34,6 +65,12 @@ export interface ReplResult {
   // a `repl_done` ReplEvent in real time (during exec) — this field is the
   // post-exec harvest for callers that don't subscribe to events.
   done?: { value: unknown };
+  // Structured post-exec say() harvest. say(text) still emits a real-time
+  // repl_say event and still echoes to captured stdout for legacy behavior.
+  // Field name is deliberately NOT "say": the bridge reserves top-level
+  // {"say": ...} frames for fire-and-forget callbacks before resolving exec
+  // results. This result-envelope field keeps the protocols disjoint.
+  say_texts?: string[];
   // Shape telemetry from body/shape.py — attached unconditionally by
   // _run_exec so every Repl result carries composition metrics. Consumed
   // by src/loop.ts to log a `repl_shape` session event per exec and a
@@ -45,6 +82,9 @@ export interface ReplResult {
     line_count: number;
     char_count: number;
     primitives_called: string[];
+    costs?: Record<string, number>;
+    effects?: Record<string, number>;
+    expensive_primitives?: string[];
     distinct_primitive_count: number;
     total_primitive_call_count: number;
     has_for_or_while: boolean;
@@ -54,7 +94,24 @@ export interface ReplResult {
     has_comprehension: boolean;
     is_micro_repl: boolean;
     is_composed: boolean;
+    composition_kind?: 'micro' | 'fanout' | 'pipeline' | 'control_flow' | 'commit' | 'silent' | string;
     error?: string;
+  };
+  runtime?: {
+    footer?: string;
+    state?: {
+      dir?: string;
+      count?: number;
+      receipts?: Array<{ key: string; summary: string; note?: string; updated_at?: string }>;
+      last_produced?: Array<{ key: string; summary: string; note?: string; updated_at?: string }>;
+      error?: string;
+    };
+    vars?: Array<{ name: string; summary: string }>;
+    plan?: Record<string, unknown>;
+    spanner?: Record<string, unknown>;
+    scratch?: ScratchStatus;
+    telemetry?: Array<Record<string, unknown>>;
+    shape?: Record<string, unknown>;
   };
 }
 
@@ -95,7 +152,15 @@ export type ReplEvent =
   // also appears post-exec as result.done on ReplResult, so callers that
   // don't subscribe to events still see the commit. Fire-and-forget from
   // Python (no bridge response needed); exec continues.
-  | { type: 'repl_done'; value: unknown };
+  | { type: 'repl_done'; value: unknown }
+  // body_drift fires when the bridge detects that the running body subprocess
+  // is stale relative to on-disk source. The body's reported contentHash
+  // (computed at its startup) no longer matches the current on-disk hash.
+  // Until the user restarts the CLI, structural body changes (e.g. the
+  // composition wall) are not in effect. The UI surfaces this as "body:
+  // stale, restart required" in the status bar. Bridge does not auto-restart
+  // because that would lose REPL namespace state.
+  | { type: 'body_drift'; runningHash: string; onDiskHash: string; runningStartedAt: string };
 
 export interface ReplOptions {
   /** Path to body/server.py. Defaults to <repo>/body/server.py */

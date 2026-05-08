@@ -49,7 +49,7 @@ bench/2026-04/runs/{YYYY-MM-DD}/
 
 | CLI | Invocation | Output source |
 |---|---|---|
-| aries-cli | `node dist/index.js "<prompt>"` with `ARIES_SUBAGENT=1` | session log at `~/.aries/sessions/{id}/*.jsonl` (newest after run) |
+| aries-cli | `node dist/index.js "<prompt>"` with `ARIES_HEADLESS=1` | session log at `~/.aries/sessions/{id}/*.jsonl` (newest after run) |
 | claude-code | `claude -p --output-format stream-json --include-partial-messages --dangerously-skip-permissions --model claude-opus-4-7` (prompt via stdin) | stdout (newline-delimited JSON) |
 | pi-coding-agent | `pi --mode json --model claude-opus-4-7 "<prompt>"` | stdout (newline-delimited JSON) |
 
@@ -62,6 +62,7 @@ bench/2026-04/runs/{YYYY-MM-DD}/
 - `success` — boolean from regex grader (see `tasks.ts`)
 - `success_details.missing` — which grader patterns missed (debug failed runs)
 - `fragmentation.ratio` — actual_tool_calls / target_tool_calls (1.0 = optimal)
+- `compose` — Aries compose-loop rollups: quick/compose/goal request counts, cells/request, preflight coverage, gate rejection reasons, scout/verify/repair counts, and micro cells by mode
 - `exit_code` — CLI exit status
 
 ## Grader logic

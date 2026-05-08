@@ -27,6 +27,8 @@ ops/sessions/
 
 # Benchmark results (keep bench/ code, drop results)
 bench/results/
+bench/2026-04/runs/*/
+bench/2026-04/runs/*.log
 
 # Benchmark workspaces — nested foreign git repos (django, flask, requests,
 # pylint, pytest, etc.) cloned for SWE-Bench Lite + pi-mono fixture. ~300MB
@@ -37,6 +39,9 @@ bench/2026-04/fixtures/pi-mono/
 
 # Scratch output from ad-hoc shell runs
 bench_output.txt
+body/bench/
+ops/promote.log
+refs/
 
 # Spike (superseded by body/)
 spike/
@@ -58,6 +63,9 @@ CHANGELOG.md
 # Test scratch files
 test-*.mjs
 test/
+scripts/_debug_probe.ts
+body/test_fs_paths_check.py
+body/test_fs_paths_probe.py
 
 # Video assets
 video/

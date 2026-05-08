@@ -1,15 +1,109 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { platform } from 'node:os';
+import { platform, homedir } from 'node:os';
 import { execSync } from 'node:child_process';
 import type { AriesConfig } from './config/types.js';
 import type { VaultIdentity } from './memory/vault.js';
+import type { SystemPromptInput, SystemPromptParts } from './router/types.js';
 
 /**
- * Prompt marker used by Anthropic provider to split stable ambient signatures
- * from the rest of the prompt for prompt-cache prefix billing.
+ * Prompt marker used by the Anthropic provider to split stable content from
+ * volatile session content for prompt-cache prefix billing.
  */
 export const CACHE_PREFIX_BREAK = '<!-- ARIES_CACHE_PREFIX_BREAK -->';
+
+export function splitSystemPromptInput(input: SystemPromptInput): SystemPromptParts {
+  if (typeof input !== 'string') {
+    return {
+      stable: input.stable.trim(),
+      volatile: input.volatile.trim(),
+    };
+  }
+  const idx = input.indexOf(CACHE_PREFIX_BREAK);
+  if (idx === -1) {
+    return { stable: '', volatile: input.trim() };
+  }
+  return {
+    stable: input.slice(0, idx).trim(),
+    volatile: input.slice(idx + CACHE_PREFIX_BREAK.length).trim(),
+  };
+}
+
+export function renderSystemPrompt(input: SystemPromptInput): string {
+  const { stable, volatile } = splitSystemPromptInput(input);
+  return [stable, volatile].map(s => s.trim()).filter(Boolean).join('\n\n');
+}
+
+function joinPromptSections(...sections: Array<string | undefined>): string {
+  return sections.map(s => s?.trim()).filter(Boolean).join('\n\n');
+}
+
+function markdownFence(text: string, info = 'markdown'): string {
+  let fence = '```';
+  while (text.includes(fence)) fence += '`';
+  return `${fence}${info}\n${text.trimEnd()}\n${fence}`;
+}
+
+export interface ComposeRequestPromptOptions {
+  mode: 'compose' | 'goal';
+  requestId: string;
+  scratchContent?: string;
+  scratchError?: string;
+  verificationFilled?: boolean;
+}
+
+const FINAL_ANSWER_READINESS_AUDIT = `## Final Answer Readiness Audit
+
+Verification is present in the request scratch. Before calling \`done(value)\`:
+- Restate the objective as concrete deliverables or success criteria.
+- Map every explicit requirement, named file, command, test, gate, and deliverable to concrete evidence.
+- Inspect the current files, command output, test results, runtime state, or other real evidence for each item.
+- Check that each passing test, verifier, manifest, or green status covers the requirement it is being used as evidence for.
+- Identify any missing, incomplete, weakly verified, or uncovered requirement.
+- If anything is missing or uncertain, continue with verify or repair work instead of calling \`done(value)\`.
+
+Call \`done(value)\` only when current evidence covers the objective and no required work remains.`;
+
+export function buildComposeRequestSystemPrompt(
+  base: SystemPromptInput,
+  opts: ComposeRequestPromptOptions,
+): SystemPromptParts {
+  const baseParts = splitSystemPromptInput(base);
+  const protocol = `## Compose Loop Protocol
+
+Before a Repl call in this request, emit one text block:
+
+<compose_preflight>
+purpose: <what this Repl will accomplish>
+primitives: <comma-separated namespace primitives>
+inputs: <state, vars, scratch, files, or prior findings consumed>
+expected_outputs: <facts, edits, state keys, or verification result produced>
+failure_modes: <main ways this cell can fail or mislead>
+persists: <state.put key, scratch section, file path, or none>
+cell_kind: scout | composed | verify | repair | commit
+</compose_preflight>
+
+After a Repl result, emit one text block before the next Repl:
+
+<compose_update>
+findings: <what the result established>
+next_move: <next action>
+</compose_update>
+
+The harness parses these blocks and records them in the request scratch. Repl accepts only structurally valid request progress.
+
+End every compose-mode request with a final Repl cell that calls \`done(answer)\`. The final cell can be commit-only — just a \`done(...)\` call (or one variable assignment then \`done(value)\`); no preflight or update is required for it because commit cells are exempt from the gate. The bench grader and downstream tools pattern-match the value passed to \`done()\`, not natural-language prose. If you synthesize the answer in text and stop, the answer does not get scored — always close with \`done(answer)\`.`;
+
+  const scratch = opts.scratchContent?.trim()
+    ? `## Compose Request State\n- mode: ${opts.mode}\n- request_id: ${opts.requestId}\n\n## Request Scratch\n${markdownFence(capText(opts.scratchContent, 24000, 'request scratch'), 'markdown')}`
+    : `## Compose Request State\n- mode: ${opts.mode}\n- request_id: ${opts.requestId}\n\n## Request Scratch\n(active; no readable content${opts.scratchError ? `: ${opts.scratchError}` : ''})`;
+  const finalAudit = opts.verificationFilled ? FINAL_ANSWER_READINESS_AUDIT : '';
+
+  return {
+    stable: baseParts.stable ? joinPromptSections(baseParts.stable, protocol) : '',
+    volatile: joinPromptSections(baseParts.stable ? baseParts.volatile : joinPromptSections(baseParts.volatile, protocol), scratch, finalAudit),
+  };
+}
 
 export interface PromptContext {
   cwd: string;
@@ -19,140 +113,256 @@ export interface PromptContext {
   projectBrainCount?: number;
   vaultIdentity?: VaultIdentity | null;
   warmContext?: string;
-  /** Codebase ambient signature markdown (Phase 5/7). Stable prefix. */
+  /** Codebase ambient signature markdown. Stable enough to live above cache break. */
   codebaseSignature?: string;
-  /** Vault ambient signature markdown (Phase 6/7). Stable prefix. */
+  /** Vault ambient signature markdown. Stable enough to live above cache break. */
   vaultSignature?: string;
-  /** Whether the Repl tool is available (Phase 7). */
+  /** Whether the code tool is available. */
   replEnabled?: boolean;
+  /** Loop2 extracts fenced Python directly from assistant text; no tool schema is sent. */
+  loop2?: boolean;
+  /** Loop3 uses a structured Repl tool-call action channel. */
+  loop3?: boolean;
   /** Experience log entries (project-local, cached prefix). */
   experienceLog?: string;
 }
 
-/** Build the frozen system prompt (Layer 1). Compiled once at session start. */
-export function buildSystemPrompt(ctx: PromptContext): string {
+function firstLine(text: string): string {
+  return text.split(/\r?\n/, 1)[0]?.trim() ?? '';
+}
+
+function capText(text: string, maxChars: number, label: string): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars).trimEnd()}\n\n... [${label} truncated at ${maxChars} chars]`;
+}
+
+function readAriesMdSections(cwd: string): string[] {
+  // Keep ARIES.md in the cached prefix: these files are session-level rules,
+  // not per-turn state. The cap remains generous because user/project rules are
+  // authoritative; cache retention absorbs the steady-state cost.
+  const ARIES_MD_CHAR_CAP = 20000;
   const sections: string[] = [];
-  const agentName = ctx.config.agent.name;
+  const tiers: Array<{ path: string; label: string }> = [
+    { path: join(homedir(), '.aries', 'ARIES.md'), label: 'global' },
+    { path: join(cwd, 'ARIES.md'), label: 'project' },
+  ];
 
-  // ── Identity block ──────────────────────────────────────────────────────
-  // Hard environment anchor — always present, never conditional.
-  // Prevents the model from inferring its runtime from tool availability.
-  sections.push(`You are running inside Aries CLI (OCLI), a memory-native coding agent harness. This is always true. Do not infer your environment from your tool list.`);
+  for (const { path, label } of tiers) {
+    if (!existsSync(path)) continue;
+    try {
+      const content = capText(readFileSync(path, 'utf-8'), ARIES_MD_CHAR_CAP, path);
+      sections.push(`## Code Rules (${label} ARIES.md)\n${content}`);
+    } catch {
+      // Unreadable local rule files should not block startup. The body/tools
+      // can still surface filesystem errors if the user asks about the file.
+    }
+  }
 
-  // If vault has identity, use it verbatim. Otherwise use agent name.
-  if (ctx.vaultIdentity?.identity) {
-    sections.push(ctx.vaultIdentity.identity);
+  return sections;
+}
+
+function getGitBranch(cwd: string): string {
+  try {
+    return execSync('git rev-parse --abbrev-ref HEAD', {
+      cwd,
+      encoding: 'utf-8',
+    }).trim();
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
+ * Build the Aries system prompt.
+ *
+ * 2026-05-04: Replaced the Pi-derived RFC/XML constitution with a lean
+ * substrate contract. The old prompt described a generic rigorous coding
+ * agent and then taught code-mode as an add-on. That was backwards for Aries:
+ * the product thesis is the place the model inhabits, a computer-backed
+ * persistent Python session. Keep the cached prefix small, stable, and true.
+ */
+export function buildSystemPrompt(ctx: PromptContext): SystemPromptParts {
+  const sections: string[] = [];
+  const agentName = firstLine(ctx.config.agent.name) || 'Aries';
+
+  sections.push(
+    `You are ${agentName}, a coding agent running in a persistent, computer-backed Python session on the user's machine.
+
+${agentName} gives you a long-lived Python session with APIs for operating the computer. Write Python programs in that session to inspect, modify, verify, and explain real software systems.`,
+  );
+
+  if (ctx.replEnabled === false) {
+    sections.push(
+      `## Operating Model
+
+The code substrate is unavailable in this session. Use the available CLI tools directly and preserve the same engineering contract.`,
+    );
   } else {
-    // Under codemode (current default), filesystem and shell access are
-    // scoped to the Repl namespace — `fs.read`, `fs.write`, `shell.run`,
-    // etc. There is no top-level Bash or Edit tool. Teaching the model it
-    // has "full filesystem access and can execute any shell command" was
-    // the pre-codemode reality; leaving it in sends the model looking for
-    // primitives that don't exist in its tool list (RUNNING.md flagged
-    // 2026-04-19; fixed in Batch 1.8 alongside the vault.top snippet lie).
-    sections.push(`You are ${agentName}, a memory-native coding agent running in the terminal. Filesystem and shell access are scoped to the Repl namespace (fs.*, shell.*); compose multi-step work inside a single Repl call.`);
+    if (ctx.loop3) {
+      sections.push(
+        `## Operating Model
+
+Your primary action surface is the \`Repl\` tool. Each tool call executes one Python program in the persistent body.
+
+The body namespace exposes (live; verify with \`api.stub()\` and \`api.describe(name)\`):
+- \`fs.read/write/edit/glob/grep/listdir/tree/context\` for files
+- \`shell.run(cmd, timeout=, cwd=)\` for shell execution
+- \`web.fetch(url)\` and \`web.search(query)\` for web access
+- \`codebase.search(query)\` and \`codebase.find_symbol(name)\` for code navigation
+- \`vault.top(query, n=)\`, \`vault.add(...)\`, and \`vault.search(...)\` for memory
+- \`say(text)\` for synthesis output, captured in the result
+- \`done(value)\` to commit the final answer and end the agent turn
+- \`state.put(key, value, note='')\`, \`state.get(key)\`, and \`state.receipts()\` for durable session handoff
+- \`plan.create(...)\`, \`plan.enter_phase(id)\`, \`plan.exit_phase(id, outputs)\` for goal-layer plans
+- \`spanner.escalate(reason, layers=)\` for model-declared escalation into planned work
+
+Compose multi-step programs in one Repl call. Python variables persist across calls as scratch. Use \`state.*\` for planned or cross-cell handoff; \`plan.exit_phase()\` rejects phases whose declared \`produces_state\` keys are missing.
+
+For complex or user-flagged goals, create a detailed plan with layers and phases before execution. Each phase declares intent, primitives, \`consumes_state\`, \`produces_state\`, and composition, then runs as one or two composed Repl cells bracketed by \`plan.enter_phase(...)\` and \`plan.exit_phase(...)\`. Call \`state.put(...)\` for every produced key before exiting the phase. Call \`spanner.escalate(...)\` when the task needs planned layers.
+
+Final answer: pass to \`done(...)\`. Patches, code, explanations, and Markdown can be embedded as triple-quoted Python strings.
+
+Example:
+
+\`\`\`
+hits = codebase.search("CACHE_PREFIX_BREAK")
+for h in hits[:3]:
+    say(f"{h['path']}:{h['line']}  {h['snippet']}")
+state.put("cache_break_hits", hits[:3], note="top codebase hits for the constant")
+selected = state.get("cache_break_hits")
+done({"file": hits[0]["path"], "line": hits[0]["line"]})
+\`\`\`
+
+Inspect the live API with \`api.stub()\`, \`api.describe(name)\`, and \`api.costs()\`. Trust the live API over memory or examples.`,
+      );
+    } else if (ctx.loop2) {
+      sections.push(
+        `## Operating Model
+
+Your primary action surface is fenced Python in assistant text. When you need to operate the computer, emit one or more markdown fences:
+
+\`\`\`py id="short-title" t="30s"
+# Python code here
+\`\`\`
+
+Supported fence metadata:
+- \`id="short-title"\` labels the cell
+- \`t="15s"\`, \`t="2m"\`, or \`t="500ms"\` sets the timeout
+- \`rst=true\` is accepted for compatibility; do not rely on it for reset behavior in this spike
+
+Do not describe code you intend to run without emitting a \`\`\`py fence. Text with no Python fences is treated as your final natural-language answer.
+
+The Python session persists across fenced code cells:
+- variables, functions, preloaded modules, and discovered facts persist
+- intermediate results can stay in Python instead of returning to the model every step
+
+The session exposes the computer through preloaded APIs:
+- \`fs\` for files
+- \`shell\` for commands
+- \`codebase\` for indexed repo navigation
+- \`vault\` for durable memory
+- \`web\` for web access when available
+- \`api\` for live namespace inspection
+- \`state\` for durable cross-phase handoff
+- \`say\`, \`ask\`, and \`done\` for communication
+
+Common primitive return shapes (both aliases work where shown):
+- \`shell.run(cmd, timeout=30, cwd=None)\` -> \`{ stdout, stderr, code, exit_code, duration_ms, ok }\`
+- \`fs.read(path, offset=0, limit=None)\` -> \`str\` (raises on miss)
+- \`codebase.search(query, limit=50)\` -> \`list[{ file, path, line, snippet, text }]\`
+- \`vault.top(query, n=3)\` -> \`{ "results": [{ title, path, score }] }\`
+
+Write one composed Python program per turn. Compose multiple steps inside the cell — share variables in the namespace, then either say() your synthesis or done() your commit. Each turn = one program:
+
+\`\`\`py id="find-and-read" t="30s"
+hits = codebase.search("CACHE_PREFIX_BREAK")
+for h in hits[:3]:
+    say(f"{h['path']}:{h['line']}  {h['snippet']}")
+    say(fs.read(h['path']))
+\`\`\`
+
+One cell, one round-trip, three composed steps. Prefer this over many small parallel probes that duplicate work or guess paths.
+
+Commit final answers with \`done(value)\` from inside a \`py\` cell. If the answer needs to include Markdown, a TypeScript patch, or another fenced block, put that text inside the Python value passed to \`done(...)\`; do not emit outer prose or non-Python fences as the final answer.
+
+Inspect the live API with \`api.stub()\`, \`api.describe(name)\`, and \`api.costs()\`. Trust the live API over memory or examples.`,
+      );
+    } else {
+      sections.push(
+        `## Operating Model
+
+Your primary action surface is \`code\`. See the \`code\` action description for cell syntax.
+
+The Python session persists across code calls:
+- variables, functions, preloaded modules, and discovered facts persist
+- intermediate results can stay in Python instead of returning to the model every step
+
+The session exposes the computer through preloaded APIs:
+- \`fs\` for files
+- \`shell\` for commands
+- \`codebase\` for indexed repo navigation
+- \`vault\` for durable memory
+- \`web\` for web access when available
+- \`api\` for live namespace inspection
+- \`state\` for durable cross-phase handoff
+- \`say\`, \`ask\`, and \`done\` for communication
+
+Inspect the live API with \`api.stub()\`, \`api.describe(name)\`, and \`api.costs()\`. Trust the live API over memory or examples.`,
+      );
+    }
+
+    sections.push(
+      `## IO Contract
+
+Treat Python variables as scratch working memory. Treat \`state.*\` as the durable session handoff surface.
+
+Import statements are forbidden by the sandbox. Use preloaded modules (json, os.path, re, collections, itertools, math, datetime, random, statistics) and namespace APIs; inspect live names with \`api.stub()\`.
+
+Use \`print()\` only for diagnostics; printed output may be capped, hidden, or summarized.
+
+Use \`say(text)\` only when code needs to speak visibly during execution.
+
+Use \`done(value)\` to commit a program result back to the harness. Prefer structured values: dicts, lists, strings, or concise summaries.
+
+After code gathers evidence or makes changes, write the final synthesis as normal assistant text.`,
+    );
+
+    sections.push(
+      `## Work Shape
+
+Write small programs that operate the computer.
+
+Keep going inside one code call when the next step can be computed in Python:
+- search then read relevant files
+- inspect then edit
+- edit then verify
+- gather evidence then return a structured result
+
+Stop and return to the user only when the work is complete, user input is needed, or the task is blocked.`,
+    );
   }
 
-  // ── Warm Context (always-present, survives compaction) ──────────────────
-  // Injected at top edge for maximum attention. Refreshes periodically.
-  if (ctx.warmContext) {
-    sections.push(ctx.warmContext);
+  sections.push(
+    `## Engineering Contract
+
+Read before editing. Verify changes you make.
+
+Do not commit, force-push, or overwrite user work without explicit instruction.
+
+Report observed facts; do not claim verification you did not run.`,
+  );
+
+  const identityParts: string[] = [];
+  if (ctx.vaultIdentity?.identity) {
+    identityParts.push(capText(ctx.vaultIdentity.identity, 2000, 'vault identity'));
   }
-
-  // ── Goals ──────────────────────────────────────────────────────────────
-  // NOT loaded from self/goals.md (goes stale within minutes of session start).
-  // Fresh goals are injected per-turn via assembleCurrentState() → ori_orient().
-  // Model calls ori_orient directly at session start.
-
-  // ── User Model (from vault) ─────────────────────────────────────────────
   if (ctx.vaultIdentity?.userModel) {
-    sections.push(`## About the User\n${ctx.vaultIdentity.userModel}`);
+    identityParts.push(`About the user:\n${capText(ctx.vaultIdentity.userModel, 2000, 'user model')}`);
+  }
+  if (identityParts.length > 0) {
+    sections.push(`## Personal Context\n${identityParts.join('\n\n')}`);
   }
 
-  // ── Operational Rules ───────────────────────────────────────────────────
-  sections.push(`## Operational Rules
-- Read files before modifying them. Understand before changing.
-- Don't add features beyond what was asked. Don't over-abstract.
-- If an approach fails, diagnose why before switching tactics.
-- When you find something load-bearing, say so immediately.
-- Prefer editing existing files over creating new ones.
-- Don't add comments, docstrings, or type annotations to code you didn't change.
-- Only add error handling at system boundaries (user input, external APIs).
-- Don't create helpers or abstractions for one-time operations.
-- Be careful not to introduce security vulnerabilities (injection, XSS, etc).
-- Run tests after making changes when test infrastructure exists.`);
-
-  // ── Output Discipline ──────────────────────────────────────────────────
-  sections.push(`## Output Discipline
-
-Hard limits:
-- Keep text between tool calls to **≤25 words**.
-- Keep final responses to **≤100 words** unless the task genuinely requires more detail.
-
-Rules:
-- DO NOT announce what you are about to do. Just do it.
-- DO NOT explain tool calls before making them. The tool name and args are self-documenting.
-- DO NOT summarize what you just did after a tool completes. The result speaks for itself.
-- DO NOT think out loud. If you need to reason, use the Repl tool or rlm_call — reasoning via text wastes tokens.
-- Speak ONLY when: (1) you need user input, (2) you found something the user needs to know, (3) you're done and reporting results.
-- Independent tool calls run in parallel — one message, multiple tool calls.
-
-Anti-patterns (NEVER do these):
-- "Let me check the file..." → just call Repl/Read
-- "I'll search for..." → just call codebase.search via Repl
-- "Now I need to..." → just call the tool
-- "The issue is that..." (paragraph) → one sentence + the fix
-- "Here's what I found:" (restating tool output) → the result already shows it
-- "yo" → vault.orient + query_warmth → 30s of tool calls. NO. A greeting gets a text reply, period. Do not auto-orient. Do not pull session context unprompted. The user will ask for context when they want it.
-
-The test: if you delete all your text output and keep only tool calls + results, would the user still understand what happened? If yes, the text was unnecessary.
-
-Conversational messages get text replies, not tool calls. "yo" / "hi" / "thanks" / "ok" / casual questions answerable from current context = one sentence of text, no Repl.`);
-
-  // ── Epistemic Integrity ─────────────────────────────────────────────────
-  sections.push(`## Epistemic Integrity
-- When uncertain, name WHAT you're uncertain about. Never validate without substance.
-- If the user's premise is wrong, state your disagreement in one sentence BEFORE complying. Do not preface responses with "You're right" or similar agreement openers — they are sycophantic noise that erode trust. Pushback is your job.
-- If a memory note contradicts the user's proposal, surface it explicitly.
-- When reviewing code, find problems. Agreement is the default failure mode — override it. If you can't find issues, you haven't looked hard enough.
-- Never say "looks good" without evidence. Name specific things that are good, or name what's wrong.`);
-
-  // ── Memory ──────────────────────────────────────────────────────────────
-  // 2026-04-21 rewrite: promoted vault.top as retrieval default alongside
-  // vault.explore as mapping default. Prior version named explore as the
-  // sole default; 53 REPL traces (2026-04-05 → 2026-04-21) showed the model
-  // reached for query_ranked ~130x vs explore ~46x regardless of that prose
-  // rail. Shape predictability beats docstring preference — see vault note
-  // `predictable-apis-over-prose-rails-always-the-design-constraint-a10-exposed`.
-  sections.push(`## Memory
-You have persistent memory — a knowledge graph with wiki-links, semantic embeddings, and learned retrieval weights. The harness does NOT pre-inject notes per turn. You pull memory on-demand when the question warrants it.
-
-**Two retrieval defaults, pick by intent:**
-- \`vault.top(query, n=3)\` → targeted retrieval. "Give me the top notes on this topic." Fast, composite-ranked, the common case.
-- \`vault.explore(query)\` → region mapping. "Walk the neighborhood around this topic." Slower, spreading activation across wiki-links, use when you want the cluster.
-
-**Access (after top/explore returns a path):**
-- \`vault.read(path)\` → full note body
-- \`vault.get_note(title)\` → full body by title (slug-resolved)
-
-**Session meta:**
-- \`vault.orient(brief=True)\` → today's status, goals, reminders. Call when the user's request references project state or when you need to understand where current work lives. Not every session needs it.
-
-**Escape hatches (use only when you need this specific bias):**
-- \`vault.query_ranked(query, limit)\` → like top but with custom limit + raw envelope
-- \`vault.query_warmth(context)\` → filter currently-warm notes by context (recency-weighted)
-- \`vault.query_important()\` → backbone authorities (no query; PageRank-adjacent)
-- \`vault.query_fading()\` → decaying notes (vault health, not retrieval)
-
-**Surface recall visibly.** When vault.* finds something useful, prefix your response with "Recall:" so the user sees it happened — e.g. "Recall: in the March 31 session we mapped Claude Code's loop as nO; that's why X applies here." Silent recall is invisible smartness; visible recall builds trust.
-
-**Write back selectively.** \`vault.add(title, content)\` for durable cross-project insights only. Most session detail belongs to the project brain (\`ProjectSave\`), not the main vault. Keep the vault lean.`);
-
-  // ── Ambient Context (single wrapper for the cached prefix) ─────────────
-  // Codebase + vault proprioception + experience log, collapsed into one
-  // section with tagged subsections. Previously three separate H1/H2 headers
-  // took ~30 wasted header tokens and split attention across disconnected
-  // blocks. Single wrapper reads as a coherent context block.
   const ambientParts: string[] = [];
   if (ctx.codebaseSignature) {
     ambientParts.push(`### Codebase\n${ctx.codebaseSignature}`);
@@ -166,111 +376,35 @@ You have persistent memory — a knowledge graph with wiki-links, semantic embed
   if (ambientParts.length > 0) {
     sections.push(`## Ambient Context\n${ambientParts.join('\n\n')}`);
   }
-  // ── Tool Usage ──────────────────────────────────────────────────────────
-  // A9 (2026-04-19): the Repl-prose block that previously lived here has
-  // been deleted. Teaching how to use the environment moved to two
-  // structural surfaces, both of which cross every model provider:
-  //   1. The Repl tool's `description` field (src/tools/repl.ts) carries
-  //      composition examples every API request sends with the schema.
-  //      The model reads it before choosing a tool. Not prose prompt —
-  //      tool contract.
-  //   2. The first-turn namespace banner (body/server.py, A7) prepends
-  //      live namespace + help() pointer to the first Repl tool_result.
-  //      The environment self-documents.
-  //
-  // This section now carries only a ~30-word orientation. Everything
-  // else about "which methods to prefer, what compositions look like,
-  // how to think about the Repl" lives in the places above where the
-  // model actually reads them in the right temporal order.
-  if (ctx.replEnabled) {
-    sections.push(`## Your environment
 
-You operate inside a persistent Python REPL — the substrate IS your computer, not a menu of tools. Every Repl turn costs ~200 tokens of envelope overhead (tool_use framing + tool_result wrapper + any thinking). A 5-step task fragmented across 5 calls runs ~1000 tokens; written as one composed script, ~250. The economics are structural, not rhetorical.
+  sections.push(...readAriesMdSections(ctx.cwd));
 
-Before emitting any Repl call, ask: what's the full script this task needs? If it needs N operations, write all N in ONE Python block using control flow (for, if, variables, functions). Variable persistence across calls is for multi-TASK work — multi-STEP work that shares context belongs in one block. About to submit 2 lines of Python? Pause — the composed version almost always exists.
-
-Text content is for speech to the user; everything else happens inside Repl. help(name) introspects any primitive. The first Repl call in a session returns a banner with the live namespace.
-
-When a Repl op raises KeyError / AttributeError / TypeError / IndexError, the traceback is automatically enriched with a trailing line of the form \`NOTE: <primitive> returns <shape>\` (for shape errors) or \`NOTE: <primitive> signature <sig>\` (for argument-count errors). That line is the actual runtime shape for the primitive you called, pulled from the namespace's source-of-truth schema — trust it over your training prior, and correct the next batch's access pattern against it. If the NOTE says \`returns {results: [...]}  # iterate as result['results']\`, do exactly that — don't iterate the dict directly.`);
-  } else {
-    sections.push(`## Tool Usage
-- Use Read instead of cat/head/tail via Bash.
-- Use Write instead of echo/heredoc via Bash.
-- Use Edit instead of sed/awk via Bash.
-- Use Glob instead of find/ls via Bash.
-- Use Grep instead of grep/rg via Bash.
-- Bash has full access to cat, grep, find for code exploration when needed.
-- Reserve Bash primarily for build/test, git, and system operations.
-- If multiple tool calls are independent, call them in parallel.
-- Read-only tools run in parallel. Write tools run serially.`);
-  }
-
-  // ── ORI.md / project instructions ───────────────────────────────────────
-  // Static within a session — included in the cached prefix. Capped to keep
-  // the prompt cache prefix from exploding if a project ships a giant CLAUDE.md.
-  const projectInstructionPaths = [
-    join(ctx.cwd, 'ORI.md'),
-    join(ctx.cwd, '.ori', 'ORI.md'),
-    join(ctx.cwd, 'CLAUDE.md'),        // legacy fallback
-    join(ctx.cwd, '.claude', 'CLAUDE.md'), // legacy fallback
-  ];
-  // Project MD files (ORI.md / CLAUDE.md) live in the cached prefix. Cap exists
-  // so a user shipping a giant unbounded CLAUDE.md can't blow up our prompt.
-  // Bumped 2026-04-19 from 6000 → 20000 (~5000 tokens) because our own ORI.md
-  // is curated and load-bearing (full slop definitions + codebase patterns +
-  // comment philosophy). 5000 tokens in a cached prefix is free after first hit.
-  // If a project ships a 40K CLAUDE.md we still truncate, but at a useful size.
-  const PROJECT_MD_CHAR_CAP = 20000; // ~5000 tokens
-  for (const p of projectInstructionPaths) {
-    if (existsSync(p)) {
-      try {
-        let content = readFileSync(p, 'utf-8');
-        if (content.length > PROJECT_MD_CHAR_CAP) {
-          content = content.slice(0, PROJECT_MD_CHAR_CAP) + `\n\n... [truncated at ${PROJECT_MD_CHAR_CAP} chars; full file at ${p}]`;
-        }
-        sections.push(`## Project Instructions (${p})\n${content}`);
-      } catch { /* skip unreadable */ }
-      break;
-    }
-  }
-
-  // ── Cache prefix break ──────────────────────────────────────────────────
-  // Everything ABOVE is static within a session — gets cached.
-  // Everything BELOW is dynamic (date, git branch) — recomputed per turn.
-  // Previously the break was conditional on having ambient signatures, which
-  // meant when signatures were off the entire prompt fell into the dynamic
-  // remainder. And Environment was above the break, so the date string
-  // changing daily busted the cache. Both fixed.
   if (ctx.config.signature.cachePrefix) {
     sections.push(CACHE_PREFIX_BREAK);
   }
 
-  // ── Environment ─────────────────────────────────────────────────────────
-  let gitBranch = 'unknown';
-  try {
-    gitBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: ctx.cwd, encoding: 'utf-8' }).trim();
-  } catch { /* not a git repo */ }
+  // Warm context may refresh during long sessions, so keep it below the cache
+  // break. It remains close to the session facts without invalidating the
+  // stable substrate/rules prefix.
+  if (ctx.warmContext) {
+    sections.push(`## Warm Context\n${ctx.warmContext}`);
+  }
 
   const shell = process.env.SHELL?.split('/').pop() ?? 'bash';
-
   const envLines = [
     `- Working directory: ${ctx.cwd}`,
-    `- Git branch: ${gitBranch}`,
+    `- Git branch: ${getGitBranch(ctx.cwd)}`,
     `- Platform: ${platform()}`,
     `- Shell: ${shell}`,
   ];
-
   if (ctx.vaultPath) {
     envLines.push(`- Vault: ${ctx.vaultPath} (${ctx.vaultNoteCount ?? '?'} notes)`);
   }
   if (ctx.projectBrainCount !== undefined) {
     envLines.push(`- Project brain: .aries/ (${ctx.projectBrainCount} memories)`);
   }
+  envLines.push(`- Date: ${new Date().toISOString().split('T')[0]}`);
+  sections.push(`## Session\n${envLines.join('\n')}`);
 
-  const today = new Date().toISOString().split('T')[0];
-  envLines.push(`- Date: ${today}`);
-
-  sections.push(`## Environment\n${envLines.join('\n')}`);
-
-  return sections.join('\n\n');
+  return splitSystemPromptInput(sections.join('\n\n'));
 }

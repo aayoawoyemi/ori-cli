@@ -6,7 +6,7 @@ import type { ReplHandle } from '../repl/setup.js';
 
 // ── Constrained Bash ─────────────────────────────────────────────────────────
 // Whitelist: build/test, git, system ops, package management.
-// Blocked patterns are split into categories based on REPL availability.
+// Blocked patterns are split into categories based on code availability.
 
 const ALLOWED_PREFIXES = new Set([
   // Build/test
@@ -23,9 +23,9 @@ const ALLOWED_PREFIXES = new Set([
   'code', 'cursor', 'ori',
   // System
   'powershell', 'cmd', 'docker', 'chmod', 'chown',
-  // File reading — allowed when REPL is off (non-Claude models need these)
+  // File reading — allowed when code is off (non-Claude models need these)
   'cat', 'head', 'tail', 'less', 'more', 'bat',
-  // File searching — allowed when REPL is off
+  // File searching — allowed when code is off
   'grep', 'rg', 'find', 'fd', 'ag', 'ack',
 ]);
 
@@ -39,7 +39,7 @@ const ALWAYS_BLOCKED = [
   /\beval\b/, // never
 ];
 
-// Only blocked when REPL is available — model should use codebase.* instead
+// Only blocked when code is available — model should use codebase.* instead
 const REPL_MODE_BLOCKED = [
   /^cat\s/, /^head\s/, /^tail\s/, /^less\s/, /^more\s/, /^bat\s/,
   /^grep\s/, /^rg\s/, /^find\s/, /^fd\s/, /^ag\s/, /^ack\s/,
@@ -56,7 +56,7 @@ const WEB_BLOCKED = [
 
 // Win32-blocked — these Unix commands don't exist or behave wrong on Windows.
 // Forces the model to use native tools (Read, Glob, Grep) instead of wasting
-// turns on commands that will fail. Applied regardless of REPL mode.
+// turns on commands that will fail. Applied regardless of code mode.
 const WIN32_BLOCKED = [
   /^ls\s/,    // no ls on win32 — use Glob or dir
   /^cat\s/,   // unreliable on win32 — use Read tool
@@ -88,13 +88,13 @@ function isCommandAllowed(command: string, replEnabled: boolean): { allowed: boo
     }
   }
 
-  // REPL-mode-only blocks: when REPL is on, push code exploration through codebase.*
+  // code-mode-only blocks: when code is on, push code exploration through codebase.*
   if (replEnabled) {
     for (const pattern of REPL_MODE_BLOCKED) {
       if (pattern.test(trimmed)) {
         return {
           allowed: false,
-          reason: `Blocked: "${trimmed.split(' ')[0]}" — use Repl instead. fs.listdir(path) for directory listing, fs.glob(pattern, path) for file search, fs.read(path) for file contents, codebase.search(query) for code search (project-scoped only).`,
+          reason: `Blocked: "${trimmed.split(' ')[0]}" — use code instead. fs.listdir(path) for directory listing, fs.glob(pattern, path) for file search, fs.read(path) for file contents, codebase.search(query) for code search (project-scoped only).`,
         };
       }
     }
@@ -169,11 +169,11 @@ function isCommandAllowed(command: string, replEnabled: boolean): { allowed: boo
 
   return {
     allowed: false,
-    reason: `Command "${basename}" is not in the allowed list. Bash is constrained to: build/test (tsc, npm, npx), git, file management (mkdir, rm, cp, mv), and system ops.${replEnabled ? ' Use the Repl tool for code exploration and search.' : ''}`,
+    reason: `Command "${basename}" is not in the allowed list. Bash is constrained to: build/test (tsc, npm, npx), git, file management (mkdir, rm, cp, mv), and system ops.${replEnabled ? ' Use code for code exploration and search.' : ''}`,
   };
 }
 
-// ── Soft rewrite: map navigation shell commands → REPL equivalents ───────────
+// ── Soft rewrite: map navigation shell commands -> code equivalents ──────────
 
 interface ReplRewrite {
   code: string;
@@ -314,7 +314,7 @@ export class BashTool implements Tool {
     this.replEnabled = options?.replEnabled ?? false;
     this.getHandle = options?.getHandle;
     this.description = this.replEnabled
-      ? 'Run shell commands. ONLY for: build, test, git, install, file management (mkdir/rm/cp/mv), environment. NEVER for: reading files (use Repl: fs.read), searching code (use Repl: codebase.search), listing directories (use Repl: fs.listdir), or any kind of code/text inspection. If you find yourself reaching for cat/grep/find/ls/head/tail/wc, you are using the wrong tool — use Repl. Reaching for Bash on a navigation task wastes a turn.'
+      ? 'Run shell commands. ONLY for: build, test, git, install, file management (mkdir/rm/cp/mv), environment. NEVER for: reading files (use code: fs.read), searching code (use code: codebase.search), listing directories (use code: fs.listdir), or any kind of code/text inspection. If you find yourself reaching for cat/grep/find/ls/head/tail/wc, you are using the wrong tool — use code. Reaching for Bash on a navigation task wastes a turn.'
       : 'Execute system commands including file reading (cat, grep, find), build/test (tsc, npm, npx, node), git, file management (mkdir, rm, cp, mv), environment (env, echo), and tools (docker, ori).';
   }
 
@@ -328,7 +328,7 @@ export class BashTool implements Tool {
           command: {
             type: 'string',
             description: this.replEnabled
-              ? 'The command to execute. Allowed: build/test, git, file management, env. Blocked: cat, grep, find, curl (use Repl/WebFetch instead).'
+              ? 'The command to execute. Allowed: build/test, git, file management, env. Blocked: cat, grep, find, curl (use code/WebFetch instead).'
               : 'The command to execute. Allowed: build/test, git, file management, env, cat, grep, find. Blocked: sed, awk, curl (use Edit/WebFetch instead).',
           },
           timeout: {
@@ -348,9 +348,9 @@ export class BashTool implements Tool {
       .replace(/[\u2018\u2019]/g, "'");
     const timeout = Math.min((input.timeout as number) || 120_000, 600_000);
 
-    // ── Soft rewrite layer: intercept navigation commands → REPL ─────
+    // ── Soft rewrite layer: intercept navigation commands -> code ────
     // Instead of returning a block error (wasting a turn), silently execute
-    // the equivalent REPL operation and annotate the result so the model
+    // the equivalent code operation and annotate the result so the model
     // learns the mapping in-context.
     if (this.replEnabled && this.getHandle) {
       const rewrite = tryRewriteAsRepl(command, ctx.cwd);
@@ -366,7 +366,7 @@ export class BashTool implements Tool {
           return {
             id: '',
             name: this.name,
-            output: `[harness routed your Bash call through Repl. The original "${command}" was rewritten as: ${rewrite.label}\nNext time call Repl directly with: ${rewrite.code}\nThis would have wasted a turn if rewrite hadn't fired.]\n\n${output || '(no output)'}`,
+            output: `[harness routed your Bash call through code. The original "${command}" was rewritten as: ${rewrite.label}\nNext time call code directly with: ${rewrite.code}\nThis would have wasted a turn if rewrite hadn't fired.]\n\n${output || '(no output)'}`,
             isError: !!result.exception,
           };
         }

@@ -1,18 +1,31 @@
-import type { ModelProvider, Message, ToolDefinition, StreamEvent, ModelSlot, ContentBlock, ImageContent } from './types.js';
-import type { RouterConfig, ModelConfig, ExperimentalConfig, FeaturesConfig } from '../config/types.js';
+import type { ModelProvider, Message, ToolDefinition, StreamEvent, ModelSlot, ContentBlock, ImageContent, EffortLevel, SystemPromptInput } from './types.js';
+import type { RouterConfig, ModelConfig, ExperimentalConfig, FeaturesConfig, CacheConfig } from '../config/types.js';
 import { AnthropicProvider } from './providers/anthropic.js';
 import { GoogleProvider } from './providers/google.js';
 import { OpenAICompatibleProvider } from './providers/openai-compatible.js';
 
+// EffortLevel relocated to router/types.ts (2026-05-01) to break a circular
+// import: providers need the type for their setEffort() implementations, and
+// importing it from router/index.ts → providers/anthropic.ts cycles.
+export type { EffortLevel };
+
 // â”€â”€ Effort Levels â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-export type EffortLevel = 'high' | 'medium' | 'low';
-
 const EFFORT_CONFIG: Record<EffortLevel, { maxTokens: number; thinkingBudget: number }> = {
-  // thinkingBudget = 0 → no thinking (instant); >0 → extended thinking with that token budget
-  high:   { maxTokens: 32_768, thinkingBudget: 10_000 },
-  medium: { maxTokens: 16_384, thinkingBudget: 1_500 },
-  low:    { maxTokens: 8_192,  thinkingBudget: 0 },
+  // 2026-05-01: Redesigned effort tiers.
+  // thinkingBudget is clamped to maxTokens-1 by resolveThinkingBudget.
+  // Low = no thinking at all (speed). Medium = real reasoning.
+  // High = deep deliberation. Max = full model capacity.
+  //
+  // For models that support adaptive thinking (Opus 4.6/4.7, Sonnet 4.6),
+  // the budget number is irrelevant — the provider sends `output_config.effort`
+  // instead and lets the model self-regulate depth. For older models that
+  // only support legacy `enabled+budget_tokens`, the budget here drives the
+  // request directly.
+  max:    { maxTokens: 128_000, thinkingBudget: 100_000 },
+  high:   { maxTokens: 64_000,  thinkingBudget: 50_000 },
+  medium: { maxTokens: 32_768,  thinkingBudget: 16_000 },
+  low:    { maxTokens: 16_384,  thinkingBudget: 0 },
 };
 
 // â”€â”€ Model Shortnames â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -128,8 +141,16 @@ const MODEL_SHORTCUTS: Record<string, ModelShortcut> = {
   'kimi-k2':  { provider: 'moonshot', model: 'kimi-k2', contextWindow: 128_000 },
 
   // â”€â”€ DeepSeek â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  'deepseek':    { provider: 'deepseek', model: 'deepseek-chat',     contextWindow: 128_000, maxOutputTokens: 8_192 },
-  'deepseek-r1': { provider: 'deepseek', model: 'deepseek-reasoner', contextWindow: 128_000, maxOutputTokens: 8_192 },
+  // V4 — released 2026-04-23. Two MoE variants, both with 1M context.
+  // V4-Flash: 284B total / 13B active, $0.14in / $0.28out per M tokens.
+  // V4-Pro:   1.6T total / 49B active, $1.74in / $3.48out per M tokens.
+  // deepseek-chat / deepseek-reasoner deprecated 2026-07-24; DeepSeek maps them
+  // to v4-flash — keeping legacy aliases so existing slot assignments don't break.
+  'deepseek-v4':       { provider: 'deepseek', model: 'deepseek-v4-flash', contextWindow: 1_000_000, maxOutputTokens: 384_000 },
+  'deepseek-v4-flash': { provider: 'deepseek', model: 'deepseek-v4-flash', contextWindow: 1_000_000, maxOutputTokens: 384_000 },
+  'deepseek-v4-pro':   { provider: 'deepseek', model: 'deepseek-v4-pro',   contextWindow: 1_000_000, maxOutputTokens: 384_000 },
+  'deepseek':    { provider: 'deepseek', model: 'deepseek-v4-flash', contextWindow: 1_000_000, maxOutputTokens: 384_000 },
+  'deepseek-r1': { provider: 'deepseek', model: 'deepseek-v4-flash', contextWindow: 1_000_000, maxOutputTokens: 384_000 },
 
   // â”€â”€ Groq (fast inference) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   'llama':    { provider: 'groq', model: 'llama-3.3-70b-versatile', contextWindow: 128_000 },
@@ -189,12 +210,18 @@ const PROVIDER_ENV_KEYS: Partial<Record<ModelConfig['provider'], string>> = {
 
 // â”€â”€ Provider Factory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-function createProvider(config: ModelConfig, experimental?: ExperimentalConfig, features?: FeaturesConfig): ModelProvider {
+function createProvider(
+  config: ModelConfig,
+  experimental?: ExperimentalConfig,
+  features?: FeaturesConfig,
+  cache?: CacheConfig,
+): ModelProvider {
   switch (config.provider) {
     case 'anthropic':
       return new AnthropicProvider(config, {
         allowExperimentalLocalOAuth: experimental?.localClaudeSubscription ?? false,
         features,
+        cache,
       });
     case 'google':
       return new GoogleProvider(config);
@@ -209,6 +236,7 @@ function createProvider(config: ModelConfig, experimental?: ExperimentalConfig, 
     case 'custom':
       return new OpenAICompatibleProvider(config, {
         allowLocalOAuth: experimental?.localChatGPTSubscription ?? false,
+        cache,
       });
     default:
       throw new Error(`Unsupported provider: ${config.provider}. Available: anthropic, google, openai-compatible, deepseek, moonshot, groq, fireworks, openrouter, ollama`);
@@ -224,22 +252,66 @@ export class ModelRouter {
   private overrideProvider: ModelProvider | null = null;
   /** Shortcut name that produced the current override (e.g. "opus-sub"). null when no shortcut is active. */
   private overrideShortcut: string | null = null;
-  private _effort: EffortLevel = 'medium';
+  // 2026-05-01: Default lifted from 'medium' to 'high'. Per Anthropic's
+  // adaptive-thinking docs, `medium` lets the model skip thinking on
+  // "very simple queries" — wrong default for a coding agent. `high`
+  // guarantees the model always thinks, with deep reasoning on hard tasks.
+  private _effort: EffortLevel = 'high';
   private primaryConfig: ModelConfig;
   private experimental?: ExperimentalConfig;
   private features?: FeaturesConfig;
+  private cache?: CacheConfig;
+  /**
+   * Session ID for prompt-cache affinity. Set once after construction by
+   * src/index.ts (the SessionStorage exists at that point but providers
+   * already needed instantiating). Stored here so any later-created
+   * provider (model override, transient vision, slot reassignment) gets
+   * it propagated automatically — see attachSessionId below.
+   */
+  private sessionId: string | null = null;
 
-  constructor(config: RouterConfig, experimental?: ExperimentalConfig, features?: FeaturesConfig) {
+  constructor(
+    config: RouterConfig,
+    experimental?: ExperimentalConfig,
+    features?: FeaturesConfig,
+    cache?: CacheConfig,
+  ) {
     // Primary is optional at construction — a fresh install with no config
     // should be able to load the CLI and see an onboarding screen rather than
     // crash. The router throws a readable error at first call site below.
     this.primaryConfig = config.primary ?? ({} as ModelConfig);
     this.experimental = experimental;
     this.features = features;
-    if (config.primary) this.providers.set('primary', createProvider(config.primary, this.experimental, this.features));
-    if (config.reasoning) this.providers.set('reasoning', createProvider(config.reasoning, this.experimental, this.features));
-    if (config.cheap) this.providers.set('cheap', createProvider(config.cheap, this.experimental, this.features));
-    if (config.bulk) this.providers.set('bulk', createProvider(config.bulk, this.experimental, this.features));
+    this.cache = cache;
+    if (config.primary) this.providers.set('primary', createProvider(config.primary, this.experimental, this.features, this.cache));
+    if (config.reasoning) this.providers.set('reasoning', createProvider(config.reasoning, this.experimental, this.features, this.cache));
+    if (config.cheap) this.providers.set('cheap', createProvider(config.cheap, this.experimental, this.features, this.cache));
+    if (config.bulk) this.providers.set('bulk', createProvider(config.bulk, this.experimental, this.features, this.cache));
+  }
+
+  /**
+   * Propagate the session ID to every existing provider (and remember it
+   * for any later-created one). Idempotent — safe to call multiple times.
+   * Native Anthropic providers no-op via the optional method shape; the
+   * OpenAI-compat provider stores it for prompt_cache_key emission.
+   */
+  setSessionId(id: string): void {
+    this.sessionId = id;
+    for (const p of this.providers.values()) p.setSessionId?.(id);
+    this.overrideProvider?.setSessionId?.(id);
+    this.transientVisionProvider?.setSessionId?.(id);
+  }
+
+  /**
+   * Internal helper — wrap createProvider with the side-effect of
+   * propagating the current sessionId. Used by every later-created
+   * provider site (model override, vision proxy, slot reassignment) so
+   * they inherit the affinity ID without each call site remembering.
+   */
+  private buildProvider(config: ModelConfig): ModelProvider {
+    const p = createProvider(config, this.experimental, this.features, this.cache);
+    if (this.sessionId) p.setSessionId?.(this.sessionId);
+    return p;
   }
 
   /** Readable error when a caller tries to use an unset primary slot. */
@@ -300,7 +372,7 @@ export class ModelRouter {
     const effortStr = parts[1] as EffortLevel | undefined;
 
     // Set effort if specified
-    if (effortStr && (effortStr === 'high' || effortStr === 'medium' || effortStr === 'low')) {
+    if (effortStr && (effortStr === 'max' || effortStr === 'high' || effortStr === 'medium' || effortStr === 'low')) {
       this._effort = effortStr;
     }
 
@@ -349,7 +421,7 @@ export class ModelRouter {
         apiKey: resolvedApiKey,
         baseUrl: shortcut.baseUrl,
       };
-      this.overrideProvider = createProvider(config, this.experimental);
+      this.overrideProvider = this.buildProvider(config);
       this.overrideSlot = null;
       this.overrideShortcut = modelName;
       return { model: shortcut.model, effort: this._effort };
@@ -368,13 +440,18 @@ export class ModelRouter {
   /** Stream from the current provider. Does NOT clear override (persistent until changed). */
   async *stream(
     messages: Message[],
-    systemPrompt: string,
+    systemPrompt: SystemPromptInput,
     tools: ToolDefinition[],
     signal?: AbortSignal,
   ): AsyncGenerator<StreamEvent> {
-    // Propagate effort-level thinking budget to providers that support it (Anthropic)
+    // Propagate both legacy budget AND effort level. Anthropic provider picks:
+    //   - adaptive shape with `output_config.effort` for Opus 4.6/4.7 + Sonnet 4.6
+    //   - legacy `enabled+budget_tokens` for everything else (Haiku/older)
+    // OpenAI-compat provider uses effort for `reasoning_effort` on gpt-5/o3.
+    // Providers that don't support either are no-ops (optional methods).
     const budget = EFFORT_CONFIG[this._effort].thinkingBudget;
     this.current.setThinkingBudget?.(budget);
+    this.current.setEffort?.(this._effort);
 
     // Vision proxy: if the current model is text-only and the conversation
     // contains image blocks, describe each image via a vision-capable slot
@@ -415,13 +492,13 @@ export class ModelRouter {
     // Allow override for users who want a different OCR model on OpenRouter.
     const modelId = process.env.ARIES_VISION_PROXY_MODEL || 'qwen/qwen3-vl-235b-a22b-instruct';
 
-    this.transientVisionProvider = createProvider({
+    this.transientVisionProvider = this.buildProvider({
       provider: 'openrouter',
       model: modelId,
       contextWindow: 262_144,
       maxTokens: 4_096,
       apiKey,
-    }, this.experimental);
+    });
     return this.transientVisionProvider;
   }
 
@@ -562,7 +639,7 @@ export class ModelRouter {
       apiKey: shortcut.baseUrl ? '' : undefined,
       baseUrl: shortcut.baseUrl,
     };
-    this.providers.set(slot, createProvider(config, this.experimental));
+    this.providers.set(slot, this.buildProvider(config));
   }
 
   /**
@@ -678,4 +755,3 @@ export class ModelRouter {
     return Object.keys(MODEL_SHORTCUTS).filter(k => !k.includes('-'));
   }
 }
-

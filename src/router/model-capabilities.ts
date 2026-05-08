@@ -29,8 +29,25 @@ export type ModelCapability = {
   upperLimit: number;
   /** Reserved for future telemetry / context-budget logic. */
   contextWindow?: number;
-  /** Reserved for future thinking-budget gating. */
+  /** Whether the model supports any form of extended thinking (adaptive OR legacy budget). */
   supportsExtendedThinking?: boolean;
+  /**
+   * Whether the model supports adaptive thinking — `thinking: {type: 'adaptive'}`
+   * with `output_config: {effort}`. When true, we send adaptive shape and let
+   * the model self-regulate depth via effort. When false (or undefined), we
+   * fall back to legacy `thinking: {type: 'enabled', budget_tokens: N}`.
+   *
+   * Per Anthropic docs (May 2026):
+   *  - Opus 4.7 — adaptive ONLY (legacy enabled+budget rejected with 400)
+   *  - Opus 4.6, Sonnet 4.6 — adaptive supported; legacy deprecated but still works
+   *  - Older Sonnet/Haiku — legacy only, adaptive rejected
+   *
+   * Adaptive auto-enables interleaved thinking (model thinks BETWEEN tool calls).
+   * On Opus 4.7 also requires `display: 'summarized'` to make thinking content
+   * visible — defaults to 'omitted' which returns empty thinking blocks (the
+   * "thinking feels like 2 lines max" symptom).
+   */
+  supportsAdaptiveThinking?: boolean;
 };
 
 export const MIN_THINKING_BUDGET_TOKENS = 1024;
@@ -40,17 +57,17 @@ export const MIN_THINKING_BUDGET_TOKENS = 1024;
 // are disjoint, not prefix-related).
 const CAPABILITIES: Array<[string, ModelCapability]> = [
   // â”€â”€ Anthropic â”€â”€ Flagship composition models. Default = upperLimit (codemode maximalism).
-  ['claude-opus-4-7',   { default: 128_000, upperLimit: 128_000, contextWindow: 200_000, supportsExtendedThinking: true }],
-  ['claude-opus-4-6',   { default: 128_000, upperLimit: 128_000, contextWindow: 200_000, supportsExtendedThinking: true }],
+  ['claude-opus-4-7',   { default: 128_000, upperLimit: 128_000, contextWindow: 200_000, supportsExtendedThinking: true, supportsAdaptiveThinking: true }],
+  ['claude-opus-4-6',   { default: 128_000, upperLimit: 128_000, contextWindow: 200_000, supportsExtendedThinking: true, supportsAdaptiveThinking: true }],
 
   // Sonnet 4.6 â€” codemode-capable, default lifted but kept under upper.
-  ['claude-sonnet-4-6', { default: 64_000,  upperLimit: 128_000, contextWindow: 200_000, supportsExtendedThinking: true }],
+  ['claude-sonnet-4-6', { default: 64_000,  upperLimit: 128_000, contextWindow: 200_000, supportsExtendedThinking: true, supportsAdaptiveThinking: true }],
 
-  // Older Sonnets â€” lower API ceilings.
+  // Older Sonnets â€” lower API ceilings. No adaptive.
   ['claude-sonnet-4-5', { default: 64_000,  upperLimit: 64_000,  contextWindow: 200_000 }],
   ['claude-sonnet-4',   { default: 32_000,  upperLimit: 64_000,  contextWindow: 200_000 }],
 
-  // Haiku â€” cheap slot, run hot.
+  // Haiku 4.5 — cheap slot, run hot. Adaptive NOT supported per Anthropic docs.
   ['claude-haiku-4-5',  { default: 64_000,  upperLimit: 64_000,  contextWindow: 200_000 }],
 
   // Older Opus generations â€” capped tighter by the API itself.
@@ -66,8 +83,12 @@ const CAPABILITIES: Array<[string, ModelCapability]> = [
   ['kimi-k2.6',         { default: 128_000, upperLimit: 128_000, contextWindow: 262_144 }],
 
   // DeepSeek V3/R1 â€” strong reasoning, 128K context.
-  ['deepseek-chat',     { default: 64_000,  upperLimit: 64_000,  contextWindow: 128_000 }],
-  ['deepseek-reasoner', { default: 64_000,  upperLimit: 64_000,  contextWindow: 128_000 }],
+  // DeepSeek V4 — 1M context window; set default/upper to 200K to avoid runaway costs.
+  ['deepseek-v4-flash', { default: 200_000, upperLimit: 500_000, contextWindow: 1_000_000 }],
+  ['deepseek-v4-pro',   { default: 200_000, upperLimit: 500_000, contextWindow: 1_000_000 }],
+  // Legacy aliases mapped to v4-flash in the router.
+  ['deepseek-chat',     { default: 200_000, upperLimit: 500_000, contextWindow: 1_000_000 }],
+  ['deepseek-reasoner', { default: 200_000, upperLimit: 500_000, contextWindow: 1_000_000 }],
 
   // Qwen â€” DashScope, 131K context.
   ['qwen3.6-plus',      { default: 64_000,  upperLimit: 64_000,  contextWindow: 131_072 }],
@@ -139,4 +160,19 @@ export function resolveThinkingBudget(maxTokens: number, requestedBudget: number
   if (upper < MIN_THINKING_BUDGET_TOKENS) return 0;
 
   return Math.min(requestedBudget, upper);
+}
+
+/**
+ * Whether this model accepts the adaptive thinking shape
+ * (`thinking: {type: 'adaptive', display: 'summarized'}` + `output_config: {effort}`).
+ *
+ * Drives a fork in AnthropicProvider.stream(): adaptive-capable models get
+ * the new shape (which auto-enables interleaved thinking and lets the model
+ * self-regulate); everything else gets legacy `enabled+budget_tokens`.
+ *
+ * On Opus 4.7 specifically, legacy mode is REJECTED with a 400 — adaptive is
+ * the only accepted shape.
+ */
+export function supportsAdaptiveThinking(modelId: string): boolean {
+  return getModelCapability(modelId).supportsAdaptiveThinking === true;
 }

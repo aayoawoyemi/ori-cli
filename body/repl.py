@@ -19,7 +19,7 @@ import threading
 import ctypes
 import traceback
 
-from security import check_ast, SecurityError
+from security import check_ast, SecurityError, strip_preloaded_imports
 from schema import NAMESPACE_SIGNATURES, primitives_by_length
 
 
@@ -151,7 +151,7 @@ def _enrich_exception(tb: str, code: str) -> tuple[str, bool]:
         last_line = tail_lines[-1]
         exc_class = last_line.split(":", 1)[0].strip()
 
-        # ── SyntaxError + TS-like code → hint that Repl is Python ──────
+        # ── SyntaxError + TS-like code -> hint that code is Python ─────
         # When Python raises SyntaxError on code that contains TypeScript-like
         # patterns (const, let, =>, interface, export), append a teaching hint.
         # This replaces the removed client-side looksLikeTypeScriptOrJavaScript
@@ -164,7 +164,7 @@ def _enrich_exception(tb: str, code: str) -> tuple[str, bool]:
             if any(h in code for h in ts_hints):
                 return (
                     tb.rstrip()
-                    + "\nNOTE: This looks like TypeScript/JavaScript — Repl runs "
+                    + "\nNOTE: This looks like TypeScript/JavaScript -- code runs "
                     + "Python. For TS file work, use fs.read/fs.edit/fs.write "
                     + "from Python.\n"
                 ), True
@@ -252,6 +252,9 @@ def execute(code: str, namespace: dict, timeout_ms: int = 30000) -> dict:
 
     # AST pre-pass — runs BEFORE any exec
     try:
+        # Silent muscle-memory normalizer; see body/security.py for why this
+        # transforms only preloaded top-level imports before validation.
+        code = strip_preloaded_imports(code)
         check_ast(code)
     except SecurityError as e:
         return {
@@ -273,8 +276,15 @@ def execute(code: str, namespace: dict, timeout_ms: int = 30000) -> dict:
         sys.stdout, sys.stderr = stdout_buf, stderr_buf
         try:
             exec(code, namespace)
-        except BaseException:
-            state["exception"] = traceback.format_exc()
+        except BaseException as e:
+            # done(value) raises a private BaseException sentinel from
+            # body/server.py. Treat that marker as clean control flow, not a
+            # traceback. This preserves the important property that
+            # model-written `except Exception:` cannot swallow done(), while
+            # still letting KeyboardInterrupt / TimeoutError / real
+            # BaseException subclasses surface as failures.
+            if not getattr(e, "_aries_done", False):
+                state["exception"] = traceback.format_exc()
         finally:
             sys.stdout, sys.stderr = old_stdout, old_stderr
             state["done"] = True

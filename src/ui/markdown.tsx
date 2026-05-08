@@ -2,11 +2,12 @@ import React, { useRef, useMemo, useState, useEffect } from 'react';
 import { Text } from 'ink';
 import { Marked } from 'marked';
 import { markedTerminal } from 'marked-terminal';
+import { lerpColor } from './spinner.js';
 
 // Markdown width accounts for the ● prefix (2 chars) + 1 char safety margin.
 // Recalculated per render to handle terminal resize.
 function getMarkdownWidth(): number {
-  return Math.max(40, (process.stdout.columns || 80) - 3);
+  return Math.max(40, (process.stdout.columns || 80) - 6);
 }
 
 function renderMarkdown(text: string): string {
@@ -100,7 +101,52 @@ export function StreamingMarkdown({ text, isStreaming = true }: { text: string; 
     ? stableRenderedRef.current + '\n' + unstableRendered
     : unstableRendered;
 
-  return <Text>{combined}</Text>;
+  // Render the cursor as part of the same Text node so it sits inline at the
+  // leading edge of the rendered text — appearing on the same line as the last
+  // visible character. Without this nesting it lands on the line below.
+  return (
+    <Text>
+      {combined}
+      {isStreaming && <StreamingCursor />}
+    </Text>
+  );
+}
+
+// ── Streaming cursor ──────────────────────────────────────────────────────
+// A pulsing ▏ glyph that sits at the leading edge of streaming text. Visual
+// purpose: says "new content is arriving here" without competing with the
+// rendered markdown. The breathe rate is intentionally slower than the spinner
+// (1.6s vs 3s) so the cursor reads as a typing indicator, not a load spinner.
+//
+// Why a cursor instead of trailing-character fade-in: the streamed text is
+// rendered as one `<Text>` containing markdown-converted ANSI escape codes.
+// Splitting that string to dim a trailing window requires either parsing ANSI
+// (brittle) or rendering the trailing chars as plain text (loses bold/italic
+// formatting for the bleeding edge). A cursor sidesteps both — it's a single
+// glyph that sits inline without touching the rendered markdown.
+
+const CURSOR_GLYPH = '▏';
+const CURSOR_BREATH_MS = 1600;
+const CURSOR_FRAME_MS = 33;
+const CURSOR_DIM = '#5c4f3e';
+const CURSOR_BRIGHT = '#c4a46c';
+
+function StreamingCursor(): React.ReactElement {
+  const [, forceRender] = useState(0);
+  const originRef = useRef(Date.now());
+
+  useEffect(() => {
+    const interval = setInterval(() => forceRender(n => n + 1), CURSOR_FRAME_MS);
+    return () => clearInterval(interval);
+  }, []);
+
+  const elapsed = Date.now() - originRef.current;
+  const phase = ((elapsed % CURSOR_BREATH_MS) / CURSOR_BREATH_MS) * Math.PI * 2;
+  const raw = (Math.sin(phase - Math.PI / 2) + 1) / 2;
+  const t = raw * raw * (3 - 2 * raw);
+  const color = lerpColor(CURSOR_DIM, CURSOR_BRIGHT, t);
+
+  return <Text color={color}>{CURSOR_GLYPH}</Text>;
 }
 
 /** Find the last "stable" boundary in streaming text.

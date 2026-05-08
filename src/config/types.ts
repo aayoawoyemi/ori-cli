@@ -79,10 +79,32 @@ export interface CompactConfig {
   classifyTiers: boolean;
 }
 
+/**
+ * Prompt-cache retention policy. Threaded into ModelRouter at construction,
+ * read by AnthropicProvider and OpenAICompatibleProvider when emitting
+ * cache_control markers / prompt_cache_key fields.
+ *
+ * - 'short' (default) — Anthropic 5-min ephemeral cache. 1× write cost.
+ *                       Byte-identical to pre-feature behavior.
+ * - 'long'            — Anthropic 1h cache (ttl: '1h' + extended-cache-ttl beta
+ *                       header). 2× write cost. Wins on any session >5min that
+ *                       reuses the same prefix. Aries' harness loop fits this.
+ *                       Also enables OpenAI prompt_cache_retention: '24h'.
+ * - 'none'            — drop cache_control + prompt_cache_key entirely. Useful
+ *                       for cost-instrumented runs where you want to see the
+ *                       un-cached price tag.
+ *
+ * Override via env: ARIES_CACHE_RETENTION=long (or PI_CACHE_RETENTION=long
+ * as muscle-memory fallback for pi users). Env beats YAML beats default.
+ */
+export interface CacheConfig {
+  retention?: 'short' | 'long' | 'none';
+}
+
 export interface ToolsConfig {
   maxResultChars: number;
   parallelReadTools: boolean;
-  maxSubagents: number;
+  // maxSubagents removed 2026-05-03 â€” AgentTool deleted.
   /**
    * Enable dynamic tool exposure — only expose tools relevant to the current
    * task phase (lean: Repl/Edit/Write/Bash/VaultAdd/ProjectSave). Widens to
@@ -142,8 +164,8 @@ export interface SignatureConfig {
   vault: SignatureLayerConfig;
   /** Insert Anthropic cache_control marker after signatures (Anthropic-only). */
   cachePrefix: boolean;
-  /** Whether subagents inherit ambient signatures (default: false). */
-  includeInSubagents: boolean;
+  /** Whether headless mode inherits ambient signatures (default: false). */
+  includeInHeadless: boolean;
   /**
    * Bridge-side tactical trim of vault MCP return payloads — strips
    * `signals`, `spaces`, `rrf`/`rrf_base`/`composite`, warmth internals,
@@ -197,7 +219,12 @@ export interface LocalConfig {
   models: Record<string, { path: string; contextWindow?: number }>;
 }
 
-export type DisplayMode = 'verbose' | 'normal' | 'quiet' | 'cerebral';
+// 2026-05-01: 'cerebral' variant removed. The mode prepended a [CEREBRAL MODE]
+// prefix to every user turn that read "Execute directly. Zero narration. Tool
+// calls only until you have a final result." — anti-cerebral, despite the
+// name. Removed alongside the migration to adaptive thinking, which lets the
+// model self-regulate depth without the prompt fighting itself.
+export type DisplayMode = 'verbose' | 'normal' | 'quiet';
 
 export interface AriesConfig {
   agent: AgentConfig;
@@ -216,7 +243,8 @@ export interface AriesConfig {
   signature: SignatureConfig;
   experimental: ExperimentalConfig;
   features: FeaturesConfig;
+  // Optional so existing user configs without this block don't break.
+  // Provider reads with `?? 'short'` so missing field = current behavior.
+  cache?: CacheConfig;
   mcp: { servers: Record<string, { command: string; args?: string[] }> };
 }
-
-

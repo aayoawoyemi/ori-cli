@@ -3,8 +3,8 @@
  *
  * Variants:
  *   BASELINE           - legacy tools only, no REPL, no signatures
- *   HARNESS-ADDITIVE   - Repl + legacy tools
- *   HARNESS-MANDATORY  - Repl + legacy nav stripped
+ *   HARNESS-ADDITIVE   - code + legacy tools
+ *   HARNESS-MANDATORY  - code + legacy nav stripped
  *
  * Tasks:
  *   read, write, refactor
@@ -30,7 +30,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { ModelRouter } from '../src/router/index.js';
-import { createCoreRegistry, registerReplTool, stripNavigationTools } from '../src/tools/registry.js';
+import { createCoreRegistry, registerCodeTool, stripNavigationTools } from '../src/tools/registry.js';
 import { buildSystemPrompt } from '../src/prompt.js';
 import { SessionStorage } from '../src/session/storage.js';
 import { agentLoop } from '../src/loop.js';
@@ -88,13 +88,13 @@ const VARIANTS: VariantSpec[] = [
   },
   {
     id: 'HARNESS-ADDITIVE',
-    label: 'HARNESS-ADDITIVE (REPL + legacy)',
+    label: 'HARNESS-ADDITIVE (code + legacy)',
     useRepl: true,
     stripLegacyNav: false,
   },
   {
     id: 'HARNESS-MANDATORY',
-    label: 'HARNESS-MANDATORY (REPL-only)',
+    label: 'HARNESS-MANDATORY (code-only)',
     useRepl: true,
     stripLegacyNav: true,
   },
@@ -246,7 +246,7 @@ async function runVariant(
       });
       if (!replHandle) throw new Error('REPL bridge failed to start');
 
-      registerReplTool(registry, () => replHandle);
+      registerCodeTool(registry, () => replHandle);
       if (variant.stripLegacyNav) stripNavigationTools(registry);
 
       const idxResult = await replHandle.bridge.index({ repoPath: workspace });
@@ -407,7 +407,7 @@ function formatDiagnostics(rows: RunMetrics[]): string[] {
 
   if (additive.meanTokens > baseline.meanTokens && additive.meanSeconds > baseline.meanSeconds) {
     notes.push(
-      'Additive harness is slower and more expensive than baseline in aggregate, consistent with mixed-affordance zigzag (legacy tools + REPL both available).',
+      'Additive harness is slower and more expensive than baseline in aggregate, consistent with mixed-affordance zigzag (legacy tools + code both available).',
     );
   }
 
@@ -420,7 +420,7 @@ function formatDiagnostics(rows: RunMetrics[]): string[] {
     const secDelta = (wrMand.secondsPerSuccess - wrBase.secondsPerSuccess) / Math.max(1, wrBase.secondsPerSuccess);
     if (tokenDelta > 0.15 || secDelta > 0.15) {
       notes.push(
-        'Mandatory REPL underperforms on write/refactor tasks. Likely remaining gap: mutation path still relies on legacy Write/Edit and lacks specialized judgment tools for low-turn edits (Phase 8 pending).',
+        'Mandatory code underperforms on write/refactor tasks. Likely remaining gap: mutation path still relies on legacy Write/Edit and lacks specialized judgment tools for low-turn edits (Phase 8 pending).',
       );
     }
   }
@@ -431,7 +431,7 @@ function formatDiagnostics(rows: RunMetrics[]): string[] {
   const readBase = readAgg.get('BASELINE');
   if (readMand && readBase && readMand.tokensPerSuccess < readBase.tokensPerSuccess) {
     notes.push(
-      'Mandatory REPL remains structurally strong for exploration/read tasks, where composed codebase+vault+RLM operations reduce navigation overhead.',
+      'Mandatory code remains structurally strong for exploration/read tasks, where composed codebase+vault+RLM operations reduce navigation overhead.',
     );
   }
 

@@ -27,7 +27,7 @@ A concrete list. When you're about to commit code, scan for these. Every one tra
 
 **Defensive bloat** — `try/except Exception: pass` wrapping every call, null-checks on things internal invariants guarantee non-null, fallback chains that mask the real error. Errors only get caught where there's a meaningful action to take. Otherwise let them propagate.
 
-**Fabrication** — inventing API methods, importing packages that aren't in `package.json` / `requirements.txt`, calling functions that don't exist in the referenced file. Before calling something, confirm it exists. Before importing, confirm it's installed.
+**Fabrication** — inventing API methods, importing packages that aren't in `package.json` / `requirements.txt`, calling functions that don't exist in the referenced file. Before calling something, confirm it exists. Before importing, confirm it's installed. **This includes facts about the world.** If you state a model name, version, price, release date, benchmark score, or API capability — and you haven't seen it in the current session's tool results — search before asserting. Training data is stale by definition. An unverified assertion is a fabrication even if it *happens* to be right.
 
 **Scope creep** — "while I'm here" refactoring, adjacent cleanup during a bug fix, renaming variables in code you weren't asked to touch. Finish the asked task. Note adjacent slop in the commit message, don't silently rewrite it.
 
@@ -190,8 +190,10 @@ If a clean fix requires a larger refactor, STOP and ask.
 
 ## Output discipline (assistant-facing, not code)
 
-- Text between tool calls: ≤25 words. Announcing is noise.
-- Final responses: ≤100 words unless the task genuinely needs more.
+**Think before acting.** Before every tool call, reason in your internal thinking block — not in Repl, not in user-visible text. The thinking block is your internal monologue: deliberation, reconsideration, planning, catching yourself. What reaches the user is the conclusion, not the process. Repl is for *doing*, not for figuring out what to do.
+
+**No hard word caps.** Be cerebral. Think deeply, speak precisely. Depth is the default — never sacrifice understanding for brevity. No padding, no summaries of what just happened, no announcements. But when depth is needed, go deep without apology. Let the content dictate the length, not an arbitrary number.
+
 - No summaries of what just happened — the diff shows it.
 - No emojis in code, output, or docs unless explicitly asked.
 - No sycophantic openers ("Great question", "You're absolutely right"). Say what's true.

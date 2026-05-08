@@ -36,11 +36,12 @@ export const TASKS: BenchTask[] = [
     prompt:
       "Where is CACHE_PREFIX_BREAK defined and how does the Anthropic provider use it? " +
       "Name the file and line for the constant, the function that splits the system prompt on it, " +
+      "cite src/router/providers/anthropic.ts where the native Anthropic provider consumes the split, " +
       "and list three things that go above the break vs three things below.",
     grader: {
       mustContainAll: [
         'src/prompt\\.ts',
-        'splitSystemPromptByCacheBoundary|split.*cache.*boundary',
+        'splitSystemPromptInput|splitSystemPromptByCacheBoundary|split.*cache.*boundary',
         'anthropic\\.ts',
       ],
       mustContainAtLeast: {
@@ -53,23 +54,31 @@ export const TASKS: BenchTask[] = [
   },
 
   {
-    id: '02-repl-failure-audit',
+    id: '02-code-import-detector-fix',
     category: 'dogfood',
     prompt:
-      "What are the top 3 most common Repl failure modes in the session logs at ~/.aries/sessions? Show counts.",
+      "In bench/2026-04/fixtures/import-detector-bug.ts, the code tool rejects valid Python imports like `import json` as TypeScript/JavaScript before the import-specific lint can explain that imports are forbidden. " +
+      "Find the detector, explain the exact regex bug, and give the minimal TypeScript patch. Do not edit files; inspect the source and answer from the code.",
     grader: {
       mustContainAll: [
-        'codebase',
-        'rlm_batch|rlm batch',
-        'NameError|FileNotFoundError|not defined',
+        'looksLikeTypeScriptOrJavaScript',
+        'import json|from collections|Python import',
+        'TypeScript|JavaScript|TS\\/JS',
+        'Imports are forbidden|import-specific|import lint',
       ],
       mustContainAtLeast: {
         n: 2,
-        patterns: ['\\b1[01]\\b', '\\b[6-9]\\b', '\\b[5-7]\\b'], // ground truth: 11, 7, 6
+        patterns: [
+          'import\\s+type',
+          'from\\s+["\\\']',
+          'side-effect',
+          '\\{',
+          'do not match|avoid matching|stop matching',
+        ],
       },
     },
-    reference: 'Top 3: NameError "codebase" (~11), FileNotFoundError fs.read (~7), NameError "rlm_batch" (~6).',
-    target: { tokens: 5000, toolCalls: 3, wallMs: 30000 },
+    reference: 'The broad /^\\s*import\\s+(?:type\\s+)?[{*\\w]/ regex matches Python imports. Split TS/JS import detection into import type, import { ... }, import * ..., import name from "...", and side-effect import "..."; let Python import/from statements fall through to the import-forbidden lint.',
+    target: { tokens: 6000, toolCalls: 2, wallMs: 30000 },
   },
 
   {

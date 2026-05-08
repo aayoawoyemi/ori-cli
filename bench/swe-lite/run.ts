@@ -27,9 +27,11 @@
  *   --skip-agent    don't run the agent (just re-grade existing edits)
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync, statSync, createWriteStream } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync, statSync, createWriteStream, copyFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { parseAries, parseClaude, parsePi, type Metrics } from '../2026-04/runner/parsers.js';
 
 // Read repo-root .env into a local map. We deliberately do NOT inject into
 // process.env — that would leak credentials to every child the runner
@@ -292,6 +294,47 @@ function setupWorkspace(): void {
   }
 }
 
+// ── Bench fixture: pytest wrapper script ────────────────────────────────
+// 2026-05-03 — fix for cmd.exe quote-mangling. The original prompt told the
+// model to run pytest via:
+//   shell.run('"C:/path/python.exe" -m pytest "test_id"')
+// On Windows shell.run wraps in `cmd.exe /c <cmd>`, and cmd.exe's documented
+// quote-handling rule strips the outer quotes from the /c argument when the
+// command line has exactly the wrong shape. The result: 19 turns burned in
+// the swe-lite pytest trace just trying to construct a working invocation,
+// before the model ever got to fix the actual bug.
+//
+// Workaround: pre-write a Python wrapper that does subprocess.run([...])
+// with argv-array (no shell). Tell the model to invoke it as
+// `shell.run('python run_test.py', cwd=...)` — a one-token command with no
+// quote-stripping concerns. The wrapper handles the venv-python path
+// internally, sidestepping cmd.exe entirely. System python (already on
+// PATH) launches the wrapper; the wrapper launches venv-python via argv.
+function writeRunTestScript(): string {
+  const scriptPath = join(wsDir, 'run_test.py');
+  const venvPyRepr = JSON.stringify(venvPy.replace(/\\/g, '/'));  // forward-slash path is portable + JSON-quotable
+  const repoRepr = JSON.stringify(repoDir.replace(/\\/g, '/'));
+  const testsRepr = '[' + FAIL_TO_PASS.map(t => JSON.stringify(t)).join(', ') + ']';
+  const content = [
+    '"""Bench test wrapper. Runs the FAIL_TO_PASS tests via venv-python with',
+    'argv-array subprocess so cmd.exe quote-mangling never enters the picture.',
+    'Exit code = pytest exit code."""',
+    'import subprocess, sys',
+    `VENV_PY = ${venvPyRepr}`,
+    `REPO = ${repoRepr}`,
+    `TESTS = ${testsRepr}`,
+    '',
+    'r = subprocess.run(',
+    '    [VENV_PY, "-m", "pytest", "-v", "-p", "no:cacheprovider", *TESTS],',
+    '    cwd=REPO,',
+    ')',
+    'sys.exit(r.returncode)',
+    '',
+  ].join('\n');
+  writeFileSync(scriptPath, content);
+  return scriptPath;
+}
+
 // ── Build the agent prompt ──────────────────────────────────────────────
 // The verification clause (2026-04-27) — the first pilot run showed aries
 // shipping a confident-but-wrong fix in 59s without ever running the test.
@@ -303,11 +346,18 @@ function setupWorkspace(): void {
 // prompt mandates verification explicitly: model must run pytest, see it
 // pass, then commit. Failure here means the codemode prior is the
 // structural problem and we need to revisit done() semantics, not prompts.
-function buildPrompt(): string {
-  // Absolute python path the model can use directly via shell.run() inside
-  // the Repl. Forward slashes work on Windows + Unix.
-  const venvPyPosix = venvPy.replace(/\\/g, '/');
-  return [
+//
+// 2026-05-03 — switched verification step from inline shell.run pytest to
+// the run_test.py wrapper (see writeRunTestScript above) to bypass cmd.exe
+// quote-mangling. Also added an Aries-only suffix telling it to reindex the
+// workspace so codebase.* primitives work for the test repo. Without that,
+// codebase.find_symbol/search return empty (the index is built for
+// aries-cli, not the test repo) and the model falls back to fs.read+rgrep,
+// underutilizing its substrate.
+function buildPrompt(scriptPath: string, forCli: 'aries-cli' | 'claude-code' | 'pi-coding-agent'): string {
+  const scriptPosix = scriptPath.replace(/\\/g, '/');
+  const wsDirPosix = wsDir.replace(/\\/g, '/');
+  const lines = [
     `You are working in the repo at "${repoDir}". A failing test has been added that captures a real bug. Read the relevant code, find the bug, and fix it. Do not modify the tests — only the source files.`,
     '',
     'GitHub issue (the bug):',
@@ -322,26 +372,39 @@ function buildPrompt(): string {
     '1. Read the failing test to understand what behavior it expects.',
     '2. Read the relevant source files. Form a hypothesis about the bug.',
     '3. Edit the source files to apply your fix.',
-    '4. **Run the failing test in the Repl to verify**:',
-    `     shell.run('"${venvPyPosix}" -m pytest -v -p no:cacheprovider ${FAIL_TO_PASS.map(t => `"${t}"`).join(' ')}')`,
-    '   The result has fields {stdout, stderr, code}. code=0 means all tests passed.',
-    '5. If any test still fails, read the actual pytest output, diagnose, edit again, re-run pytest. Do NOT call done() while any FAIL_TO_PASS test is still failing.',
+    '4. **Run the failing test to verify**:',
+    `     shell.run('python run_test.py', cwd='${wsDirPosix}')`,
+    `   (run_test.py is at ${scriptPosix} — it invokes the venv-pinned pytest with the FAIL_TO_PASS tests.)`,
+    '   Result fields: {stdout, stderr, code}. code=0 means all tests passed.',
+    '5. If any test still fails, read the actual pytest output, diagnose, edit again, re-run. Do NOT call done() while any FAIL_TO_PASS test is still failing.',
     '6. Only after pytest exit code is 0, call done() to commit.',
     '',
-    'Edit files directly with fs.edit / fs.write. Do not produce a diff in prose — make actual edits to actual files. The test fixtures already exist in the working tree; do not regenerate them.',
-  ].join('\n');
+    'Edit files directly. Do not produce a diff in prose — make actual edits to actual files. The test fixtures already exist in the working tree; do not regenerate them.',
+  ];
+  if (forCli === 'aries-cli') {
+    lines.push(
+      '',
+      `Aries: this is a fresh codebase you have not indexed. Call \`reindex(${JSON.stringify(repoDir.replace(/\\/g, '/'))})\` early so codebase.find_symbol / codebase.search / codebase.get_file_summary work against this repo. Without that they query the wrong index and return empty.`,
+    );
+  }
+  return lines.join('\n');
 }
 
 // ── Spawn agent ─────────────────────────────────────────────────────────
-function ariesInvocation(prompt: string) {
+function ariesInvocation(prompt: string, sessionId: string) {
   const distEntry = join(REPO_ROOT, 'dist', 'index.js');
   if (!existsSync(distEntry)) {
     throw new Error(`aries dist not built — run \`npm run build\` in repo root`);
   }
+  // ARIES_SESSION_ID pins the session log filename so parseAries can find
+  // the right transcript even when other Aries processes are live. Without
+  // it parseAries falls back to newest-mtime in ~/.aries/sessions/, which
+  // is unsafe under concurrency (the wrong session can win and the bench
+  // grades a stranger's transcript).
   return {
     cmd: process.execPath,
     args: [distEntry, prompt],
-    env: { ...process.env, ARIES_SUBAGENT: '1', BENCH_MODEL: MODEL },
+    env: { ...process.env, ARIES_HEADLESS: '1', BENCH_MODEL: MODEL, ARIES_SESSION_ID: sessionId },
     useShell: false,
   };
 }
@@ -437,9 +500,35 @@ function piInvocation(_prompt: string) {
   };
 }
 
-async function runAgent(prompt: string): Promise<{ exitCode: number | null; wallMs: number; stdoutBytes: number; stderrTail: string; transcriptPath: string }> {
+interface AgentRun {
+  exitCode: number | null;
+  wallMs: number;
+  startedAtMs: number;
+  stdoutBytes: number;
+  stderrTail: string;
+  transcriptPath: string;
+  /** In-memory stdout. Used by parseClaude/parsePi to extract token + tool data
+   *  and by parseAries as the archived-jsonl fallback when no on-disk session
+   *  log is found. Held alongside the streamed transcript file for a
+   *  single source of truth. */
+  stdout: string;
+  /** Stable session id for aries (undefined for other CLIs). Threaded through
+   *  to parseAries so it locates the right ~/.aries/sessions/<sid>/<sid>.jsonl
+   *  even when concurrent Aries processes are alive. */
+  ariesSessionId: string | undefined;
+}
+
+async function runAgent(prompt: string): Promise<AgentRun> {
+  // Stable session id for aries. Encoded into ARIES_SESSION_ID so the bench
+  // can locate the transcript even under concurrent Aries processes. Encoded
+  // into the result so re-summarization later still ties this task's
+  // metrics to its log.
+  const ariesSessionId = CLI === 'aries-cli'
+    ? `bench-swe-${task!.instance_id.slice(0, 40).replace(/[^A-Za-z0-9_-]/g, '_')}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    : undefined;
+
   const inv =
-    CLI === 'aries-cli' ? ariesInvocation(prompt)
+    CLI === 'aries-cli' ? ariesInvocation(prompt, ariesSessionId!)
     : CLI === 'claude-code' ? claudeInvocation(prompt)
     : piInvocation(prompt);
   step(`spawning ${CLI}: ${inv.cmd} ${inv.args.slice(0, 2).join(' ')}...`);
@@ -448,8 +537,8 @@ async function runAgent(prompt: string): Promise<{ exitCode: number | null; wall
   // the run. CC emits stream-json (one event per line) including usage and
   // tool_use blocks; aries-cli writes its session events to ~/.aries/sessions/
   // separately, so capturing here is mostly for CC/pi but harmless for aries.
-  // Pre-fix the runner only counted bytes and discarded the stream — token
-  // comparison was impossible until we ran a fresh task.
+  // We ALSO accumulate the stdout in memory so the parser doesn't have to
+  // re-read from disk — same single-pass shape as bench/2026-04/runner.
   const transcriptDir = join(__dirname, 'results');
   mkdirSync(transcriptDir, { recursive: true });
   const transcriptPath = join(transcriptDir, `${task!.instance_id}-${CLI}.transcript.jsonl`);
@@ -464,7 +553,15 @@ async function runAgent(prompt: string): Promise<{ exitCode: number | null; wall
     });
     let stdoutBytes = 0;
     let stderrTail = '';
-    proc.stdout.on('data', (d) => { stdoutBytes += d.length; transcriptStream.write(d); });
+    let stdoutBuf = '';
+    proc.stdout.on('data', (d) => {
+      stdoutBytes += d.length;
+      transcriptStream.write(d);
+      // Decode incrementally. UTF-8 boundary risk is real but stream-json
+      // events are line-oriented so partial-codepoint splits are rare in
+      // practice; the parser tolerates the occasional unparseable line.
+      stdoutBuf += d.toString();
+    });
     proc.stderr.on('data', (d) => {
       stderrTail = (stderrTail + String(d)).slice(-4000);
     });
@@ -478,9 +575,47 @@ async function runAgent(prompt: string): Promise<{ exitCode: number | null; wall
     proc.on('exit', (code) => {
       clearTimeout(killer);
       transcriptStream.end();
-      resolve({ exitCode: code, wallMs: Date.now() - t0, stdoutBytes, stderrTail, transcriptPath });
+      resolve({
+        exitCode: code,
+        wallMs: Date.now() - t0,
+        startedAtMs: t0,
+        stdoutBytes,
+        stderrTail,
+        transcriptPath,
+        stdout: stdoutBuf,
+        ariesSessionId,
+      });
     });
   });
+}
+
+// Locate the aries session log on disk for the given session id and copy it
+// into the run's results dir. The session log holds the full loop3+compose
+// telemetry — without copying, future Aries processes can rotate or evict
+// it before we re-summarize. Returns the destination path or null on miss.
+function preserveAriesSessionLog(sessionId: string, instanceId: string): string | null {
+  const sessionsDir = join(homedir(), '.aries', 'sessions');
+  if (!existsSync(sessionsDir)) return null;
+  for (const sid of readdirSync(sessionsDir)) {
+    const candidate = join(sessionsDir, sid, `${sessionId}.jsonl`);
+    if (existsSync(candidate)) {
+      const dest = join(__dirname, 'results', `${instanceId}-aries-cli.session.jsonl`);
+      try { copyFileSync(candidate, dest); return dest; }
+      catch { return null; }
+    }
+  }
+  return null;
+}
+
+// Drop the inflated `transcript` field from the Metrics object before we
+// serialize the result JSON. The parser populates it with the full session
+// log (which we already copy to .session.jsonl for aries, or .transcript.jsonl
+// for the other CLIs). Duplicating it inside the JSON would balloon result
+// files to 1MB+ on the bigger SWE-Bench tasks for no information gain.
+function leanMetrics(m: Metrics): Omit<Metrics, 'transcript'> & { transcript?: never } {
+  const { transcript: _omit, ...rest } = m;
+  void _omit;
+  return rest as Omit<Metrics, 'transcript'> & { transcript?: never };
 }
 
 // ── Grading via pytest ─────────────────────────────────────────────────
@@ -572,13 +707,53 @@ function runPytest(testIds: string[], label: string): PytestRunResult {
 async function main() {
   setupWorkspace();
 
-  let agent = { exitCode: 0 as number | null, wallMs: 0, stdoutBytes: 0, stderrTail: '' };
+  // Always (re)write the test wrapper. It bakes in venv-py path, repo path,
+  // and FAIL_TO_PASS list — cheap to regenerate on every run, avoids stale
+  // values when --skip-setup reuses an old workspace.
+  const scriptPath = writeRunTestScript();
+
+  let agent: AgentRun = {
+    exitCode: 0,
+    wallMs: 0,
+    startedAtMs: Date.now(),
+    stdoutBytes: 0,
+    stderrTail: '',
+    transcriptPath: '',
+    stdout: '',
+    ariesSessionId: undefined,
+  };
   if (!SKIP_AGENT) {
-    const prompt = buildPrompt();
+    const prompt = buildPrompt(scriptPath, CLI);
     agent = await runAgent(prompt);
     step(`agent exit=${agent.exitCode} wall=${(agent.wallMs / 1000).toFixed(1)}s stdout=${agent.stdoutBytes}B`);
   } else {
     step('skipping agent run (--skip-agent)');
+  }
+
+  // Parse rich metrics: tokens, tool breakdown, loop3 composition density,
+  // compose sub-loop telemetry (preflight coverage, gate rejections, V2
+  // closure: commit/done rates per request), structured-done channel.
+  // For aries we ALSO copy the session log into results/ so the metrics
+  // remain reproducible from disk even after the original log rotates.
+  let metrics: Metrics | null = null;
+  let sessionLogCopied: string | null = null;
+  if (!SKIP_AGENT) {
+    if (CLI === 'aries-cli') {
+      metrics = parseAries(agent.stdout, agent.stderrTail, agent.startedAtMs, agent.ariesSessionId);
+      if (agent.ariesSessionId) {
+        sessionLogCopied = preserveAriesSessionLog(agent.ariesSessionId, task!.instance_id);
+        if (sessionLogCopied) step(`session log copied → ${sessionLogCopied}`);
+      }
+    } else if (CLI === 'claude-code') {
+      metrics = parseClaude(agent.stdout);
+    } else {
+      metrics = parsePi(agent.stdout);
+    }
+    step(
+      `metrics: tokens=${metrics.tokens.total} (cached=${metrics.tokens.cached}) tools=${metrics.toolCalls.total}` +
+      (metrics.compose ? ` compose=${metrics.compose.requests.total}req/${metrics.compose.preflights.parsed}pf/${metrics.compose.gateRejections.total}gate/${metrics.compose.closure.commitsCount}commit/${metrics.compose.closure.donesCount}done` : '') +
+      (metrics.loop3 ? ` loop3=${metrics.loop3.cells}c/${metrics.loop3.composedCells}cmp/${metrics.loop3.crossCellStateReuseCells}reuse` : ''),
+    );
   }
 
   // Diff — what did the agent actually change?
@@ -608,13 +783,14 @@ async function main() {
     instance_id: task!.instance_id,
     repo: task!.repo,
     cli: CLI,
-    model: MODEL,
+    model: metrics?.observedModel ?? MODEL,
     success,
     agent: {
       exitCode: agent.exitCode,
       wallMs: agent.wallMs,
       stdoutBytes: agent.stdoutBytes,
       stderrTail: agent.stderrTail,
+      ariesSessionId: agent.ariesSessionId,
     },
     diff_stat: diffStat,
     fail_to_pass: {
@@ -631,6 +807,17 @@ async function main() {
       failed: ptp.failed,
       errored: ptp.errored,
     },
+    // Deep telemetry from the shared parsers.ts. tokens (input/cached/output/
+    // total), per-tool counts, observed model, plus the loop3 composition
+    // block (turns, cells, composedCells, microCells, pureProbes,
+    // usefulOperations, batched read/verify cells, cross-cell state reuse,
+    // structuredDone, cellsByStatus) and the compose sub-loop block (mode
+    // breakdown, preflight coverage, gate rejections by reason, V2 closure
+    // counters). For non-aries CLIs the loop3/compose blocks are absent.
+    // The bulky `transcript` field is dropped from the JSON — the streamed
+    // stdout lives at <id>-<cli>.transcript.jsonl and the aries session log
+    // (when applicable) at <id>-<cli>.session.jsonl.
+    ...(metrics ? { metrics: leanMetrics(metrics) } : {}),
     timestamp: new Date().toISOString(),
   };
 

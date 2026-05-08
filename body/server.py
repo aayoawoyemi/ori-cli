@@ -25,7 +25,7 @@ import os.path as _ospath
 from types import SimpleNamespace as _SimpleNamespace
 from pathlib import Path
 
-# Pure-function stdlib modules bound into the Repl namespace at build
+# Pure-function stdlib modules bound into the code namespace at build
 # time (A.6.4, 2026-04). Kills the model's `import re` / `import datetime`
 # reflex that currently costs a turn on every session — the AST pre-pass
 # blocks every `import`, and the model doesn't know re is already available
@@ -114,11 +114,17 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import repl
 from fs import Fs
+import fs as _fs_mod
 from shell import Shell
 from web import Web
 from speak import Speak
 from shape import analyze_shape
-from schema import NAMESPACE_SIGNATURES
+from schema import NAMESPACE_SIGNATURES, NamespaceApi
+from plan import Plan
+from spanner import Spanner
+from state import State
+from scratch import Scratch
+import version as _body_version
 from _protocol import write_message
 
 # Lazy imports (heavy deps) — only loaded when ops are used
@@ -127,9 +133,9 @@ _codebase_module = None
 _vault_module = None
 _research_module = None
 _rlm_module = None
-CODEBASE = None  # CodebaseGraph instance, exposed via REPL namespace
-VAULT = None  # Vault proxy instance, exposed via REPL namespace
-RESEARCH = None  # Research proxy instance, exposed via REPL namespace
+CODEBASE = None  # CodebaseGraph instance, exposed via code namespace
+VAULT = None  # Vault proxy instance, exposed via code namespace
+RESEARCH = None  # Research proxy instance, exposed via code namespace
 
 # ── Environment-awareness globals (Fix 1A — A10 finding) ─────────────────
 # Display-only metadata populated by the `configure` op that the TS harness
@@ -167,6 +173,14 @@ ENV_VAULT_GLOBAL = None
 ENV_VAULT_PROJECT = None
 ENV_MODE = None
 ENV_SHELL = None
+ENV_STATE_DIR = None
+# Compose sub-loop request scoping (Tier 2). The harness configures these
+# per top-level user message via the configure op. Used by Scratch to
+# compute the per-request markdown file path. None when no compose-mode
+# request is in flight; scratch primitives no-op gracefully in that case.
+ENV_SESSION_ID = None
+ENV_REQUEST_ID = None
+ENV_COMPOSE_MODE = None
 
 # Fs is always available (no connect step, no heavy deps), so instantiate it
 # eagerly at module import. Lives for the full process lifetime. resolve()
@@ -195,8 +209,23 @@ WEB = Web()
 # matches the codemode intent: user-facing I/O should read like builtins, not
 # namespaced API surface. See CODEMODE_ROADMAP.md §A6 for why the turn-break
 # cost of text content blocks makes these primitives the critical path for
-# collapsing N-turn tasks into single Repl calls.
+# collapsing N-turn tasks into single code calls.
 SPEAK = Speak()
+
+# Goal-mode substrate primitives. These are body-local and provider-neutral:
+# the model calls plan.* / spanner.* from inside composed Repl cells, while the
+# TS harness only observes result metadata and telemetry.
+STATE = State(lambda: ENV_STATE_DIR, lambda: ENV_PROJECT)
+PLAN = Plan(lambda: ENV_PROJECT, STATE.has)
+SPANNER = Spanner()
+# Compose sub-loop scratch substrate (Tier 2). Per-request markdown file
+# at <project>/.aries/tmp/requests/<session_id>-<request_id>.md. Lifecycle:
+# created on compose-mode request start (harness calls scratch.start via a
+# new sync op), updated by the model via scratch.append/set OR by the
+# harness via parsed <compose_preflight>/<compose_update> blocks (Tier 3),
+# deleted on terminal events. The model can also fs.read/fs.edit the file
+# directly using the path from scratch.status() — both surfaces work.
+SCRATCH = Scratch(lambda: ENV_PROJECT, lambda: ENV_SESSION_ID, lambda: ENV_REQUEST_ID)
 
 
 # ── done() commitment primitive ──────────────────────────────────────────
@@ -222,6 +251,24 @@ _done_sink: list = []
 _done_sink_lock = threading.Lock()
 
 
+class _DoneException(BaseException):
+    """
+    Private control-flow sentinel raised by done(value).
+
+    It intentionally inherits BaseException, not Exception, following the
+    smolagents final_answer pattern: model-written `except Exception:` blocks
+    should not be able to swallow the commit signal. body/repl.py recognizes
+    the marker attributes below and treats this as clean completion, not an
+    error traceback.
+    """
+
+    _aries_done = True
+
+    def __init__(self, value):
+        super().__init__("Aries done(value) committed")
+        self.value = value
+
+
 def _safe_for_json(value):
     """Coerce value to something json.dumps() won't choke on. Non-serializable
     inputs fall back to str() — the committed value is for telemetry/narrative,
@@ -236,10 +283,10 @@ def _safe_for_json(value):
 def _done_primitive(value=None):
     """Commit `value` as the turn's final answer and signal turn-end intent.
 
-    Non-raising: execution of the surrounding batch continues. The harness
-    records the committed value in telemetry and the loop decides whether
-    to force turn-end based on its own policy. If called multiple times,
-    the last call wins.
+    Raises a private BaseException sentinel after recording the value. That
+    makes done() a true commit boundary: ordinary `except Exception:` blocks
+    in model-written code cannot accidentally swallow it, and code after
+    done() in the same cell does not run.
 
     Typical usage — last op of a batch:
         done(my_answer)
@@ -257,6 +304,7 @@ def _done_primitive(value=None):
     # _done_sink_lock guards a Python list (not the pipe), so it stays.
     with _done_sink_lock:
         _done_sink.append(safe)
+    raise _DoneException(safe)
 
 
 def _lazy_load_indexer():
@@ -313,6 +361,7 @@ def _reindex(path: str, include_nested_repos: bool = False) -> dict:
     idx_mod, cb_mod = _lazy_load_indexer()
     idx_result = idx_mod.index_repo(path, include_nested_repos=include_nested_repos)
     CODEBASE = cb_mod.CodebaseGraph(idx_result)
+    _fs_mod._CODEBASE_REF = CODEBASE
     _rebuild_namespace()
     return CODEBASE.stats()
 
@@ -431,14 +480,23 @@ def _build_namespace() -> dict:
     # own workspace-scope checks, permission prompts, and edit snapshots.
     import json as _json
     ns["fs"] = FS
-    # shell.run inside the Repl replaces the top-level Bash tool. See
+    # shell.run inside code replaces the top-level Bash tool. See
     # body/shell.py header for the design rationale (no zigzag blocks,
     # because the model is already in Python — there's nothing to zigzag to).
     ns["shell"] = SHELL
     # web.fetch / web.search replace the top-level WebFetch / WebSearch tools.
-    # Model composes search+fetch in a single Repl call instead of two
+    # Model composes search+fetch in a single code call instead of two
     # sequential tool calls.
     ns["web"] = WEB
+    # Generated namespace inspector. Cheap/local, backed by body/schema.py,
+    # and filtered against the live namespace at call time. This is the
+    # structural discovery path for Level 1: api.stub(), api.describe(name),
+    # and api.costs() replace ad hoc dir()/wrong-shape probing.
+    ns["api"] = NamespaceApi(lambda: _visible_primitive_names())
+    ns["plan"] = PLAN
+    ns["spanner"] = SPANNER
+    ns["state"] = STATE
+    ns["scratch"] = SCRATCH
     # say / ask are bound as BARE names — not speak.say / speak.ask — because
     # they are the agent's primary I/O channel to the user and should read as
     # part of the Python builtin surface. `say("hello")` matches `print("hello")`
@@ -548,7 +606,7 @@ def _write_response(response: dict) -> None:
 
 _BANNER_PRIMITIVES = [
     "codebase", "vault", "research",
-    "fs", "shell", "web",
+    "fs", "shell", "web", "api", "plan", "spanner", "state", "scratch",
     "rlm_call", "rlm_batch",
     "say", "ask", "done", "json", "os", "reindex",
     # Stdlib modules pre-bound in A.6.4 (2026-04) — kills the import-reflex
@@ -577,6 +635,21 @@ _BANNER_PRIMITIVES = [
 # the banner honest about what's actually callable this session — a
 # vault-less session never advertises vault.* shapes.
 
+def _primitive_visible(primitive: str, namespace: dict | None = None) -> bool:
+    """Return whether `primitive` resolves against the live namespace."""
+    ns = NAMESPACE if namespace is None else namespace
+    if "." in primitive:
+        ns_name, method = primitive.split(".", 1)
+        ns_obj = ns.get(ns_name)
+        return ns_obj is not None and hasattr(ns_obj, method)
+    return primitive in ns
+
+
+def _visible_primitive_names() -> list[str]:
+    """Return schema primitives callable in the current runtime namespace."""
+    return [p for p in NAMESPACE_SIGNATURES if _primitive_visible(p)]
+
+
 def _visible_shapes() -> list[tuple[str, str]]:
     """Compute the Shapes block for the current namespace.
 
@@ -594,16 +667,8 @@ def _visible_shapes() -> list[tuple[str, str]]:
     for primitive, entry in sorted(
         NAMESPACE_SIGNATURES.items(), key=lambda kv: -len(kv[0])
     ):
-        if "." in primitive:
-            ns_name, method = primitive.split(".", 1)
-            ns_obj = NAMESPACE.get(ns_name)
-            if ns_obj is None or not hasattr(ns_obj, method):
-                continue
-        else:
-            # Bare-name primitive (say / ask / done / rlm_call / rlm_batch
-            # / reindex). Must be directly bound in NAMESPACE.
-            if primitive not in NAMESPACE:
-                continue
+        if not _primitive_visible(primitive):
+            continue
         sig_line = f"{primitive}{entry['sig']}"
         visible.append((sig_line, entry["returns"]))
     # Sort for stable banner output — longest-first ordering inside the
@@ -680,13 +745,33 @@ def _format_first_turn_banner() -> str:
                 "forward-slash paths."
             )
 
+    # Categorized capability listing — teaches the model WHAT each primitive
+    # does, not just that it exists. Added 2026-04-29 to fix bench failures
+    # where the model couldn't find the right primitive (search vs find_symbol,
+    # shell.run for unindexed paths, etc). The flat Namespace line stays for
+    # grep-ability and backward compat with traces that parse it.
     lines.extend([
+"Primitives by intent:",
+        "  UNDERSTAND a file  -> codebase.get_file_summary(path)  â€” symbols, imports, dependents in one call",
+        "  FIND usage/callers -> codebase.find_symbol(name), codebase.show_dependents(file)  [tree-sitter]",
+        "  SEARCH by concept  -> codebase.search(query)  â€” semantic + structural, not just regex",
+        "  READ specific code -> codebase.get_context(file, lines, window=5)  â€” surgical line slices",
+        "  EXPLORE structure  -> codebase.map(path, depth), codebase.list_files()",
+        "  TRACE imports      -> codebase.trace_path(from_file, to_file), codebase.show_dependencies(file)",
+        "  READ whole file    -> fs.read(path)  â€” when you need ALL of it, or it's unindexed (config, md, env)",
+        "  WRITE/EDIT files   -> fs.write(path, content), fs.edit(path, old, new), fs.patch(path, edits)",
+        "  INSPECT API        -> api.stub(), api.describe(name), api.costs()  -> generated from live namespace",
+        "  SHELL (build/test) -> shell.run(cmd, timeout=30)  â€” for npm, git, system commands; not for code search",
+        "  MEMORY             -> vault.top(query), vault.explore(query), vault.orient(), vault.add(title, content)",
+        "  DURABLE STATE      -> state.put(key, value), state.get(key), state.receipts() for cross-phase handoff",
+        "  GOAL PLANNING      -> plan.create(...), plan.enter_phase(id), plan.exit_phase(id, outputs)",
+        "  STAY SPANNER       -> spanner.escalate(reason, layers) for model-declared planned tier",
+        "  REASON over slices -> rlm_call(slice, question), rlm_batch(pairs)",
+        "  OUTPUT             -> say(text), done(value), ask(question)",
         f"Namespace: {', '.join(available)}",
-        "State: empty — variables you define here persist across Repl calls in this session",
-        "Discovery: obj.__doc__ shows the API for any primitive; fs.read.__doc__ works on methods too",
-        "Idiom: compose multiple operations in one call — reads, searches, summaries, edits, says — using Python control flow. One composed call is the shape that wins.",
+        "Python variables persist as scratch. Use state.* for durable planned handoff. Discovery: api.stub() for generated signatures; obj.__doc__ for details.",
     ])
-    # Shape cheat-sheet — generated from schema.NAMESPACE_SIGNATURES at
+
     # render time (Batch 1.5). Column-aligned, ASCII arrow so the banner
     # round-trips through every terminal encoding (Windows cp1252 can't
     # encode U+2192 and crashes when the smoke test re-prints body stdout).
@@ -700,13 +785,207 @@ def _format_first_turn_banner() -> str:
     return "\n".join(lines)
 
 
+_NON_USER_VAR_NAMES = {
+    "__builtins__", "__name__",
+    "fs", "shell", "web", "api", "plan", "spanner", "state", "scratch",
+    "say", "ask", "done", "json", "os", "reindex",
+    "codebase", "vault", "research", "rlm_call", "rlm_batch",
+    "re", "datetime", "random", "statistics", "collections", "itertools", "math",
+    "print", "len", "list", "dict", "set", "tuple", "frozenset", "str", "int",
+    "float", "bool", "bytes", "sorted", "reversed", "enumerate", "zip", "range",
+    "map", "filter", "sum", "min", "max", "any", "all", "abs", "round", "divmod",
+    "repr", "ord", "chr", "hex", "oct", "bin", "hash", "id", "isinstance",
+    "issubclass", "hasattr", "type", "iter", "next", "callable", "help",
+    "BaseException", "Exception", "ArithmeticError", "ZeroDivisionError",
+    "OverflowError", "FloatingPointError", "ValueError", "TypeError", "KeyError",
+    "IndexError", "AttributeError", "NameError", "RuntimeError", "RecursionError",
+    "StopIteration", "StopAsyncIteration", "LookupError", "UnicodeDecodeError",
+    "NotImplementedError", "AssertionError", "TimeoutError", "None", "True", "False",
+}
+
+
+def _summarize_value(value) -> str:
+    try:
+        if isinstance(value, str):
+            return f"str({len(value)})"
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return f"{type(value).__name__}({len(value)})"
+        if isinstance(value, dict):
+            return f"dict({len(value)})"
+        if isinstance(value, (int, float, bool)) or value is None:
+            return type(value).__name__
+        return type(value).__name__
+    except Exception:
+        return "unknown"
+
+
+def _visible_user_vars(limit: int = 12) -> list[dict]:
+    rows = []
+    for name, value in sorted(NAMESPACE.items()):
+        if name.startswith("_") or name in _NON_USER_VAR_NAMES:
+            continue
+        if callable(value):
+            continue
+        rows.append({"name": name, "summary": _summarize_value(value)})
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _runtime_footer(runtime: dict) -> str:
+    parts = []
+    state_status = runtime.get("state") or {}
+    state_rows = state_status.get("receipts") or []
+    if state_rows:
+        parts.append("state: " + ", ".join(
+            f"{row.get('key')}={row.get('summary')}" for row in state_rows[:8]
+        ))
+    else:
+        parts.append("state: (none)")
+
+    produced_rows = state_status.get("last_produced") or []
+    if produced_rows:
+        parts.append("last produced: " + ", ".join(
+            f"{row.get('key')}={row.get('summary')}" for row in produced_rows[-4:]
+        ))
+
+    vars_rows = runtime.get("vars") or []
+    if vars_rows:
+        parts.append("vars(debug): " + ", ".join(f"{row['name']}={row['summary']}" for row in vars_rows[:8]))
+    else:
+        parts.append("vars(debug): (none)")
+
+    shape = runtime.get("shape") or {}
+    if shape:
+        label = "composed" if shape.get("is_composed") else ("micro" if shape.get("is_micro_repl") else "mixed")
+        parts.append(
+            f"composition: {label}, primitives={shape.get('distinct_primitive_count', 0)}, stmts={shape.get('stmt_count', 0)}"
+        )
+
+    plan_status = runtime.get("plan") or {}
+    if plan_status.get("active"):
+        phase_id = plan_status.get("active_phase_id") or "none"
+        parts.append(f"plan: phase={phase_id}, layers={plan_status.get('layer_count', 0)}, policy=telemetry")
+
+    spanner_status = runtime.get("spanner") or {}
+    tier = spanner_status.get("tier")
+    if tier and tier != "exploration":
+        layers = spanner_status.get("layers")
+        suffix = f", layers={layers}" if layers else ""
+        parts.append(f"spanner: {tier}{suffix}")
+
+    # Compose sub-loop scratch indicator. When a per-request scratch exists,
+    # show its filled-section count so the model sees both that the substrate
+    # is live AND how much of it has been engaged. The path is omitted to
+    # keep the footer scannable; scratch.status() returns it on demand.
+    scratch_status = runtime.get("scratch") or {}
+    if scratch_status.get("active"):
+        filled = scratch_status.get("sections_filled") or []
+        intent = (scratch_status.get("intent") or "").strip()
+        intent_disp = (intent[:32] + "…") if len(intent) > 32 else intent
+        parts.append(
+            f"scratch: active filled={len(filled)}/{len(filled) + len(scratch_status.get('sections_empty') or [])}"
+            + (f" intent={intent_disp!r}" if intent_disp else "")
+        )
+
+    return " | ".join(parts)
+
+
+def _runtime_state(shape: dict | None) -> dict:
+    events = []
+    state_events = []
+    try:
+        state_events = STATE.drain_events()
+        events.extend(state_events)
+    except Exception as e:
+        events.append({"type": "state_telemetry_error", "error": str(e)})
+    try:
+        events.extend(PLAN.drain_events())
+    except Exception as e:
+        events.append({"type": "plan_telemetry_error", "error": str(e)})
+    try:
+        events.extend(SPANNER.drain_events())
+    except Exception as e:
+        events.append({"type": "spanner_telemetry_error", "error": str(e)})
+    try:
+        state_status = STATE.status()
+        state_status["last_produced"] = [
+            event.get("receipt") for event in state_events
+            if event.get("type") == "state_put" and isinstance(event.get("receipt"), dict)
+        ]
+    except Exception as e:
+        state_status = {"error": str(e), "receipts": [], "last_produced": []}
+    try:
+        scratch_status = SCRATCH.status()
+    except Exception as e:
+        scratch_status = {"active": False, "error": str(e)}
+    try:
+        events.extend(SCRATCH.drain_events())
+    except Exception as e:
+        events.append({"type": "scratch_telemetry_error", "error": str(e)})
+    runtime = {
+        "state": state_status,
+        "vars": _visible_user_vars(),
+        "shape": shape or {},
+        "plan": PLAN.status(),
+        "spanner": SPANNER.status(),
+        "scratch": scratch_status,
+        "telemetry": events,
+    }
+    runtime["footer"] = _runtime_footer(runtime)
+    return runtime
+
+
+def _planned_composition_rejection(shape: dict | None) -> str | None:
+    """Reject active-phase micro read cells before they burn another turn.
+
+    Returns a one-line typed code + the data that tripped the wall, never
+    remediation prose. Same shape as SecurityError messages: name the rule
+    and the facts; let the model read its own shape and adapt. Vault canon
+    (the dead-category rule, paid for in two weeks of Loop2 prose-injection
+    failures) bans corrective sentences here — the rejection itself is the
+    signal, not a sentence telling the model what to do next. The model
+    sees: phase id, distinct-primitive count, stmt count, primitives called,
+    and the exempt list. From those facts it can adapt. Anything more is
+    composition-linter-shaped feedback we already proved doesn't work.
+    """
+    if not shape or not shape.get("is_micro_repl"):
+        return None
+    try:
+        status = PLAN.status()
+    except Exception:
+        return None
+    if not status.get("active") or not status.get("active_phase_id"):
+        return None
+    primitives = [str(p) for p in shape.get("primitives_called", [])]
+    if any(p.startswith("plan.") for p in primitives):
+        return None
+    if any(p in {"done", "say", "ask", "state.put"} for p in primitives):
+        return None
+    phase_id = status.get("active_phase_id")
+    distinct = shape.get("distinct_primitive_count", 0)
+    stmts = shape.get("stmt_count", 0)
+    prim_csv = ",".join(primitives) or "(none)"
+    return (
+        f"PlannedPhaseWall: phase={phase_id} "
+        f"distinct_primitives={distinct} stmt_count={stmts} "
+        f"primitives={prim_csv} exempted=done,say,ask,state.put,plan.*"
+    )
+
+
 def handle_sync(msg: dict):
     """Handle synchronous (non-exec) ops. Returns response dict or None for shutdown."""
-    global NAMESPACE, CODEBASE, VAULT, RESEARCH
+    global NAMESPACE, CODEBASE, VAULT, RESEARCH, PLAN, SPANNER, STATE
     op = msg.get("op")
 
     if op == "ping":
-        return {"pong": True, "version": "0.2.0-single-mcp"}
+        # Returns version + content_hash + git sha + startup time so the TS
+        # bridge can detect when this body subprocess is stale (source files
+        # modified after this process started). See body/version.py for the
+        # rationale — body code does not hot-reload, so dogfooding against a
+        # stale body silently runs old code. The bridge surfaces "body: stale,
+        # restart required" when its on-disk hash diverges from CONTENT_HASH.
+        return {"pong": True, **_body_version.info()}
 
     elif op == "configure":
         # Populates environment-awareness module globals consumed by the
@@ -721,16 +1000,69 @@ def handle_sync(msg: dict):
         # displays back to the model on turn one. Keep it that way —
         # routing through one configure op would couple unrelated
         # lifecycles and complicate error handling.
-        global ENV_PROJECT, ENV_VAULT_GLOBAL, ENV_VAULT_PROJECT, ENV_MODE, ENV_SHELL
+        global ENV_PROJECT, ENV_VAULT_GLOBAL, ENV_VAULT_PROJECT, ENV_MODE, ENV_SHELL, ENV_STATE_DIR
+        global ENV_SESSION_ID, ENV_REQUEST_ID, ENV_COMPOSE_MODE
         ENV_PROJECT = msg.get("project") or ENV_PROJECT
         ENV_VAULT_GLOBAL = msg.get("vault_global") or ENV_VAULT_GLOBAL
         ENV_VAULT_PROJECT = msg.get("vault_project") or ENV_VAULT_PROJECT
         ENV_MODE = msg.get("mode") or ENV_MODE
         ENV_SHELL = msg.get("shell") or ENV_SHELL
+        ENV_STATE_DIR = msg.get("state_dir") or ENV_STATE_DIR
+        # Compose sub-loop request scoping. Updated per top-level user
+        # message: harness sends a fresh request_id (and session_id on
+        # first configure of the session) before the agent loop fires so
+        # scratch.* primitives can compute the per-request file path.
+        # compose_mode is the auto-router's classification — surfaced in
+        # the runtime footer so the model can see which lane it's in.
+        ENV_SESSION_ID = msg.get("session_id") or ENV_SESSION_ID
+        ENV_REQUEST_ID = msg.get("request_id") or ENV_REQUEST_ID
+        ENV_COMPOSE_MODE = msg.get("compose_mode") or ENV_COMPOSE_MODE
+        STATE.configure(ENV_STATE_DIR)
         return {"ok": True}
+
+    elif op == "scratch_start":
+        # Compose sub-loop scratch lifecycle: harness creates the per-request
+        # markdown file before the agent loop fires. Routes through the same
+        # primitive the model uses (scratch.start) so the file lifecycle has
+        # one code path. The verbatim user message is pre-filled into the
+        # User request section so the model sees its own prompt at the top.
+        intent = msg.get("intent") or ""
+        user_request = msg.get("user_request") or ""
+        mode = msg.get("mode") or "compose"
+        return SCRATCH.start(intent, user_request=user_request, mode=mode)
+
+    elif op == "scratch_close":
+        # Harness calls this on terminal events (done committed, error,
+        # max_turns, abort). Idempotent — no-op if no scratch exists.
+        return SCRATCH.close()
+
+    elif op == "scratch_status":
+        return SCRATCH.status()
+
+    elif op == "scratch_read":
+        return {"ok": True, "content": SCRATCH.read(), "status": SCRATCH.status()}
+
+    elif op == "scratch_append":
+        section = msg.get("section") or ""
+        text = msg.get("text") or ""
+        return SCRATCH.append(section, text)
+
+    elif op == "scratch_set":
+        section = msg.get("section") or ""
+        text = msg.get("text") or ""
+        return SCRATCH.set(section, text)
 
     elif op == "reset":
         global _exec_count
+        PLAN = Plan(lambda: ENV_PROJECT, STATE.has)
+        SPANNER = Spanner()
+        # /reset closes any active compose scratch — the new session starts
+        # without a stale request scratch hanging around. The harness will
+        # create a fresh one on the next compose-mode submit.
+        try:
+            SCRATCH.close()
+        except Exception:
+            pass
         NAMESPACE = _build_namespace()
         # Re-arm the first-turn banner so the next exec shows it again.
         # /reset is effectively "new session" from the model's perspective;
@@ -755,6 +1087,7 @@ def handle_sync(msg: dict):
                 include_nested_repos=include_nested_repos,
             )
             CODEBASE = cb_mod.CodebaseGraph(idx_result)
+            _fs_mod._CODEBASE_REF = CODEBASE
             _rebuild_namespace()
             stats = CODEBASE.stats()
             return {
@@ -913,7 +1246,54 @@ def _run_exec(msg: dict) -> None:
     _exec_count += 1
     is_first_exec = (_exec_count == 1)
 
-    result = repl.execute(code, NAMESPACE, timeout_ms)
+    try:
+        PLAN.begin_cell()
+    except Exception:
+        pass
+
+    pre_shape = None
+    try:
+        pre_shape = analyze_shape(code)
+        reject_reason = _planned_composition_rejection(pre_shape)
+        if reject_reason:
+            result = {
+                "stdout": "",
+                "stderr": "",
+                "exception": None,
+                "duration_ms": 0,
+                "rejected": {"reason": reject_reason},
+                "timed_out": False,
+                "shape": pre_shape,
+            }
+            try:
+                result["runtime"] = _runtime_state(pre_shape)
+            except Exception as e:
+                result["runtime"] = {
+                    "footer": f"state: runtime telemetry unavailable ({e})",
+                    "telemetry": [{"type": "runtime_state_error", "error": str(e)}],
+                }
+            _write_response(result)
+            return
+    except Exception:
+        pre_shape = None
+
+    try:
+        result = repl.execute(code, NAMESPACE, timeout_ms)
+    except BaseException as e:
+        # 2026-05-04 bench task 02 exposed this failure mode: an internal
+        # body-side exception in repl.execute killed the exec worker thread
+        # before it wrote a response, so the TS bridge waited until the
+        # 300s bench timeout and the model never saw a recoverable error.
+        # Exec worker death must be model-visible data, not a silent hang.
+        import traceback
+        result = {
+            "stdout": "",
+            "stderr": "",
+            "exception": "body exec failed before producing a result:\n" + traceback.format_exc(),
+            "duration_ms": 0,
+            "rejected": None,
+            "timed_out": False,
+        }
 
     # Attach shape telemetry. Analysis is pure inspection of the submitted
     # code (parses the AST separately from security.check_ast — cheap). Runs
@@ -922,7 +1302,18 @@ def _run_exec(msg: dict) -> None:
     # it would blind the experiment. If the parse fails, analyze_shape
     # returns a dict with an `error` field rather than raising, so exec
     # results always carry a shape entry.
-    result["shape"] = analyze_shape(code)
+    try:
+        result["shape"] = pre_shape or analyze_shape(code)
+    except Exception as e:
+        # Shape telemetry is observability, not part of execution semantics.
+        # If it breaks on unusual syntax/encoding, keep the exec result alive
+        # and surface the telemetry failure as data instead of hanging.
+        result["shape"] = {"error": f"shape analysis failed: {e}"}
+
+    try:
+        PLAN.observe_cell(result.get("shape") or {})
+    except Exception as e:
+        result.setdefault("runtime_errors", []).append(f"plan.observe_cell failed: {e}")
 
     if is_first_exec:
         # Prepend rather than replace — the model's own print() output
@@ -944,6 +1335,27 @@ def _run_exec(msg: dict) -> None:
         if _done_sink:
             result["done"] = {"value": _done_sink[-1]}
             _done_sink.clear()
+
+    # Harvest say() output as structured result data, separate from captured
+    # stdout. This is the commit-mode IO escape hatch: print() can become
+    # diagnostic/noisy/debug-only while say() remains an intentional channel
+    # back to the model and the user. The real-time {"say": ...} bridge event
+    # still fires during exec; this post-exec copy is for tool_result shaping.
+    said = SPEAK.drain_say()
+    if said:
+        # Do NOT use result["say"] here. The TS bridge reserves a top-level
+        # {"say": ...} object for fire-and-forget callback frames and returns
+        # early when it sees one. A final exec result carrying "say" would be
+        # misclassified as a callback and leave the pending exec unresolved.
+        result["say_texts"] = said
+
+    try:
+        result["runtime"] = _runtime_state(result.get("shape") or {})
+    except Exception as e:
+        result["runtime"] = {
+            "footer": f"state: runtime telemetry unavailable ({e})",
+            "telemetry": [{"type": "runtime_state_error", "error": str(e)}],
+        }
 
     _write_response(result)
 
@@ -1091,7 +1503,10 @@ def main():
         # backstop in case someone calls handle_sync directly.
         op = msg.get("op")
         if op == "ping":
-            _write_response({"pong": True, "version": "0.2.0-single-mcp"})
+            # Returns version + content_hash + git sha + startup time so the
+            # TS bridge can detect when this body subprocess is stale (source
+            # files modified after this process started). See body/version.py.
+            _write_response({"pong": True, **_body_version.info()})
             continue
 
         # ── Cancel currently-running exec (user interrupt path) ─────────

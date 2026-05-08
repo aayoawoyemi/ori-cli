@@ -33,7 +33,8 @@ BODY = ROOT / "body" / "server.py"
 # run. Absence here means the build is broken, not that the bridge hasn't
 # connected yet.
 EAGER_NAMES = {
-    "fs", "shell", "web",   # bridged primitives (objects bound, not lazy)
+    "fs", "shell", "web", "api",   # bridged/local primitives (objects bound, not lazy)
+    "plan", "spanner", "state",      # goal-mode substrate + durable handoff
     "say", "ask",           # bare user-I/O callables
     "done",                 # commitment primitive (v0.5 Phase 3 / 2026-04-22)
     "json", "reindex",      # pre-bound stdlib + reindex helper
@@ -623,8 +624,8 @@ def main():
         # / random / statistics / collections / itertools / math are bound
         # in the Repl namespace so `import re` reflex doesn't cost a turn.
         # Probe: call one method per module and verify output. Also verify
-        # the `import re` guard still fires (pre-binding is a namespace
-        # add, not a guard relaxation).
+        # the `import re` reflex is silently stripped by repl.strip_preloaded_imports
+        # before validation, so it does not cost a recovery turn.
         total += 1
         r = exec_code(
             proc,
@@ -648,15 +649,15 @@ def main():
             passed += 1
         else:
             print(f"  FAIL stdlib bindings:\n{stdout}")
-        # Import guard still fires — binding doesn't relax the block.
+        # Preloaded imports are normalized away before validation.
         total += 1
         send(proc, {"op": "exec", "code": "import re", "timeout_ms": 5000})
         r = recv(proc)
-        if r.get("rejected"):
-            print(f"  OK   `import re` still rejected (pre-binding doesn't relax guard): {r['rejected']['reason']}")
+        if not r.get("rejected") and not r.get("exception") and not r.get("timed_out"):
+            print("  OK   `import re` is stripped as a preloaded-import reflex")
             passed += 1
         else:
-            print(f"  FAIL `import re` should have been rejected even with re pre-bound: {r}")
+            print(f"  FAIL `import re` should have been stripped cleanly: {r}")
 
         # 21. A.6.5 first-turn banner Shapes cheat-sheet — the banner now
         # includes a "Shapes:" block with signatures for the most-reached-
@@ -716,7 +717,7 @@ def main():
             "server = importlib.import_module('server')\n"
             "# Expected primitives from _build_namespace — aries primitives\n"
             "# only; stdlib modules (re/datetime/etc.) excluded by design.\n"
-            "expected_ns_objects = ['fs', 'shell', 'web']\n"
+            "expected_ns_objects = ['fs', 'shell', 'web', 'api', 'plan', 'spanner', 'state']\n"
             "expected_bare_names = ['say', 'ask', 'done']\n"
             "missing = []\n"
             "# For each expected ns object, at least one <ns>.method must be in schema.\n"
@@ -731,7 +732,7 @@ def main():
             "# Cross-check: every key in schema should resolve to a callable if the\n"
             "# ns object is actually bound. VAULT/CODEBASE/RESEARCH may be None in\n"
             "# standalone smoke (lazy), so skip those; test only the always-bound ones.\n"
-            "always_bound = {'fs': server.FS, 'shell': server.SHELL, 'web': server.WEB}\n"
+            "always_bound = {'fs': server.FS, 'shell': server.SHELL, 'web': server.WEB, 'api': server.NAMESPACE['api'], 'plan': server.PLAN, 'spanner': server.SPANNER, 'state': server.STATE}\n"
             "unreachable = []\n"
             "for key in NAMESPACE_SIGNATURES:\n"
             "    if '.' not in key: continue\n"

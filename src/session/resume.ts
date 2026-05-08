@@ -1,15 +1,13 @@
-import type { Message, ContentBlock } from '../router/types.js';
+import type { ContentBlock, Message } from '../router/types.js';
 import { SessionStorage, type SessionEntry } from './storage.js';
 
 /**
- * Reconstruct messages from a session JSONL file.
- * If a compact boundary exists, start from the last one.
- * Returns the messages array ready for the agent loop.
+ * Reconstruct provider-ready messages from a session JSONL file.
  *
- * Key challenge: the session log stores tool_call entries separately from
- * assistant text, but Anthropic's API expects assistant messages to contain
- * both text AND tool_use blocks in a single content array. We reconstruct
- * this by merging consecutive assistant + tool_call entries into one message.
+ * Legacy sessions store native assistant/tool_call/tool_result events, which
+ * are reconstructed as native tool protocol. Loop3 sessions store transcript
+ * renderings for completed Repl calls, so resume keeps completed history as
+ * text and never resurrects stale native tool_use/tool_result pairs.
  */
 export function resumeFromSession(sessionPath: string): {
   messages: Message[];
@@ -18,7 +16,6 @@ export function resumeFromSession(sessionPath: string): {
   const entries = SessionStorage.readSession(sessionPath);
   if (entries.length === 0) return { messages: [], meta: null };
 
-  // Find the last compact boundary — start from there
   let startIdx = 0;
   for (let i = entries.length - 1; i >= 0; i--) {
     if (entries[i].type === 'compact_boundary') {
@@ -27,28 +24,92 @@ export function resumeFromSession(sessionPath: string): {
     }
   }
 
-  // Find meta entry
   const meta = entries.find(e => e.type === 'meta') ?? null;
-
-  // Reconstruct messages from startIdx
   const messages: Message[] = [];
   const slice = entries.slice(startIdx);
+  const hasLoop3Transcript = slice.some(e => e.type === 'loop3_transcript');
 
-  // We need to merge assistant text + tool_calls into one assistant message.
-  // The log order is: assistant → tool_call → tool_call → tool_result → ...
-  // So we buffer assistant content and flush when we see a non-tool_call entry.
   let assistantBuffer: ContentBlock[] | null = null;
+  let loop3AssistantText = '';
+  let loop3PendingCode: { id: string; code: string } | null = null;
+
+  function compactLoggedText(entry: {
+    content_head?: string;
+    content_tail?: string;
+    code?: string;
+    code_head?: string;
+    code_tail?: string;
+  }): string {
+    if (typeof entry.code === 'string') return entry.code;
+    const head = entry.content_head ?? entry.code_head ?? '';
+    const tail = entry.content_tail ?? entry.code_tail ?? '';
+    if (!tail || tail === head) return head;
+    return `${head}\n\n[... truncated in session log ...]\n\n${tail}`;
+  }
+
+  function xmlAttr(value: string): string {
+    return value
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  function cdataBlock(value: string): string {
+    return `<![CDATA[\n${value.replace(/\]\]>/g, ']]]]><![CDATA[>')}\n]]>`;
+  }
+
+  function renderLoop3AssistantTranscript(text: string, id: string, code: string): string {
+    return [
+      text.trim(),
+      [
+        `<repl_call id="${xmlAttr(id)}">`,
+        `<code>${cdataBlock(code.trimEnd())}</code>`,
+        '</repl_call>',
+      ].join('\n'),
+    ].filter(Boolean).join('\n\n');
+  }
+
+  function renderLoop3ObservationTranscript(status: string, id: string, output: string): string {
+    return [
+      `<repl_observation id="${xmlAttr(id)}" status="${xmlAttr(status)}">`,
+      `<output>${cdataBlock(output)}</output>`,
+      '</repl_observation>',
+    ].join('\n');
+  }
+
+  function migrateLoop3AssistantTranscript(text: string): string {
+    return text.replace(
+      /Executed Python \(([^)\r\n]+)\):\r?\n(`{3,})python\r?\n([\s\S]*?)\r?\n\2/g,
+      (_match, id: string, _fence: string, code: string) => renderLoop3AssistantTranscript('', id, code),
+    );
+  }
+
+  function migrateLoop3ObservationTranscript(text: string): string {
+    return text.replace(
+      /Observation \((ok|error), ([^)\r\n]+)\):\r?\n([\s\S]*?)(?=\r?\n\r?\nObservation \((?:ok|error), [^)\r\n]+\):\r?\n|$)/g,
+      (_match, status: string, id: string, output: string) => renderLoop3ObservationTranscript(status, id, output.trim()),
+    );
+  }
 
   function flushAssistant(): void {
     if (assistantBuffer && assistantBuffer.length > 0) {
-      // If it's just a single text block, keep content as string for compatibility
-      if (assistantBuffer.length === 1 && assistantBuffer[0].type === 'text') {
-        messages.push({ role: 'assistant', content: assistantBuffer[0].text });
+      if (assistantBuffer.length === 1 && assistantBuffer[0]!.type === 'text') {
+        messages.push({ role: 'assistant', content: assistantBuffer[0]!.text });
       } else {
         messages.push({ role: 'assistant', content: assistantBuffer });
       }
     }
     assistantBuffer = null;
+  }
+
+  function flushLoop3NaturalText(): void {
+    const text = loop3AssistantText.trim();
+    if (text) {
+      flushAssistant();
+      messages.push({ role: 'assistant', content: text });
+    }
+    loop3AssistantText = '';
   }
 
   for (const entry of slice) {
@@ -70,19 +131,13 @@ export function resumeFromSession(sessionPath: string): {
         break;
       }
       case 'assistant': {
-        // Start a new assistant buffer. If there's already one pending, flush it.
         flushAssistant();
         const e = entry as Extract<SessionEntry, { type: 'assistant' }>;
-        // Skip empty text blocks — Anthropic API rejects messages with empty text content
         assistantBuffer = e.content ? [{ type: 'text', text: e.content }] : [];
         break;
       }
       case 'tool_call': {
-        // Append tool_use block to the current assistant buffer.
-        // If no assistant buffer exists (shouldn't happen but be defensive), create one.
-        if (!assistantBuffer) {
-          assistantBuffer = [];
-        }
+        if (!assistantBuffer) assistantBuffer = [];
         const e = entry as Extract<SessionEntry, { type: 'tool_call' }>;
         assistantBuffer.push({
           type: 'tool_use',
@@ -93,13 +148,10 @@ export function resumeFromSession(sessionPath: string): {
         break;
       }
       case 'tool_result': {
-        // tool_result comes after tool_calls — flush the assistant message first
         flushAssistant();
         const e = entry as Extract<SessionEntry, { type: 'tool_result' }>;
-        // Accumulate with any adjacent tool_results into one user message
         const lastMsg = messages[messages.length - 1];
         if (lastMsg && lastMsg.role === 'user' && Array.isArray(lastMsg.content)) {
-          // Append to existing tool_result user message
           (lastMsg.content as ContentBlock[]).push({
             type: 'tool_result',
             tool_use_id: e.id,
@@ -119,12 +171,57 @@ export function resumeFromSession(sessionPath: string): {
         }
         break;
       }
-      // preflight/postflight/meta/error/interrupted are metadata — not conversation messages
+      case 'loop3_transcript': {
+        flushAssistant();
+        const e = entry as Extract<SessionEntry, { type: 'loop3_transcript' }>;
+        const assistant = migrateLoop3AssistantTranscript(e.assistant);
+        const user = migrateLoop3ObservationTranscript(e.user);
+        if (assistant.trim()) messages.push({ role: 'assistant', content: assistant });
+        if (user.trim()) messages.push({ role: 'user', content: user });
+        loop3AssistantText = '';
+        loop3PendingCode = null;
+        break;
+      }
+      case 'loop3_assistant_text': {
+        const e = entry as Extract<SessionEntry, { type: 'loop3_assistant_text' }>;
+        loop3AssistantText = compactLoggedText(e);
+        break;
+      }
+      case 'loop3_tool_use': {
+        if (hasLoop3Transcript) break;
+        const e = entry as Extract<SessionEntry, { type: 'loop3_tool_use' }>;
+        loop3PendingCode = {
+          id: e.tool_call_id ?? e.cell_id ?? 'loop3-repl',
+          code: compactLoggedText(e),
+        };
+        break;
+      }
+      case 'loop3_tool_result': {
+        if (hasLoop3Transcript || !loop3PendingCode) break;
+        const e = entry as Extract<SessionEntry, { type: 'loop3_tool_result' }>;
+        flushAssistant();
+        const assistantText = renderLoop3AssistantTranscript(
+          loop3AssistantText,
+          loop3PendingCode.id,
+          loop3PendingCode.code,
+        );
+        const output = e.output?.trim()
+          || `status=${e.status}, duration_ms=${e.duration_ms}, done_committed=${e.done_committed}`;
+        messages.push({ role: 'assistant', content: assistantText });
+        messages.push({ role: 'user', content: renderLoop3ObservationTranscript(e.status, loop3PendingCode.id, output) });
+        loop3AssistantText = '';
+        loop3PendingCode = null;
+        break;
+      }
+      case 'loop3_turn_complete': {
+        if (!loop3PendingCode) flushLoop3NaturalText();
+        break;
+      }
     }
   }
 
-  // Flush any trailing assistant buffer
   flushAssistant();
+  if (!loop3PendingCode) flushLoop3NaturalText();
 
   return { messages, meta };
 }

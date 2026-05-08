@@ -34,7 +34,7 @@ export const DEFAULT_CONFIG: AriesConfig = {
   tools: {
     maxResultChars: 10_000,
     parallelReadTools: true,
-    maxSubagents: 5,
+    // maxSubagents removed 2026-05-03 â€” AgentTool deleted.
     dynamicTools: true,
   },
   webSearch: {},
@@ -77,7 +77,7 @@ export const DEFAULT_CONFIG: AriesConfig = {
     codebase: { level: 'standard', maxTokens: 600 },
     vault: { level: 'standard', maxTokens: 600 },
     cachePrefix: true,
-    includeInSubagents: false,
+    includeInHeadless: false,
     // trimVaultReturns added 2026-04-21 (v0.5 Phase 1). Default true —
     // strips decoration (signals/spaces/rrf/warmth.internals/federation
     // markers) from MCP retrieval responses. Flip to false if you need
@@ -110,9 +110,14 @@ export const DEFAULT_CONFIG: AriesConfig = {
     gotchas: false,
     transactions: false,
   },
+  // Default 'short' = current 5-min ephemeral behavior. Byte-identical wire
+  // output to pre-feature code on Anthropic native (already emits bare
+  // ephemeral). Users opt into 'long' (1h TTL, 2× write cost) via YAML or
+  // ARIES_CACHE_RETENTION=long env var. See src/router/cache.ts header.
+  cache: {
+    retention: 'short',
+  },
   mcp: {
     servers: {},
   },
 };
-
-

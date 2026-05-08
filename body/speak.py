@@ -1,11 +1,11 @@
 # File: body/speak.py
-# Purpose: User-facing I/O primitives exposed directly in the Repl namespace
-#   as bare `say` and `ask` functions. Without them, a long-running Repl call
+# Purpose: User-facing I/O primitives exposed directly in the code namespace
+#   as bare `say` and `ask` functions. Without them, a long-running code call
 #   is silent to the user — the UI sees nothing until exec completes and the
 #   tool_result comes back. With them, the Python body narrates progress in
 #   real time (say) and can request input mid-execution without ending the
-#   Repl call (ask). Together they break the request-response turn model:
-#   one Repl call can span a full conversational exchange instead of forcing
+#   code call (ask). Together they break the request-response turn model:
+#   one code call can span a full conversational exchange instead of forcing
 #   the model to stop-and-speak-and-restart via text content blocks.
 # Key pieces:
 #   - Speak class, instantiated once at server startup as module-global SPEAK
@@ -13,12 +13,12 @@
 #   - ask(question, timeout) — blocking proxy, returns the user's typed string
 #   - resolve(id, result) — called by server.py main loop when ask_response
 #     arrives from TS, fires the threading.Event and unblocks ask()
-# Role: Registered in the Repl namespace by server.py as ns["say"] and
+# Role: Registered in the code namespace by server.py as ns["say"] and
 #   ns["ask"] (bare names, NOT speak.say / speak.ask — the model calls them
 #   like Python builtins). Mirrors the vault/research/fs callback pattern
 #   exactly for the blocking path (ask); adds a simpler non-blocking path
 #   (say) since no response is needed. See CODEMODE_ROADMAP.md §A6 and
-#   ORI.md "callback pattern" rule — we do not invent a new transport.
+#   ARIES.md "callback pattern" rule — we do not invent a new transport.
 #
 # Why the file is named `speak` and not `io`:
 #   body/ is inserted at sys.path[0] by server.py so modules can import each
@@ -46,7 +46,7 @@ class AskError(Exception):
 
 class Speak:
     """
-    User-facing I/O for the Repl namespace.
+    User-facing I/O for the code namespace.
 
     say() is fire-and-forget — writes a notification to sys.__stdout__ and
     returns immediately. Text appears in the user's message stream as
@@ -63,6 +63,7 @@ class Speak:
     def __init__(self) -> None:
         self._request_id = 0
         self._pending: dict[int, dict[str, Any]] = {}
+        self._said: list[str] = []
         # _lock guards the _pending dict (Python state, not the pipe).
         # _stdout_lock deleted in Batch 1.6 — protocol writes go through
         # _protocol.write_message which is atomic via os.write. See the
@@ -85,6 +86,21 @@ class Speak:
         self._request_id += 1
         return self._request_id
 
+    def drain_say(self) -> list[str]:
+        """
+        Return and clear say() texts emitted since the previous exec result.
+
+        This is separate from captured stdout on purpose. In commit-mode
+        code IO, ordinary print() is diagnostic and may be hidden from the
+        model, while say() remains an intentional model/user-visible output
+        channel. The bridge still receives the real-time sentinel below; this
+        drain is the post-exec result-envelope copy for tool_result formatting.
+        """
+        with self._lock:
+            texts = list(self._said)
+            self._said.clear()
+        return texts
+
     # ── say — fire-and-forget ──────────────────────────────────────────────
     # No request_id, no threading.Event, no _pending entry. Just write the
     # notification to __stdout__ and return. The UI may or may not render it
@@ -98,7 +114,7 @@ class Speak:
         """
         Push `text` to the user's message stream. Non-blocking — Python
         execution continues immediately after the stdout write. Use during
-        long-running Repl calls to narrate progress so the user isn't
+        long-running code calls to narrate progress so the user isn't
         looking at a blank screen while the agent works.
 
         Args:
@@ -125,6 +141,11 @@ class Speak:
         # Previously used `with self._stdout_lock: sys.__stdout__.write +
         # flush` — see _protocol.py header for why we dropped the lock.
         write_message({"say": {"text": text}})
+        # Post-exec harvest for the result envelope. This is what lets the
+        # TS formatter make print() debug-only without making say() invisible
+        # to the model. The bridge sentinel above remains the real-time path.
+        with self._lock:
+            self._said.append(text)
         # Echo to sys.stdout so the model sees its own output in
         # tool_result. repl.py redirects sys.stdout during exec; this
         # print() lands in the captured buffer that becomes result.stdout.
